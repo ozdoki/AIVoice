@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter};
 
 /// グローバルホットキーを登録する。
@@ -27,6 +28,13 @@ use std::sync::OnceLock;
 /// フック→ディスパッチスレッド間チャネルの送信端
 #[cfg(target_os = "windows")]
 static KEY_SENDER: OnceLock<std::sync::mpsc::SyncSender<u8>> = OnceLock::new();
+
+/// F4 長押し時のキーリピートによる多重 emit を防ぐフラグ
+#[cfg(target_os = "windows")]
+static F4_HELD: AtomicBool = AtomicBool::new(false);
+/// F5 キーリピート防止フラグ
+#[cfg(target_os = "windows")]
+static F5_HELD: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 const EV_F4_DOWN: u8 = 0;
@@ -68,17 +76,28 @@ unsafe extern "system" fn ll_keyboard_proc(
             VK_F4 => {
                 if let Some(tx) = KEY_SENDER.get() {
                     if is_down {
-                        let _ = tx.try_send(EV_F4_DOWN);
+                        // キーリピートを無視: 最初の押下のみ emit
+                        if !F4_HELD.swap(true, Ordering::AcqRel) {
+                            let _ = tx.try_send(EV_F4_DOWN);
+                        }
                     } else if is_up {
+                        F4_HELD.store(false, Ordering::Release);
                         let _ = tx.try_send(EV_F4_UP);
                     }
                 }
                 return LRESULT(1); // キーを消費（他アプリに渡さない）
             }
             VK_F5 if is_down => {
-                if let Some(tx) = KEY_SENDER.get() {
-                    let _ = tx.try_send(EV_F5_DOWN);
+                // キーリピートを無視: 最初の押下のみ emit
+                if !F5_HELD.swap(true, Ordering::AcqRel) {
+                    if let Some(tx) = KEY_SENDER.get() {
+                        let _ = tx.try_send(EV_F5_DOWN);
+                    }
                 }
+                return LRESULT(1);
+            }
+            VK_F5 if is_up => {
+                F5_HELD.store(false, Ordering::Release);
                 return LRESULT(1);
             }
             _ => {}

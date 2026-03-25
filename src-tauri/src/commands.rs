@@ -2,7 +2,7 @@ use tokio::sync::watch;
 use tauri::State;
 
 use crate::{
-    inject::inject_text,
+    inject,
     mode,
     settings::{self, AppSettings},
     speech::{
@@ -86,7 +86,7 @@ pub async fn stop_recording_session(state: State<'_, AppState>) -> Result<String
     let current_mode = state.mode.lock().await.clone();
     let final_text = mode::route(&current_mode, &raw_text);
 
-    inject_text(&final_text).map_err(|e| e.to_string())?;
+    inject::inject_text_after_f4(&final_text).map_err(|e| e.to_string())?;
 
     *state.recording_state.lock().await = RecordingState::Idle;
     Ok(final_text)
