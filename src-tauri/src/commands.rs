@@ -84,7 +84,8 @@ pub async fn stop_recording_session(state: State<'_, AppState>) -> Result<String
     };
 
     let current_mode = state.mode.lock().await.clone();
-    let final_text = mode::route(&current_mode, &raw_text);
+    let current_settings_for_mode = state.settings.lock().await.clone();
+    let final_text = mode::route(&current_mode, &current_settings_for_mode, &raw_text).await;
 
     inject::inject_text_after_f4(&final_text).map_err(|e| e.to_string())?;
 

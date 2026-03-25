@@ -1,10 +1,17 @@
-use crate::state::Mode;
+use crate::{polish, settings::AppSettings, state::Mode};
 
 /// モードに応じてテキストを加工する。
-/// Raw: そのまま返す。Polish: （将来的に整形処理を行う場所。今は Raw と同じ）
-pub fn route(mode: &Mode, text: &str) -> String {
+/// Raw: そのまま返す。Polish: LLM による文章整形。
+pub async fn route(mode: &Mode, settings: &AppSettings, text: &str) -> String {
     match mode {
         Mode::Raw => text.to_string(),
-        Mode::Polish => text.to_string(), // 将来 PolishProcessor に委譲する
+        Mode::Polish => match polish::polish_text(settings, text).await {
+            Ok(polished) if !polished.trim().is_empty() => polished,
+            Ok(_) => text.to_string(),
+            Err(e) => {
+                tracing::warn!("polish_text failed, falling back to raw: {e}");
+                text.to_string()
+            }
+        },
     }
 }

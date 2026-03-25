@@ -5,6 +5,7 @@ interface AppSettings {
   api_base_url: string;
   api_key: string;
   api_model: string;
+  polish_model: string;
 }
 
 interface Props {
@@ -16,6 +17,7 @@ export function SettingsPanel({ onClose }: Props) {
     api_base_url: "https://api.openai.com/v1",
     api_key: "",
     api_model: "whisper-1",
+    polish_model: "gpt-4o-mini",
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -89,7 +91,8 @@ export function SettingsPanel({ onClose }: Props) {
 
         {field("API Base URL", "api_base_url")}
         {field("API Key", "api_key", "password")}
-        {field("Model", "api_model")}
+        {field("ASR Model", "api_model")}
+        {field("Polish Model", "polish_model")}
 
         <p style={{ fontSize: "0.72rem", color: "#666", marginBottom: "1rem" }}>
           ホットキー: F4 = 録音開始/停止　F5 = Raw / Polish 切替

@@ -5,10 +5,12 @@ use tauri_plugin_store::StoreExt;
 const STORE_PATH: &str = "settings.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppSettings {
     pub api_base_url: String,
     pub api_key: String,
     pub api_model: String,
+    pub polish_model: String,
 }
 
 impl Default for AppSettings {
@@ -17,6 +19,7 @@ impl Default for AppSettings {
             api_base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
             api_model: "whisper-1".to_string(),
+            polish_model: "gpt-4o-mini".to_string(),
         }
     }
 }
