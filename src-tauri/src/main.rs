@@ -1,8 +1,8 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use aivoice::{commands, hotkey, settings, state::AppState};
-use tauri::Manager;
+use aivoice::{commands, hotkey, settings, state::AppState, tray};
+use tauri::{Manager, WindowEvent};
 
 fn main() {
     tauri::Builder::default()
@@ -18,7 +18,24 @@ fn main() {
             }
             // グローバルホットキーを登録
             hotkey::register_hotkeys(&app.handle())?;
+            // システムトレイを作成
+            tray::create(&app.handle())?;
             Ok(())
+        })
+        .on_menu_event(|app, event| {
+            tray::handle_menu(app, event);
+        })
+        .on_tray_icon_event(|app, event| {
+            tray::handle_tray_event(app, event);
+        })
+        .on_window_event(|window, event| {
+            // X ボタンでは終了せず hide してトレイに残す
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_mode,

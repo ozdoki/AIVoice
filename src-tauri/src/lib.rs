@@ -6,3 +6,4 @@ pub mod mode;
 pub mod settings;
 pub mod speech;
 pub mod state;
+pub mod tray;
