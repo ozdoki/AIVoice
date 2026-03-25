@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod commands;
 pub mod hotkey;
 pub mod inject;

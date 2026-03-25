@@ -20,15 +20,20 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const unlistenStart = listen("hotkey://start", () => {
-      setRecordingState("recording");
+    const unlistenStart = listen("hotkey://start", async () => {
+      try {
+        await invoke("start_recording_session");
+        setRecordingState("recording");
+      } catch (e) {
+        console.error(e);
+      }
     });
 
     const unlistenStop = listen("hotkey://stop", async () => {
       setRecordingState("processing");
       try {
-        const text = await invoke<string>("start_mock_session");
-        setLastText(text);
+        const text = await invoke<string>("stop_recording_session");
+        if (text) setLastText(text);
       } catch (e) {
         console.error(e);
       } finally {

@@ -1,6 +1,13 @@
-use tokio::sync::Mutex;
+use std::sync::Arc;
+use tokio::{
+    sync::{watch, Mutex},
+    task::JoinHandle,
+};
 
-use crate::settings::AppSettings;
+use crate::{
+    audio::{self, AudioInput, CapturedAudio},
+    settings::AppSettings,
+};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -29,10 +36,18 @@ impl Default for RecordingState {
     }
 }
 
+/// アクティブな録音セッションの制御ハンドル。
+pub struct SessionController {
+    pub stop_tx: watch::Sender<bool>,
+    pub capture_task: JoinHandle<anyhow::Result<CapturedAudio>>,
+}
+
 pub struct AppState {
     pub mode: Mutex<Mode>,
     pub recording_state: Mutex<RecordingState>,
     pub settings: Mutex<AppSettings>,
+    pub audio_input: Arc<dyn AudioInput>,
+    pub session: Mutex<Option<SessionController>>,
 }
 
 impl Default for AppState {
@@ -41,6 +56,8 @@ impl Default for AppState {
             mode: Mutex::new(Mode::default()),
             recording_state: Mutex::new(RecordingState::default()),
             settings: Mutex::new(AppSettings::default()),
+            audio_input: audio::default_input(),
+            session: Mutex::new(None),
         }
     }
 }

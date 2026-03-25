@@ -1,3 +1,4 @@
+use crate::audio::CapturedAudio;
 use super::SpeechProvider;
 
 /// モック実装。マイクや API なしで固定文字列を返す。
@@ -16,7 +17,7 @@ impl Default for MockSpeechProvider {
 
 #[async_trait::async_trait]
 impl SpeechProvider for MockSpeechProvider {
-    async fn transcribe(&self, _audio: &[f32]) -> anyhow::Result<String> {
+    async fn transcribe(&self, _audio: &CapturedAudio) -> anyhow::Result<String> {
         Ok(self.fixed_text.clone())
     }
 }

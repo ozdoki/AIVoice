@@ -15,7 +15,8 @@ export function MockTrigger({ onResult, onStateChange }: Props) {
     setError(null);
     onStateChange("processing");
     try {
-      const result = await invoke<string>("start_mock_session");
+      await invoke("start_recording_session");
+      const result = await invoke<string>("stop_recording_session");
       onResult(result);
     } catch (e) {
       setError(String(e));

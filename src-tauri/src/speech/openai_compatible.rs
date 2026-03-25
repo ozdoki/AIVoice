@@ -2,6 +2,7 @@ use anyhow::Context;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 
+use crate::audio::CapturedAudio;
 use super::SpeechProvider;
 
 pub struct OpenAiCompatibleProvider {
@@ -15,9 +16,12 @@ struct TranscriptionResponse {
     text: String,
 }
 
-/// f32 PCM サンプル列を RIFF WAV バイト列に変換する。
-/// サンプルレート 16000 Hz、モノラル、16-bit PCM 固定。
-fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+/// CapturedAudio を RIFF WAV バイト列に変換する。
+/// サンプルレート・チャンネル数は audio から取得する。
+fn encode_wav(audio: &CapturedAudio) -> Vec<u8> {
+    let samples = &audio.samples;
+    let sample_rate = audio.sample_rate;
+    let channels = audio.channels as u32;
     let num_samples = samples.len() as u32;
     let data_size = num_samples * 2; // 16-bit = 2 bytes/sample
     let file_size = 36 + data_size;
@@ -31,10 +35,10 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     buf.extend_from_slice(b"fmt ");
     buf.extend_from_slice(&16u32.to_le_bytes());
     buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    buf.extend_from_slice(&1u16.to_le_bytes()); // モノラル
+    buf.extend_from_slice(&(channels as u16).to_le_bytes());
     buf.extend_from_slice(&sample_rate.to_le_bytes());
-    buf.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // ByteRate
-    buf.extend_from_slice(&2u16.to_le_bytes()); // BlockAlign
+    buf.extend_from_slice(&(sample_rate * channels * 2).to_le_bytes()); // ByteRate
+    buf.extend_from_slice(&(channels as u16 * 2).to_le_bytes()); // BlockAlign
     buf.extend_from_slice(&16u16.to_le_bytes()); // BitsPerSample
 
     buf.extend_from_slice(b"data");
@@ -48,8 +52,8 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 
 #[async_trait::async_trait]
 impl SpeechProvider for OpenAiCompatibleProvider {
-    async fn transcribe(&self, audio: &[f32]) -> anyhow::Result<String> {
-        let wav = encode_wav(audio, 16000);
+    async fn transcribe(&self, audio: &CapturedAudio) -> anyhow::Result<String> {
+        let wav = encode_wav(audio);
         let client = reqwest::Client::new();
 
         let part = Part::bytes(wav)

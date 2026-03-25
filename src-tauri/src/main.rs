@@ -23,8 +23,8 @@ fn main() {
             commands::get_mode,
             commands::set_mode,
             commands::get_recording_state,
-            commands::start_mock_session,
-            commands::stop_session,
+            commands::start_recording_session,
+            commands::stop_recording_session,
             commands::get_settings,
             commands::save_settings,
         ])
