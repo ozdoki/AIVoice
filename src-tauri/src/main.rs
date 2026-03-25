@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use aivoice::{commands, hotkey, settings, state::AppState};
+use tauri::Manager;
 
 fn main() {
     tauri::Builder::default()

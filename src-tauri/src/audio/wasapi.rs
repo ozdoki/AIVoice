@@ -2,15 +2,13 @@ use std::{ptr::null_mut, slice};
 use anyhow::bail;
 use tokio::sync::watch;
 use windows::{
+    core::GUID,
     Win32::{
         Foundation::{CloseHandle, WAIT_OBJECT_0},
-        Media::{
-            Audio::{
-                eCapture, eConsole, IAudioCaptureClient, IAudioClient3, IMMDeviceEnumerator,
-                MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                WAVEFORMATEXTENSIBLE,
-            },
-            KernelStreaming::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, KSDATAFORMAT_SUBTYPE_PCM},
+        Media::Audio::{
+            eCapture, eConsole, IAudioCaptureClient, IAudioClient3, IMMDeviceEnumerator,
+            MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            WAVEFORMATEXTENSIBLE,
         },
         System::{
             Com::{
@@ -28,11 +26,27 @@ const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
+// {00000001-0000-0010-8000-00AA00389B71}
+const SUBTYPE_PCM: GUID = GUID::from_values(
+    0x0000_0001,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
+);
+
+// {00000003-0000-0010-8000-00AA00389B71}
+const SUBTYPE_IEEE_FLOAT: GUID = GUID::from_values(
+    0x0000_0003,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
+);
+
 pub struct WasapiInput;
 
 impl AudioInput for WasapiInput {
     fn capture_blocking(&self, stop_rx: watch::Receiver<bool>) -> anyhow::Result<CapturedAudio> {
-        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok(); }
+        unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
         let result = capture_inner(stop_rx);
         unsafe { CoUninitialize(); }
         result
@@ -67,7 +81,7 @@ fn capture_inner(stop_rx: watch::Receiver<bool>) -> anyhow::Result<CapturedAudio
             &mut max_period,
         )?;
         client.InitializeSharedAudioStream(
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK.0,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
             default_period,
             mix,
             None,
@@ -90,8 +104,7 @@ fn capture_inner(stop_rx: watch::Receiver<bool>) -> anyhow::Result<CapturedAudio
                 continue;
             }
             loop {
-                let mut packet_frames = 0u32;
-                capture.GetNextPacketSize(&mut packet_frames)?;
+                let packet_frames = capture.GetNextPacketSize()?;
                 if packet_frames == 0 {
                     break;
                 }
@@ -131,13 +144,15 @@ unsafe fn read_format(
         WAVE_FORMAT_IEEE_FLOAT => true,
         WAVE_FORMAT_PCM => false,
         WAVE_FORMAT_EXTENSIBLE => {
-            let ext = &*(wf as *const _ as *const WAVEFORMATEXTENSIBLE);
-            if ext.SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
+            let ext_ptr = wf as *const _ as *const WAVEFORMATEXTENSIBLE;
+            // WAVEFORMATEXTENSIBLE は packed struct なので read_unaligned を使う
+            let sub_format = std::ptr::read_unaligned(std::ptr::addr_of!((*ext_ptr).SubFormat));
+            if sub_format == SUBTYPE_IEEE_FLOAT {
                 true
-            } else if ext.SubFormat == KSDATAFORMAT_SUBTYPE_PCM {
+            } else if sub_format == SUBTYPE_PCM {
                 false
             } else {
-                bail!("unsupported WASAPI sub format: {:?}", ext.SubFormat);
+                bail!("unsupported WASAPI sub format: {:?}", sub_format);
             }
         }
         other => bail!("unsupported WASAPI format tag: {other}"),
