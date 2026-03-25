@@ -13,16 +13,19 @@ pub fn inject_text_after_f4(text: &str) -> anyhow::Result<()> {
 
 /// テキストをフォーカス中のアプリのカーソル位置に注入する。
 ///
-/// 第一経路: SendInput（Win32 API による直接入力）
-/// 第二経路: クリップボード + Ctrl+V（フォールバック）
+/// 第一経路: クリップボード + Ctrl+V（日本語 IME と干渉しない）
+/// 第二経路: SendInput KEYEVENTF_UNICODE（クリップボード失敗時のフォールバック）
+///
+/// KEYEVENTF_UNICODE は日本語 IME が composition モードのときに文字変換を
+/// 引き起こすことがあるため、クリップボード経由を優先する。
 pub fn inject_text(text: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        if send_input(text).is_ok() {
+        if clipboard_paste(text).is_ok() {
             return Ok(());
         }
-        tracing::warn!("SendInput failed, falling back to clipboard");
-        clipboard_paste(text)?;
+        tracing::warn!("clipboard paste failed, falling back to SendInput");
+        send_input(text)?;
     }
     #[cfg(not(target_os = "windows"))]
     {
