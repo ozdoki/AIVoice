@@ -1,16 +1,15 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter};
 
 /// グローバルホットキーを登録する。
 ///
-/// Win32 WH_KEYBOARD_LL フックを使用し、F4/F5 キーを他アプリに漏らさず抑制する。
-/// - F4 押下: `hotkey://start` を emit（録音開始）
-/// - F4 離す: `hotkey://stop`  を emit（録音停止・テキスト注入）
-/// - F5 押下: `hotkey://toggle-mode` を emit（Raw / Polish 切替）
+/// Win32 RegisterHotKey API を使用し、Ctrl+Shift+F4/F5 をグローバルホットキーとして登録する。
+/// - Ctrl+Shift+F4 押下: `hotkey://start` を emit（録音開始）
+/// - Ctrl+Shift+F4 離す: `hotkey://stop`  を emit（録音停止・テキスト注入）
+/// - Ctrl+Shift+F5 押下: `hotkey://toggle-mode` を emit（Raw / Polish 切替）
 pub fn register_hotkeys(app: &AppHandle) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        install_ll_hook(app)?;
+        install_hotkeys(app)?;
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -23,18 +22,15 @@ pub fn register_hotkeys(app: &AppHandle) -> anyhow::Result<()> {
 // ---- Windows 実装 -------------------------------------------------------
 
 #[cfg(target_os = "windows")]
-use std::sync::OnceLock;
+use std::sync::{atomic::{AtomicBool, Ordering}, OnceLock};
 
 /// フック→ディスパッチスレッド間チャネルの送信端
 #[cfg(target_os = "windows")]
 static KEY_SENDER: OnceLock<std::sync::mpsc::SyncSender<u8>> = OnceLock::new();
 
-/// F4 長押し時のキーリピートによる多重 emit を防ぐフラグ
+/// F4 キーアップ ポーリング多重起動防止
 #[cfg(target_os = "windows")]
-static F4_HELD: AtomicBool = AtomicBool::new(false);
-/// F5 キーリピート防止フラグ
-#[cfg(target_os = "windows")]
-static F5_HELD: AtomicBool = AtomicBool::new(false);
+static F4_POLLING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 const EV_F4_DOWN: u8 = 0;
@@ -44,78 +40,23 @@ const EV_F4_UP: u8 = 1;
 const EV_F5_DOWN: u8 = 2;
 
 #[cfg(target_os = "windows")]
-const VK_F4: u32 = 0x73;
+const HOTKEY_F4: i32 = 1;
 #[cfg(target_os = "windows")]
-const VK_F5: u32 = 0x74;
+const HOTKEY_F5: i32 = 2;
 
-/// 低レベルキーボードフック コールバック
-///
-/// F4/F5 を検出したら KEY_SENDER に送信し LRESULT(1) を返してキーを消費する。
-/// それ以外のキーは CallNextHookEx でパスする。
 #[cfg(target_os = "windows")]
-unsafe extern "system" fn ll_keyboard_proc(
-    code: i32,
-    wparam: windows::Win32::Foundation::WPARAM,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::{
-        Foundation::LRESULT,
-        UI::WindowsAndMessaging::{
-            CallNextHookEx, HHOOK, KBDLLHOOKSTRUCT,
-            WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+fn install_hotkeys(app: &AppHandle) -> anyhow::Result<()> {
+    use windows::Win32::UI::{
+        Input::KeyboardAndMouse::{
+            RegisterHotKey, UnregisterHotKey,
+            HOT_KEY_MODIFIERS, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
         },
-    };
-
-    if code >= 0 {
-        let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        let msg = wparam.0 as u32;
-        let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-        let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
-
-        match kb.vkCode {
-            VK_F4 => {
-                if let Some(tx) = KEY_SENDER.get() {
-                    if is_down {
-                        // キーリピートを無視: 最初の押下のみ emit
-                        if !F4_HELD.swap(true, Ordering::AcqRel) {
-                            let _ = tx.try_send(EV_F4_DOWN);
-                        }
-                    } else if is_up {
-                        F4_HELD.store(false, Ordering::Release);
-                        let _ = tx.try_send(EV_F4_UP);
-                    }
-                }
-                return LRESULT(1); // キーを消費（他アプリに渡さない）
-            }
-            VK_F5 if is_down => {
-                // キーリピートを無視: 最初の押下のみ emit
-                if !F5_HELD.swap(true, Ordering::AcqRel) {
-                    if let Some(tx) = KEY_SENDER.get() {
-                        let _ = tx.try_send(EV_F5_DOWN);
-                    }
-                }
-                return LRESULT(1);
-            }
-            VK_F5 if is_up => {
-                F5_HELD.store(false, Ordering::Release);
-                return LRESULT(1);
-            }
-            _ => {}
-        }
-    }
-
-    CallNextHookEx(HHOOK(std::ptr::null_mut()), code, wparam, lparam)
-}
-
-#[cfg(target_os = "windows")]
-fn install_ll_hook(app: &AppHandle) -> anyhow::Result<()> {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG, WH_KEYBOARD_LL,
+        WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY},
     };
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<u8>(32);
     KEY_SENDER
-        .set(tx)
+        .set(tx.clone())
         .map_err(|_| anyhow::anyhow!("KEY_SENDER already initialized"))?;
 
     // イベントディスパッチスレッド: チャネルから受け取り Tauri emit を呼ぶ
@@ -137,22 +78,78 @@ fn install_ll_hook(app: &AppHandle) -> anyhow::Result<()> {
         }
     });
 
-    // フックスレッド: WH_KEYBOARD_LL をインストールしてメッセージループを回す
-    std::thread::spawn(|| unsafe {
-        let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), None, 0) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!("WH_KEYBOARD_LL install failed: {e}");
-                return;
-            }
-        };
+    // ホットキースレッド: RegisterHotKey でグローバルホットキーを登録しメッセージループを回す
+    std::thread::spawn(move || unsafe {
+        let modifiers: HOT_KEY_MODIFIERS = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT;
+
+        // Ctrl+Shift+F4
+        if let Err(e) = RegisterHotKey(None, HOTKEY_F4, modifiers, 0x73 /* VK_F4 */) {
+            tracing::error!("RegisterHotKey(Ctrl+Shift+F4) failed: {e}");
+            return;
+        }
+        // Ctrl+Shift+F5
+        if let Err(e) = RegisterHotKey(None, HOTKEY_F5, modifiers, 0x74 /* VK_F5 */) {
+            tracing::error!("RegisterHotKey(Ctrl+Shift+F5) failed: {e}");
+            return;
+        }
+
+        tracing::info!("Global hotkeys registered: Ctrl+Shift+F4, Ctrl+Shift+F5");
 
         let mut msg = MSG::default();
-        // GetMessageW がメッセージループを維持しフックコールバックを動かし続ける
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.message == WM_HOTKEY {
+                let id = msg.wParam.0 as i32;
+                match id {
+                    HOTKEY_F4 => {
+                        if let Some(sender) = KEY_SENDER.get() {
+                            let _ = sender.try_send(EV_F4_DOWN);
+                        }
+                        // F4 リリースをポーリングで検出
+                        if !F4_POLLING.swap(true, Ordering::AcqRel) {
+                            let tx2 = tx.clone();
+                            std::thread::spawn(move || {
+                                poll_f4_release(&tx2);
+                                F4_POLLING.store(false, Ordering::Release);
+                            });
+                        }
+                    }
+                    HOTKEY_F5 => {
+                        if let Some(sender) = KEY_SENDER.get() {
+                            let _ = sender.try_send(EV_F5_DOWN);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
-        let _ = UnhookWindowsHookEx(hook);
+        let _ = UnregisterHotKey(None, HOTKEY_F4);
+        let _ = UnregisterHotKey(None, HOTKEY_F5);
     });
 
     Ok(())
+}
+
+/// F4 キーが物理的に離されるまでポーリングし、離されたら EV_F4_UP を送信する。
+#[cfg(target_os = "windows")]
+fn poll_f4_release(tx: &std::sync::mpsc::SyncSender<u8>) {
+    use std::time::{Duration, Instant};
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    const VK_F4: i32 = 0x73;
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    while Instant::now() < deadline {
+        let is_down = unsafe { GetAsyncKeyState(VK_F4) } < 0;
+        if !is_down {
+            std::thread::sleep(Duration::from_millis(30));
+            let _ = tx.try_send(EV_F4_UP);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // タイムアウト: 安全のため停止イベントを送る
+    tracing::warn!("F4 release polling timed out (30s)");
+    let _ = tx.try_send(EV_F4_UP);
 }

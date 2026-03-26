@@ -4,6 +4,13 @@ use tauri::{
     AppHandle, Manager,
 };
 
+/// トレイアイコンのツールチップを現在の録音状態とモードで更新する。
+pub fn update_status(app: &AppHandle, recording_state: &str, mode: &str) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_tooltip(Some(&format!("AIVoice  {mode}  {recording_state}")));
+    }
+}
+
 const MENU_SHOW: &str = "show";
 const MENU_QUIT: &str = "quit";
 

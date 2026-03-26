@@ -1,11 +1,10 @@
-use std::sync::Arc;
 use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
 };
 
 use crate::{
-    audio::{self, AudioInput, CapturedAudio},
+    audio::CapturedAudio,
     settings::AppSettings,
 };
 
@@ -46,7 +45,6 @@ pub struct AppState {
     pub mode: Mutex<Mode>,
     pub recording_state: Mutex<RecordingState>,
     pub settings: Mutex<AppSettings>,
-    pub audio_input: Arc<dyn AudioInput>,
     pub session: Mutex<Option<SessionController>>,
 }
 
@@ -56,7 +54,6 @@ impl Default for AppState {
             mode: Mutex::new(Mode::default()),
             recording_state: Mutex::new(RecordingState::default()),
             settings: Mutex::new(AppSettings::default()),
-            audio_input: audio::default_input(),
             session: Mutex::new(None),
         }
     }

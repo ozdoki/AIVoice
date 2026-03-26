@@ -22,21 +22,21 @@
 
 ---
 
-## 002: グローバルホットキーを WH_KEYBOARD_LL にした
+## 002: グローバルホットキーを RegisterHotKey にした
 
-**決定**: F4/F5 のグローバルホットキーは `tauri-plugin-global-shortcut` ではなく
-Win32 の `WH_KEYBOARD_LL` + `LRESULT(1)` で実装する。
+**決定**: Ctrl+Shift+F4/F5 のグローバルホットキーは Win32 の `RegisterHotKey` API で実装する。
 
-**理由**:
-`tauri-plugin-global-shortcut` では、ホットキーをアプリが受け取った後も
-キーイベントが他のアプリへ漏れてしまう問題があった（F4 を押すと一部アプリでダイアログが開くなど）。
-`WH_KEYBOARD_LL` フックで `LRESULT(1)` を返すことでキーを「消費」し、他アプリへの伝播を防げる。
+**経緯**:
+1. `tauri-plugin-global-shortcut` → F4 が他アプリに漏れる問題で却下
+2. `WH_KEYBOARD_LL` + AtomicBool 修飾キー追跡 → Windows 11 の入力言語切替ホットキー（Ctrl+Shift）が OS レベルで横取りし、Ctrl/Shift/F4 イベントがフックコールバックに届かない問題で断念
+3. `RegisterHotKey` → OS が修飾キー検出を内部処理するため言語切替との競合なし。keyup は `GetAsyncKeyState` ポーリングで検出
 
 **トレードオフ**:
 - Win32 固有の実装になり、macOS/Linux への移植コストが上がる
-- フックスレッドの管理が複雑になる（`AtomicBool` でキーリピート防止が必要）
+- RegisterHotKey は keydown のみ通知 → F4 リリースは GetAsyncKeyState ポーリング（10ms 間隔）で検出
+- 他アプリが同じホットキーを RegisterHotKey 済みの場合、登録が失敗する
 
-**日付**: 2026-03 ホットキー実装セッション
+**日付**: 2026-03-26 ホットキー移行セッション
 
 ---
 

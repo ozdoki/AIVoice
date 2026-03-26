@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ModeSwitch } from "./components/ModeSwitch";
@@ -11,48 +11,78 @@ type RecordingState = "idle" | "recording" | "processing";
 
 function App() {
   const [mode, setMode] = useState<Mode>("raw");
+  const modeRef = useRef<Mode>("raw");
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
   const [lastText, setLastText] = useState<string | null>(null);
+  const [lastError, setLastError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
 
+  // modeRef を常に最新に保つ
   useEffect(() => {
-    invoke<Mode>("get_mode").then(setMode).catch(console.error);
+    modeRef.current = mode;
+  }, [mode]);
+
+  useEffect(() => {
+    invoke<Mode>("get_mode").then((m) => {
+      setMode(m);
+      modeRef.current = m;
+    }).catch(console.error);
   }, []);
 
+  // ホットキーリスナーは1回だけ登録する（mode 変化で再登録しない）
   useEffect(() => {
-    const unlistenStart = listen("hotkey://start", async () => {
-      try {
-        await invoke("start_recording_session");
-        setRecordingState("recording");
-      } catch (e) {
-        console.error(e);
-      }
-    });
+    let disposed = false;
+    let unlisteners: Array<() => void> = [];
 
-    const unlistenStop = listen("hotkey://stop", async () => {
-      setRecordingState("processing");
-      try {
-        const text = await invoke<string>("stop_recording_session");
-        if (text) setLastText(text);
-      } catch (e) {
-        console.error(e);
-      } finally {
-        setRecordingState("idle");
-      }
-    });
+    const setup = async () => {
+      const offs = await Promise.all([
+        listen("hotkey://start", async () => {
+          try {
+            await invoke("start_recording_session");
+            setRecordingState("recording");
+          } catch (e) {
+            console.error(e);
+          }
+        }),
+        listen("hotkey://stop", async () => {
+          setRecordingState("processing");
+          try {
+            const text = await invoke<string>("stop_recording_session");
+            setLastError(null);
+            if (text) setLastText(text);
+          } catch (e) {
+            setLastError(String(e));
+            console.error(e);
+          } finally {
+            setRecordingState("idle");
+          }
+        }),
+        listen("hotkey://toggle-mode", async () => {
+          const next: Mode = modeRef.current === "raw" ? "polish" : "raw";
+          try {
+            await invoke("set_mode", { mode: next });
+            modeRef.current = next;
+            setMode(next);
+          } catch (e) {
+            console.error(e);
+          }
+        }),
+      ]);
 
-    const unlistenToggle = listen("hotkey://toggle-mode", async () => {
-      const next: Mode = mode === "raw" ? "polish" : "raw";
-      await invoke("set_mode", { mode: next }).catch(console.error);
-      setMode(next);
-    });
+      if (disposed) {
+        offs.forEach((off) => off());
+        return;
+      }
+      unlisteners = offs;
+    };
+
+    setup().catch(console.error);
 
     return () => {
-      unlistenStart.then((f) => f());
-      unlistenStop.then((f) => f());
-      unlistenToggle.then((f) => f());
+      disposed = true;
+      unlisteners.forEach((off) => off());
     };
-  }, [mode]);
+  }, []);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "1.5rem", paddingTop: "2rem" }}>
@@ -78,6 +108,21 @@ function App() {
       <ModeSwitch mode={mode} onModeChange={setMode} />
 
       <SessionPanel state={recordingState} lastText={lastText} />
+
+      {lastError && (
+        <div style={{
+          color: "#c00",
+          background: "#fff0f0",
+          border: "1px solid #fcc",
+          borderRadius: "6px",
+          padding: "0.5rem 1rem",
+          fontSize: "0.85rem",
+          maxWidth: "320px",
+          textAlign: "center",
+        }}>
+          {lastError}
+        </div>
+      )}
 
       <MockTrigger
         onResult={(text) => setLastText(text)}

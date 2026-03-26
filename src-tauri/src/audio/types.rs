@@ -1,6 +1,13 @@
 use std::time::Duration;
 use tokio::sync::watch;
 
+/// 音声入力デバイスの情報。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AudioDeviceInfo {
+    pub id: String,
+    pub name: String,
+}
+
 /// キャプチャした音声データ。samples は interleaved PCM (-1.0..1.0)。
 #[derive(Debug, Clone, Default)]
 pub struct CapturedAudio {

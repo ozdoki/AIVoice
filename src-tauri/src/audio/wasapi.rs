@@ -20,7 +20,7 @@ use windows::{
     },
 };
 
-use super::types::{AudioInput, CapturedAudio};
+use super::types::{AudioDeviceInfo, AudioInput, CapturedAudio};
 
 const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
@@ -42,15 +42,65 @@ const SUBTYPE_IEEE_FLOAT: GUID = GUID::from_values(
     [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
 );
 
-pub struct WasapiInput;
+pub struct WasapiInput {
+    pub device_id: Option<String>,
+}
 
 impl AudioInput for WasapiInput {
     fn capture_blocking(&self, stop_rx: watch::Receiver<bool>) -> anyhow::Result<CapturedAudio> {
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
-        let result = capture_inner(stop_rx);
+        let result = capture_inner(stop_rx, self.device_id.as_deref());
         unsafe { CoUninitialize(); }
         result
     }
+}
+
+/// キャプチャデバイスの一覧を返す。
+pub fn list_capture_devices() -> anyhow::Result<Vec<AudioDeviceInfo>> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let result = list_devices_inner();
+        CoUninitialize();
+        result
+    }
+}
+
+unsafe fn list_devices_inner() -> anyhow::Result<Vec<AudioDeviceInfo>> {
+    use windows::Win32::Media::Audio::DEVICE_STATE_ACTIVE;
+    use windows::Win32::System::Com::{CoTaskMemFree, STGM_READ};
+    use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+    use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+
+    let enumerator: IMMDeviceEnumerator =
+        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+    let collection = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
+    let count = collection.GetCount()?;
+
+    let mut devices = Vec::new();
+    for i in 0..count {
+        let device = collection.Item(i)?;
+
+        // デバイス ID を取得（CoTaskMemFree で解放必要）
+        let id_pwstr = device.GetId()?;
+        let id = id_pwstr.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(id_pwstr.as_ptr().cast()));
+
+        // フレンドリ名を取得
+        let name = (|| -> anyhow::Result<String> {
+            let store: IPropertyStore = device.OpenPropertyStore(STGM_READ)?;
+            let mut prop = store.GetValue(&PKEY_Device_FriendlyName)?;
+            let name_pwstr = PropVariantToStringAlloc(&prop)?;
+            let name = name_pwstr.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(name_pwstr.as_ptr().cast()));
+            PropVariantClear(&mut prop)?;
+            Ok(name)
+        })()
+        .unwrap_or_else(|_| format!("Device {}", i + 1));
+
+        devices.push(AudioDeviceInfo { id, name });
+    }
+    Ok(devices)
 }
 
 struct CaptureFormat {
@@ -59,11 +109,16 @@ struct CaptureFormat {
     is_float: bool,
 }
 
-fn capture_inner(stop_rx: watch::Receiver<bool>) -> anyhow::Result<CapturedAudio> {
+fn capture_inner(stop_rx: watch::Receiver<bool>, device_id: Option<&str>) -> anyhow::Result<CapturedAudio> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let device = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)?;
+        let device = if let Some(id) = device_id {
+            let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+            enumerator.GetDevice(windows::core::PCWSTR(wide.as_ptr()))?
+        } else {
+            enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)?
+        };
         let client: IAudioClient3 = device.Activate(CLSCTX_ALL, None)?;
 
         let mix = client.GetMixFormat()?;

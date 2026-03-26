@@ -6,6 +6,12 @@ interface AppSettings {
   api_key: string;
   api_model: string;
   polish_model: string;
+  device_id: string | null;
+}
+
+interface AudioDevice {
+  id: string;
+  name: string;
 }
 
 interface Props {
@@ -18,12 +24,15 @@ export function SettingsPanel({ onClose }: Props) {
     api_key: "",
     api_model: "whisper-1",
     polish_model: "gpt-4o-mini",
+    device_id: null,
   });
+  const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
     invoke<AppSettings>("get_settings").then(setSettings).catch(console.error);
+    invoke<AudioDevice[]>("list_audio_devices").then(setDevices).catch(() => {});
   }, []);
 
   const handleSave = async () => {
@@ -40,9 +49,10 @@ export function SettingsPanel({ onClose }: Props) {
     }
   };
 
+  type StringKey = { [K in keyof AppSettings]: AppSettings[K] extends string ? K : never }[keyof AppSettings];
   const field = (
     label: string,
-    key: keyof AppSettings,
+    key: StringKey,
     type: "text" | "password" = "text"
   ) => (
     <div style={{ marginBottom: "1rem" }}>
@@ -94,8 +104,32 @@ export function SettingsPanel({ onClose }: Props) {
         {field("ASR Model", "api_model")}
         {field("Polish Model", "polish_model")}
 
+        <div style={{ marginBottom: "1rem" }}>
+          <label style={{ display: "block", fontSize: "0.8rem", color: "#aaa", marginBottom: "0.3rem" }}>
+            マイクデバイス
+          </label>
+          <select
+            value={settings.device_id ?? ""}
+            onChange={(e) => setSettings((s) => ({ ...s, device_id: e.target.value || null }))}
+            style={{
+              width: "100%",
+              background: "#1a1a1a",
+              border: "1px solid #444",
+              borderRadius: "6px",
+              padding: "0.4rem 0.6rem",
+              color: "#f0f0f0",
+              fontSize: "0.9rem",
+            }}
+          >
+            <option value="">デフォルト</option>
+            {devices.map((d) => (
+              <option key={d.id} value={d.id}>{d.name}</option>
+            ))}
+          </select>
+        </div>
+
         <p style={{ fontSize: "0.72rem", color: "#666", marginBottom: "1rem" }}>
-          ホットキー: F4 = 録音開始/停止　F5 = Raw / Polish 切替
+          ホットキー: Ctrl+Shift+F4 = 録音開始/停止　Ctrl+Shift+F5 = Raw / Polish 切替
         </p>
 
         <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>

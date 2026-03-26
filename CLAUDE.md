@@ -30,5 +30,5 @@
 ## 絶対に変えてはいけない制約
 - テキスト注入は `KEYEVENTF_UNICODE` ではなく clipboard+Ctrl+V を使う
   → 日本語 IME が KEYEVENTF_UNICODE を composition モードで処理し余計な文字が挿入されるため
-- グローバルホットキーは `tauri-plugin-global-shortcut` ではなく `WH_KEYBOARD_LL` を使う
-  → plugin-global-shortcut では F4 キーが他アプリに漏れるため
+- グローバルホットキーは `RegisterHotKey` API を使う（`tauri-plugin-global-shortcut` や `WH_KEYBOARD_LL` に戻さない）
+  → plugin-global-shortcut では F4 が他アプリに漏れ、WH_KEYBOARD_LL は Windows 言語切替(Ctrl+Shift)と競合する

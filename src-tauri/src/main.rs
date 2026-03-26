@@ -8,8 +8,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::default().build())
         .plugin(tauri_plugin_store::Builder::default().build())
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .manage(AppState::default())
+.manage(AppState::default())
         .setup(|app| {
             // 永続ストアから設定を読み込んで AppState に反映
             if let Ok(s) = settings::load(&app.handle()) {
@@ -46,6 +45,7 @@ fn main() {
             commands::stop_recording_session,
             commands::get_settings,
             commands::save_settings,
+            commands::list_audio_devices,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
