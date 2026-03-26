@@ -66,13 +66,85 @@
 API キーのような秘密情報は OS が管理する認証情報ストアに分離すべき。
 
 **実装**:
-- `AppSettings` の `api_key` に `#[serde(skip)]` を付与（JSON から除外）
+- `AppSettings` の `api_key` に `#[serde(skip_serializing, default)]` を付与
+  - `skip_serializing`: JSON 出力時は除外（settings.json には書かない）
+  - `default`: JSON 入力時はフィールドがなければ空文字で初期化
+  - ※ 当初 `#[serde(skip)]`（シリアライズ・デシリアライズ両方スキップ）だったが、
+    フロントエンドからの invoke ペイロードもデシリアライズされず api_key が常に空になるバグがあった。
+    `skip_serializing` に変更することで「JSON 保存には書かないが invoke では受け取れる」設計になった。
 - `settings::load()` / `save()` が `keyring::Entry` を通じて Credential Manager を読み書き
 - サービス名 `"aivoice"` / ユーザー名 `"api_key"` でエントリを識別
 
 **トレードオフ**:
 - 既存ユーザーは API キーを再入力する必要がある（旧 JSON からの自動移行なし）
 - `keyring` クレートが OS のシークレットバックエンドに依存する（Windows: DPAPI、macOS: Keychain、Linux: Secret Service）
+
+**日付**: 2026-03-26
+
+---
+
+## 006: セッション状態を Rust から全ウィンドウに emit する（Phase 0）
+
+**決定**: 録音開始・処理中・完了・エラーの状態変化は Rust の `commands.rs` から `session://state-changed` イベントとして全ウィンドウへ broadcast する。UI は状態をローカル管理しない。
+
+**理由**:
+フローティングバーを追加して複数ウィンドウ構成になると、「ホットキー → App.tsx が invoke → App.tsx がローカル state 更新」という設計では floating-bar が状態を知る手段がなくなる。
+Rust を真の状態源にして全ウィンドウへ broadcast することで、ウィンドウ数に依存しない一貫した状態同期ができる。
+
+**実装**:
+- `SessionUiEvent { state, mode, final_text, error }` を `commands.rs` で定義
+- `start_recording_session` / `stop_recording_session` コマンドが emit
+- `App.tsx` は `hotkey://start` / `hotkey://stop` リスナーで `invoke` を呼ぶだけ。`setRecordingState` は `session://state-changed` リスナーに一本化
+- `FloatingBar` は `session://state-changed` のみ購読。`invoke` は停止ボタンのみ
+
+**トレードオフ**:
+- `hotkey://toggle-mode` だけはまだ App.tsx 側で invoke + setMode しており、mode 変更イベントは session 経由では来ない。floating-bar は recording 開始時の event payload に含まれる mode で表示を更新するため、録音開始前の mode 変更は bar には反映されない（バー表示中は常に最新 mode が届くので実用上問題なし）
+
+**日付**: 2026-03-26
+
+---
+
+## 007: フローティングバーを別ウィンドウで実装する
+
+**決定**: 音声入力中インジケーターは、メインウィンドウ内の UI ではなく Tauri の別ウィンドウ（`floating-bar`）として実装する。
+
+**理由**:
+- メインウィンドウは通常 hidden 状態で使われる。別ウィンドウにすることでメインが非表示でもバーを表示できる
+- `decorations: false` / `alwaysOnTop: true` / `transparent: true` の組み合わせで他アプリに重なる常時前面ウィンドウを実現できる
+- `skipTaskbar: true` でタスクバーを汚さない
+
+**実装**:
+- `tauri.conf.json` に `floating-bar` ウィンドウを追加（`visible: false` で起動）
+- `src/main.tsx` で `getCurrentWindow().label` を見て `<FloatingBar>` か `<App>` かをルーティング
+- `recording` 時に `win.show()` でタスクバー上に表示、`idle` 時に `win.hide()`
+- ウィンドウサイズは 300×60px（ピル 280×44px + shadow 余白）
+
+**トレードオフ**:
+- `win.show()` 時にフォーカスを奪う可能性がある（未対処。問題が出れば Rust 側から `ShowWindow(SW_SHOWNOACTIVATE)` で対処する）
+- Tauri の `core:window:allow-show` など window 系パーミッションを明示的に追加する必要がある
+
+**日付**: 2026-03-26
+
+---
+
+## 008: WASAPI ループ内で RMS を計算し audio://level で emit する
+
+**決定**: マイク音量の可視化は、`wasapi.rs` のキャプチャループ内でバッファごとに RMS を計算し、`tokio::sync::mpsc::UnboundedSender<f32>` 経由で `commands.rs` の転送タスクへ渡し、`audio://level` イベントとして全ウィンドウへ emit する。
+
+**理由**:
+- WASAPI バッファは既に `f32` に正規化されており、追加変換なしで RMS を計算できる
+- `UnboundedSender` は `Send` かつ同期的に `send` できるため、blocking スレッド（WASAPI ループ）から tokio ランタイムへのブリッジとして自然に使える
+- `WasapiInput` が drop されると sender も drop され、受信側タスクが自動終了する（明示的なキャンセル不要）
+
+**実装**:
+- `audio::new_input` に `level_tx: Option<UnboundedSender<f32>>` を追加
+- `WasapiInput` がそれを保持し `capture_inner` に渡す
+- `session_service::start_session_inner` も `level_tx` を受け取り `new_input` へ転送
+- `commands::start_recording_session` でチャネルを生成し、転送タスクを spawn
+- フロントエンドは `requestAnimationFrame` ループで指数移動平均（α=0.4）を使い 60fps でスムーズに表示
+
+**トレードオフ**:
+- バッファイベントは約 10ms 間隔で届くため ~100 イベント/秒が IPC を流れる。現状許容しているが、パフォーマンス問題が出れば Rust 側でスロットリング（50ms ごとに最大値 emit）を検討する
 
 **日付**: 2026-03-26
 

@@ -13,7 +13,8 @@ const KEYRING_USER: &str = "api_key";
 pub struct AppSettings {
     pub api_base_url: String,
     /// api_key は JSON には保存しない。Credential Manager で管理する。
-    #[serde(skip)]
+    /// skip_serializing のみ: ストア保存時は出力しないが、invoke 受信時はデシリアライズする。
+    #[serde(skip_serializing, default)]
     pub api_key: String,
     pub api_model: String,
     pub polish_model: String,

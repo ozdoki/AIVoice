@@ -23,7 +23,10 @@ impl TextInjector for ClipboardInjector {
 }
 
 /// 録音開始の本体。AppHandle 不要のため単体テスト可能。
-pub async fn start_session_inner(state: &AppState) -> Result<(), String> {
+pub async fn start_session_inner(
+    state: &AppState,
+    level_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
+) -> Result<(), String> {
     let mut session = state.session.lock().await;
     if session.is_some() {
         return Ok(());
@@ -31,7 +34,7 @@ pub async fn start_session_inner(state: &AppState) -> Result<(), String> {
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let device_id = state.settings.lock().await.device_id.clone();
-    let input = audio::new_input(device_id.as_deref());
+    let input = audio::new_input(device_id.as_deref(), level_tx);
     let capture_task =
         tokio::task::spawn_blocking(move || input.capture_blocking(stop_rx));
 
@@ -157,7 +160,7 @@ mod tests {
     #[tokio::test]
     async fn start_session_sets_recording_state() {
         let state = AppState::default();
-        start_session_inner(&state).await.unwrap();
+        start_session_inner(&state, None).await.unwrap();
         assert!(matches!(
             *state.recording_state.lock().await,
             RecordingState::Recording
@@ -171,8 +174,8 @@ mod tests {
     #[tokio::test]
     async fn start_session_is_idempotent() {
         let state = AppState::default();
-        start_session_inner(&state).await.unwrap();
-        start_session_inner(&state).await.unwrap();
+        start_session_inner(&state, None).await.unwrap();
+        start_session_inner(&state, None).await.unwrap();
         // セッションが1つだけであることを確認
         assert!(state.session.lock().await.is_some());
         // WASAPI タスクをアボートして後続のテストがハングしないようにする

@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ModeSwitch } from "./components/ModeSwitch";
 import { SessionPanel } from "./components/SessionPanel";
-import { MockTrigger } from "./components/MockTrigger";
 import { SettingsPanel } from "./components/SettingsPanel";
 
 type Mode = "raw" | "polish";
@@ -36,25 +35,31 @@ function App() {
 
     const setup = async () => {
       const offs = await Promise.all([
+        // Rust から全ウィンドウに配信されるセッション状態イベント
+        listen<{ state: RecordingState; mode: Mode; final_text: string | null; error: string | null }>(
+          "session://state-changed",
+          (event) => {
+            const { state, final_text, error } = event.payload;
+            setRecordingState(state);
+            if (state === "idle") {
+              setLastError(error ?? null);
+              if (final_text) setLastText(final_text);
+            }
+          }
+        ),
+        // ホットキーハンドラは invoke のみ。状態管理は session イベントに委譲。
         listen("hotkey://start", async () => {
           try {
             await invoke("start_recording_session");
-            setRecordingState("recording");
           } catch (e) {
             console.error(e);
           }
         }),
         listen("hotkey://stop", async () => {
-          setRecordingState("processing");
           try {
-            const text = await invoke<string>("stop_recording_session");
-            setLastError(null);
-            if (text) setLastText(text);
+            await invoke<string>("stop_recording_session");
           } catch (e) {
-            setLastError(String(e));
             console.error(e);
-          } finally {
-            setRecordingState("idle");
           }
         }),
         listen("hotkey://toggle-mode", async () => {
@@ -122,13 +127,6 @@ function App() {
         }}>
           {lastError}
         </div>
-      )}
-
-      {import.meta.env.DEV && (
-        <MockTrigger
-          onResult={(text) => setLastText(text)}
-          onStateChange={(s) => setRecordingState(s)}
-        />
       )}
 
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}

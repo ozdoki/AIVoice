@@ -44,12 +44,13 @@ const SUBTYPE_IEEE_FLOAT: GUID = GUID::from_values(
 
 pub struct WasapiInput {
     pub device_id: Option<String>,
+    pub level_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
 }
 
 impl AudioInput for WasapiInput {
     fn capture_blocking(&self, stop_rx: watch::Receiver<bool>) -> anyhow::Result<CapturedAudio> {
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
-        let result = capture_inner(stop_rx, self.device_id.as_deref());
+        let result = capture_inner(stop_rx, self.device_id.as_deref(), self.level_tx.clone());
         unsafe { CoUninitialize(); }
         result
     }
@@ -109,7 +110,16 @@ struct CaptureFormat {
     is_float: bool,
 }
 
-fn capture_inner(stop_rx: watch::Receiver<bool>, device_id: Option<&str>) -> anyhow::Result<CapturedAudio> {
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() { return 0.0; }
+    (samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+fn capture_inner(
+    stop_rx: watch::Receiver<bool>,
+    device_id: Option<&str>,
+    level_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
+) -> anyhow::Result<CapturedAudio> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
@@ -174,13 +184,17 @@ fn capture_inner(stop_rx: watch::Receiver<bool>, device_id: Option<&str>) -> any
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
                 let sample_count = frames as usize * fmt.channels as usize;
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                    if let Some(tx) = &level_tx { let _ = tx.send(0.0); }
                     samples.resize(samples.len() + sample_count, 0.0f32);
                 } else if fmt.is_float {
                     let src = slice::from_raw_parts(data as *const f32, sample_count);
+                    if let Some(tx) = &level_tx { let _ = tx.send(rms(src)); }
                     samples.extend_from_slice(src);
                 } else {
                     let src = slice::from_raw_parts(data as *const i16, sample_count);
-                    samples.extend(src.iter().map(|&v| v as f32 / 32768.0));
+                    let normalized: Vec<f32> = src.iter().map(|&v| v as f32 / 32768.0).collect();
+                    if let Some(tx) = &level_tx { let _ = tx.send(rms(&normalized)); }
+                    samples.extend(normalized);
                 }
                 capture.ReleaseBuffer(frames)?;
             }

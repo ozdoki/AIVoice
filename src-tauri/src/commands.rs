@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::{
     audio,
@@ -7,6 +7,15 @@ use crate::{
     state::{AppState, Mode, RecordingState},
     tray,
 };
+
+/// Rust → 全ウィンドウへ配信するセッション状態イベント。
+#[derive(Clone, serde::Serialize)]
+struct SessionUiEvent {
+    state: RecordingState,
+    mode: Mode,
+    final_text: Option<String>,
+    error: Option<String>,
+}
 
 #[tauri::command]
 pub async fn get_mode(state: State<'_, AppState>) -> Result<Mode, String> {
@@ -48,11 +57,27 @@ pub async fn start_recording_session(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    session_service::start_session_inner(&state).await?;
+    let (level_tx, mut level_rx) = tokio::sync::mpsc::unbounded_channel::<f32>();
+    session_service::start_session_inner(&state, Some(level_tx)).await?;
 
     let mode = state.mode.lock().await.clone();
     let mode_str = if matches!(mode, Mode::Polish) { "Polish" } else { "Raw" };
     tray::update_status(&app, "録音中 ●", mode_str);
+    let _ = app.emit("session://state-changed", SessionUiEvent {
+        state: RecordingState::Recording,
+        mode,
+        final_text: None,
+        error: None,
+    });
+
+    // 音量レベルを FloatingBar に転送するタスク（WasapiInput が drop されると自動終了）
+    let app_level = app.clone();
+    tokio::spawn(async move {
+        while let Some(level) = level_rx.recv().await {
+            let _ = app_level.emit("audio://level", level);
+        }
+    });
+
     Ok(())
 }
 
@@ -62,12 +87,29 @@ pub async fn stop_recording_session(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    // Processing 状態を全ウィンドウに通知
+    {
+        let mode = state.mode.lock().await.clone();
+        let _ = app.emit("session://state-changed", SessionUiEvent {
+            state: RecordingState::Processing,
+            mode,
+            final_text: None,
+            error: None,
+        });
+    }
+
     let result = session_service::stop_session_inner(&state, &ClipboardInjector).await;
 
     let mode = state.mode.lock().await.clone();
     let mode_str = if matches!(mode, Mode::Polish) { "Polish" } else { "Raw" };
     let status_str = if result.is_ok() { "待機中" } else { "エラー ✕" };
     tray::update_status(&app, status_str, mode_str);
+    let _ = app.emit("session://state-changed", SessionUiEvent {
+        state: RecordingState::Idle,
+        mode,
+        final_text: result.as_ref().ok().filter(|s| !s.is_empty()).cloned(),
+        error: result.as_ref().err().cloned(),
+    });
 
     result
 }

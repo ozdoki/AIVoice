@@ -11,11 +11,25 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "AIVoice",
         "width": 400,
         "height": 600,
         "resizable": true,
         "fullscreen": false
+      },
+      {
+        "label": "floating-bar",
+        "title": "AIVoice",
+        "width": 300,
+        "height": 60,
+        "resizable": false,
+        "fullscreen": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false
       }
     ],
     "security": {
