@@ -51,6 +51,7 @@ fn wait_until_key_up(vk: i32, timeout_ms: u64) {
 #[cfg(target_os = "windows")]
 fn clipboard_paste(text: &str) -> anyhow::Result<()> {
     use arboard::Clipboard;
+    use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_V,
     };
@@ -59,7 +60,11 @@ fn clipboard_paste(text: &str) -> anyhow::Result<()> {
     // 現在のクリップボード内容を退避
     let previous_text = clipboard.get_text().ok();
 
+    // クリップボード変更シーケンス番号を記録（set_text 前）
+    let seq_before = unsafe { GetClipboardSequenceNumber() };
+
     clipboard.set_text(text)?;
+    // この時点でシーケンス番号は seq_before + 1 になっているはず
 
     // Ctrl+V を送信
     let ctrl_v: [INPUT; 4] = [
@@ -117,8 +122,19 @@ fn clipboard_paste(text: &str) -> anyhow::Result<()> {
 
     // ペーストが完了するのを待ってからクリップボードを復元
     std::thread::sleep(std::time::Duration::from_millis(150));
-    if let Some(prev) = previous_text {
-        let _ = clipboard.set_text(&prev);
+
+    // 待機中に別プロセスがクリップボードを書き換えた場合は復元しない。
+    // seq_before + 1 == 自分の set_text のみ。それ以上なら外部変更あり。
+    let seq_after = unsafe { GetClipboardSequenceNumber() };
+    if seq_after == seq_before.wrapping_add(1) {
+        if let Some(prev) = previous_text {
+            let _ = clipboard.set_text(&prev);
+        }
+    } else {
+        tracing::debug!(
+            "clipboard modified by another process during injection (seq {} -> {}), skipping restore",
+            seq_before, seq_after
+        );
     }
 
     Ok(())

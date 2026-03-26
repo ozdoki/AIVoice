@@ -40,6 +40,23 @@
 
 ---
 
+## 005: クリップボード復元は外部変更がない場合のみ行う
+
+**決定**: `clipboard_paste()` の 150ms 待機後、`GetClipboardSequenceNumber` でシーケンス番号を比較し、
+自分の `set_text` 以外の変更があった場合はクリップボードを復元しない。
+
+**理由**:
+待機中に別プロセスがクリップボードを書き換えていた場合、古いテキストで上書きするとユーザーのデータが失われる。
+シーケンス番号が `seq_before + 1`（自分の書き込みのみ）であれば復元は安全。それ以上なら外部変更とみなしスキップ。
+
+**トレードオフ**:
+- 競合が発生した場合、クリップボードには注入したテキストが残る（削除されない）
+- `Win32_System_DataExchange` の `GetClipboardSequenceNumber` を使うため Windows 専用
+
+**日付**: 2026-03-26
+
+---
+
 ## 004: api_key を Windows Credential Manager に保存する
 
 **決定**: `AppSettings.api_key` は `tauri-plugin-store` の JSON には書かず、`keyring` クレート経由で Windows Credential Manager に保存する。

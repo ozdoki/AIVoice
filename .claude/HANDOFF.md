@@ -28,6 +28,8 @@ Raw モード（そのまま）と Polish モード（LLM で整形）を Ctrl+S
 | device_id 無効時のデフォルトデバイスフォールバック | ✅ | GetDevice 失敗時に GetDefaultAudioEndpoint へ |
 | set_mode 後のトレイ状態同期 | ✅ | 録音中/処理中/待機中に応じてトレイを更新 |
 | MockTrigger を dev ビルド限定に | ✅ | import.meta.env.DEV ガード |
+| 設定画面のエラー表示 | ✅ | デバイス取得・保存失敗を UI に表示、✕で閉じられる |
+| クリップボード競合対策 | ✅ | GetClipboardSequenceNumber で外部変更を検知し復元をスキップ |
 | session_service 分離（AppHandle 不要の純粋関数） | ✅ | TextInjector trait でモック可能 |
 | ユニットテスト（12本） | ✅ | settings / mode / session_service をカバー |
 | tauri-plugin-global-shortcut 依存削除 | ✅ | capabilities/default.json からも削除 |
@@ -45,20 +47,12 @@ Raw モード（そのまま）と Polish モード（LLM で整形）を Ctrl+S
 
 ## 残タスク（優先順）
 
-### 中優先度
-1. **設定画面のエラー表示**
-   デバイス列挙失敗・設定保存失敗が UI に表示されない（`SettingsPanel.tsx:34` で握りつぶし）。
-
-2. **クリップボード競合リスク**
-   注入時の 150ms クリップボード保持中に別プロセスが書き込むと内容が失われる。
-   解消するには OS の遅延貼り付けや排他ロックが必要。
-
 ### 低優先度
-3. **streaming / 履歴 / ハンズフリー / ホットキー設定 UI** など
+1. **streaming / 履歴 / ハンズフリー / ホットキー設定 UI** など
    MVP 計画書 `docs/aivoice-mvp-plan.md` 参照。
 
 ---
 
 ## 最終更新
 
-2026-03-26（セキュリティ・品質改善: api_key を Credential Manager へ移行、device_id フォールバック追加、MockTrigger dev 限定化、set_mode 後トレイ同期）
+2026-03-26（中優先度タスク完了: 設定画面エラー表示、クリップボード競合対策）

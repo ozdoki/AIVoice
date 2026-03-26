@@ -29,21 +29,25 @@ export function SettingsPanel({ onClose }: Props) {
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    invoke<AppSettings>("get_settings").then(setSettings).catch(console.error);
-    invoke<AudioDevice[]>("list_audio_devices").then(setDevices).catch(() => {});
+    invoke<AppSettings>("get_settings").then(setSettings).catch((e) => setError(String(e)));
+    invoke<AudioDevice[]>("list_audio_devices")
+      .then(setDevices)
+      .catch((e) => setError(`マイクデバイス取得失敗: ${e}`));
   }, []);
 
   const handleSave = async () => {
     setSaving(true);
     setSaved(false);
+    setError(null);
     try {
       await invoke("save_settings", { newSettings: settings });
       setSaved(true);
       setTimeout(onClose, 800);
     } catch (e) {
-      console.error(e);
+      setError(`保存失敗: ${e}`);
     } finally {
       setSaving(false);
     }
@@ -98,6 +102,41 @@ export function SettingsPanel({ onClose }: Props) {
         }}
       >
         <h2 style={{ fontSize: "1rem", marginBottom: "1.2rem" }}>設定</h2>
+
+        {error && (
+          <div
+            style={{
+              background: "#5a1a1a",
+              border: "1px solid #a33",
+              borderRadius: "6px",
+              padding: "0.5rem 0.7rem",
+              marginBottom: "1rem",
+              fontSize: "0.8rem",
+              color: "#f88",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+              gap: "0.5rem",
+            }}
+          >
+            <span>{error}</span>
+            <button
+              onClick={() => setError(null)}
+              style={{
+                background: "transparent",
+                border: "none",
+                color: "#f88",
+                cursor: "pointer",
+                padding: 0,
+                fontSize: "0.9rem",
+                lineHeight: 1,
+                flexShrink: 0,
+              }}
+            >
+              ✕
+            </button>
+          </div>
+        )}
 
         {field("API Base URL", "api_base_url")}
         {field("API Key", "api_key", "password")}
