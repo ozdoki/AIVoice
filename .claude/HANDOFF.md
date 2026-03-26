@@ -36,11 +36,16 @@ Raw モード（そのまま）と Polish モード（LLM で整形）を F5 で
 
 ## 未解決事項
 
-（なし）
+- モードが永続化されていない（再起動すると常に Raw にリセットされる）
 
 ## 次にやること
 
-（次のセッション開始時に記入する）
+**フェーズB 残作業: モード永続化**
+
+1. `src-tauri/src/settings.rs`: `AppSettings` に `mode: Mode` フィールドを追加
+   - `#[serde(default)]` で既存 settings.json と後方互換
+2. `src-tauri/src/commands.rs`: `set_mode` コマンドでモード変更時に `settings::save()` も呼ぶ
+3. `src-tauri/src/main.rs`: startup の `settings::load()` 後に mode も AppState に反映する
 
 ## 最終更新
 

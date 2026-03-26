@@ -19,8 +19,17 @@ pub async fn get_mode(state: State<'_, AppState>) -> Result<Mode, String> {
 }
 
 #[tauri::command]
-pub async fn set_mode(state: State<'_, AppState>, mode: Mode) -> Result<(), String> {
-    *state.mode.lock().await = mode;
+pub async fn set_mode(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    mode: Mode,
+) -> Result<(), String> {
+    *state.mode.lock().await = mode.clone();
+    // モードをストアに永続化
+    let mut s = state.settings.lock().await.clone();
+    s.mode = mode;
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
+    *state.settings.lock().await = s;
     Ok(())
 }
 

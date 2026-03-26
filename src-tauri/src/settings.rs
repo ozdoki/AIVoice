@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
+use crate::state::Mode;
+
 const STORE_PATH: &str = "settings.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,6 +13,7 @@ pub struct AppSettings {
     pub api_key: String,
     pub api_model: String,
     pub polish_model: String,
+    pub mode: Mode,
 }
 
 impl Default for AppSettings {
@@ -20,6 +23,7 @@ impl Default for AppSettings {
             api_key: String::new(),
             api_model: "whisper-1".to_string(),
             polish_model: "gpt-4o-mini".to_string(),
+            mode: Mode::default(),
         }
     }
 }

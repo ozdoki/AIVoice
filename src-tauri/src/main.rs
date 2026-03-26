@@ -14,6 +14,7 @@ fn main() {
             // 永続ストアから設定を読み込んで AppState に反映
             if let Ok(s) = settings::load(&app.handle()) {
                 let state = app.state::<AppState>();
+                *state.mode.blocking_lock() = s.mode.clone();
                 *state.settings.blocking_lock() = s;
             }
             // グローバルホットキーを登録
