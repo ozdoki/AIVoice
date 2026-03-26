@@ -22,10 +22,14 @@ Raw モード（そのまま）と Polish モード（LLM で整形）を Ctrl+S
 | クリップボード退避・復元 | ✅ | 注入前退避、150ms 待機後復元 |
 | Polish モード（/chat/completions） | ✅ | 失敗時 raw フォールバック |
 | システムトレイ常駐 | ✅ | X ボタン → hide、ツールチップに状態表示 |
-| 設定永続化（api_base_url / api_key / api_model / polish_model / device_id） | ✅ | tauri-plugin-store |
+| 設定永続化（api_base_url / api_model / polish_model / device_id） | ✅ | tauri-plugin-store（api_key は除く） |
+| api_key を Credential Manager に保存 | ✅ | keyring クレート経由。JSON には書かない |
 | モード永続化（再起動後も維持） | ✅ | settings.mode として保存 |
+| device_id 無効時のデフォルトデバイスフォールバック | ✅ | GetDevice 失敗時に GetDefaultAudioEndpoint へ |
+| set_mode 後のトレイ状態同期 | ✅ | 録音中/処理中/待機中に応じてトレイを更新 |
+| MockTrigger を dev ビルド限定に | ✅ | import.meta.env.DEV ガード |
 | session_service 分離（AppHandle 不要の純粋関数） | ✅ | TextInjector trait でモック可能 |
-| ユニットテスト（11本） | ✅ | settings / mode / session_service をカバー |
+| ユニットテスト（12本） | ✅ | settings / mode / session_service をカバー |
 | tauri-plugin-global-shortcut 依存削除 | ✅ | capabilities/default.json からも削除 |
 
 ---
@@ -41,26 +45,20 @@ Raw モード（そのまま）と Polish モード（LLM で整形）を Ctrl+S
 
 ## 残タスク（優先順）
 
-### 高優先度
-1. **api_key 平文保存の改善**
-   現状 `tauri-plugin-store` の JSON に平文保存。Windows Credential Manager または DPAPI へ移行。
-
-2. **device_id フォールバック**
-   保存済みデバイスが消えた場合（USB デバイス取り外しなど）にデフォルトに戻す処理がない。
-
 ### 中優先度
-3. **MockTrigger コンポーネントの削除**
-   `src/components/MockTrigger.tsx` が残っている。開発用途のみなら削除または dev ガード。
+1. **設定画面のエラー表示**
+   デバイス列挙失敗・設定保存失敗が UI に表示されない（`SettingsPanel.tsx:34` で握りつぶし）。
 
-4. **`set_mode` 失敗時の tray 状態ズレ**
-   `commands.rs::set_mode` が失敗した場合、tray のモード表示が実際の状態と一致しない可能性がある。
-   （App.tsx 側の楽観的更新バグは修正済み）
+2. **クリップボード競合リスク**
+   注入時の 150ms クリップボード保持中に別プロセスが書き込むと内容が失われる。
+   解消するには OS の遅延貼り付けや排他ロックが必要。
 
 ### 低優先度
-5. **streaming / 履歴 / ハンズフリー** など
+3. **streaming / 履歴 / ハンズフリー / ホットキー設定 UI** など
+   MVP 計画書 `docs/aivoice-mvp-plan.md` 参照。
 
 ---
 
 ## 最終更新
 
-2026-03-26（ホットキーを WH_KEYBOARD_LL → RegisterHotKey に移行。Ctrl+Shift が Windows 言語切替と競合していた問題を解決）
+2026-03-26（セキュリティ・品質改善: api_key を Credential Manager へ移行、device_id フォールバック追加、MockTrigger dev 限定化、set_mode 後トレイ同期）

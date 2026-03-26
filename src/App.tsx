@@ -124,10 +124,12 @@ function App() {
         </div>
       )}
 
-      <MockTrigger
-        onResult={(text) => setLastText(text)}
-        onStateChange={(s) => setRecordingState(s)}
-      />
+      {import.meta.env.DEV && (
+        <MockTrigger
+          onResult={(text) => setLastText(text)}
+          onStateChange={(s) => setRecordingState(s)}
+        />
+      )}
 
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
     </div>

@@ -40,6 +40,27 @@
 
 ---
 
+## 004: api_key を Windows Credential Manager に保存する
+
+**決定**: `AppSettings.api_key` は `tauri-plugin-store` の JSON には書かず、`keyring` クレート経由で Windows Credential Manager に保存する。
+
+**理由**:
+`settings.json` は Tauri のアプリデータディレクトリに平文で置かれ、ファイルシステムへのアクセス権があれば誰でも読める。
+API キーのような秘密情報は OS が管理する認証情報ストアに分離すべき。
+
+**実装**:
+- `AppSettings` の `api_key` に `#[serde(skip)]` を付与（JSON から除外）
+- `settings::load()` / `save()` が `keyring::Entry` を通じて Credential Manager を読み書き
+- サービス名 `"aivoice"` / ユーザー名 `"api_key"` でエントリを識別
+
+**トレードオフ**:
+- 既存ユーザーは API キーを再入力する必要がある（旧 JSON からの自動移行なし）
+- `keyring` クレートが OS のシークレットバックエンドに依存する（Windows: DPAPI、macOS: Keychain、Linux: Secret Service）
+
+**日付**: 2026-03-26
+
+---
+
 ## 003: Polish モードは失敗時 raw にフォールバックする
 
 **決定**: `polish_text()` が API エラーや空レスポンスを返した場合、エラーを表示せず

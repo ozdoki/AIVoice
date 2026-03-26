@@ -115,7 +115,12 @@ fn capture_inner(stop_rx: watch::Receiver<bool>, device_id: Option<&str>) -> any
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let device = if let Some(id) = device_id {
             let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
-            enumerator.GetDevice(windows::core::PCWSTR(wide.as_ptr()))?
+            enumerator
+                .GetDevice(windows::core::PCWSTR(wide.as_ptr()))
+                .or_else(|_| {
+                    tracing::warn!("saved device_id not found, falling back to default device");
+                    enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)
+                })?
         } else {
             enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)?
         };

@@ -22,9 +22,18 @@ pub async fn set_mode(
     *state.mode.lock().await = mode.clone();
     // モードをストアに永続化
     let mut s = state.settings.lock().await.clone();
-    s.mode = mode;
+    s.mode = mode.clone();
     settings::save(&app, &s).map_err(|e| e.to_string())?;
     *state.settings.lock().await = s;
+    // トレイのモード表示を更新
+    let mode_str = if matches!(mode, Mode::Polish) { "Polish" } else { "Raw" };
+    let recording_state = state.recording_state.lock().await.clone();
+    let status_str = match recording_state {
+        RecordingState::Recording => "録音中 ●",
+        RecordingState::Processing => "処理中",
+        RecordingState::Idle => "待機中",
+    };
+    tray::update_status(&app, status_str, mode_str);
     Ok(())
 }
 
