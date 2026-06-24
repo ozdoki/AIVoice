@@ -1,11 +1,14 @@
 pub mod audio;
 pub mod commands;
+pub mod context;
 pub mod hotkey;
 pub mod inject;
+pub mod local_data;
 pub mod mode;
 pub mod polish;
 pub mod session_service;
 pub mod settings;
+pub mod startup;
 pub mod speech;
 pub mod state;
 pub mod tray;

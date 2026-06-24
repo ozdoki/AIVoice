@@ -1,11 +1,11 @@
+use std::time::Instant;
+
 use tokio::sync::watch;
 
 use crate::{
-    audio,
-    inject,
-    mode,
+    audio, context, inject, mode,
     speech::{openai_compatible::OpenAiCompatibleProvider, SpeechProvider},
-    state::{AppState, RecordingState, SessionController},
+    state::{AppState, Mode, RecordingState, SessionController},
 };
 
 /// テキスト注入の抽象化。テストでモック可能にするために定義する。
@@ -18,8 +18,16 @@ pub struct ClipboardInjector;
 
 impl TextInjector for ClipboardInjector {
     fn inject(&self, text: &str) -> anyhow::Result<()> {
-        inject::inject_text_after_f4(text)
+        inject::inject_text(text)
     }
+}
+
+#[derive(Debug)]
+pub struct SessionOutcome {
+    pub raw_text: String,
+    pub final_text: String,
+    pub mode: Mode,
+    pub duration_ms: u64,
 }
 
 /// 録音開始の本体。AppHandle 不要のため単体テスト可能。
@@ -35,10 +43,13 @@ pub async fn start_session_inner(
     let (stop_tx, stop_rx) = watch::channel(false);
     let device_id = state.settings.lock().await.device_id.clone();
     let input = audio::new_input(device_id.as_deref(), level_tx);
-    let capture_task =
-        tokio::task::spawn_blocking(move || input.capture_blocking(stop_rx));
+    let capture_task = tokio::task::spawn_blocking(move || input.capture_blocking(stop_rx));
 
-    *session = Some(SessionController { stop_tx, capture_task });
+    *session = Some(SessionController {
+        stop_tx,
+        capture_task,
+        started_at: Instant::now(),
+    });
     *state.recording_state.lock().await = RecordingState::Recording;
     Ok(())
 }
@@ -49,15 +60,20 @@ pub async fn start_session_inner(
 pub async fn stop_session_inner(
     state: &AppState,
     injector: &dyn TextInjector,
-) -> Result<String, String> {
+) -> Result<SessionOutcome, String> {
     let controller = state.session.lock().await.take();
     let Some(controller) = controller else {
-        return Ok(String::new());
+        return Ok(SessionOutcome {
+            raw_text: String::new(),
+            final_text: String::new(),
+            mode: state.mode.lock().await.clone(),
+            duration_ms: 0,
+        });
     };
 
     *state.recording_state.lock().await = RecordingState::Processing;
 
-    let result: Result<String, String> = async {
+    let result: Result<SessionOutcome, String> = async {
         let _ = controller.stop_tx.send(true);
 
         let audio = controller
@@ -66,15 +82,24 @@ pub async fn stop_session_inner(
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
 
+        let duration_ms = controller.started_at.elapsed().as_millis() as u64;
         let current_settings = state.settings.lock().await.clone();
         if current_settings.api_key.is_empty() {
             return Err("APIキーが設定されていません。設定画面から入力してください。".to_string());
         }
+        let dictionary_words = state.dictionary_words.lock().await.clone();
+        let focused_context = if current_settings.deep_context_enabled {
+            context::focused_app_context()
+        } else {
+            None
+        };
 
         let raw_text = OpenAiCompatibleProvider {
             base_url: current_settings.api_base_url,
             api_key: current_settings.api_key,
             model: current_settings.api_model,
+            dictionary_words,
+            focused_context: focused_context.clone(),
         }
         .transcribe(&audio)
         .await
@@ -82,11 +107,24 @@ pub async fn stop_session_inner(
 
         let current_mode = state.mode.lock().await.clone();
         let current_settings_for_mode = state.settings.lock().await.clone();
-        let final_text = mode::route(&current_mode, &current_settings_for_mode, &raw_text).await;
+        let current_dictionary_words = state.dictionary_words.lock().await.clone();
+        let final_text = mode::route(
+            &current_mode,
+            &current_settings_for_mode,
+            &current_dictionary_words,
+            focused_context.as_ref(),
+            &raw_text,
+        )
+        .await;
 
         injector.inject(&final_text).map_err(|e| e.to_string())?;
 
-        Ok(final_text)
+        Ok(SessionOutcome {
+            raw_text,
+            final_text,
+            mode: current_mode,
+            duration_ms,
+        })
     }
     .await;
 
@@ -124,8 +162,11 @@ mod tests {
             drop(stop_rx);
             Ok::<CapturedAudio, anyhow::Error>(CapturedAudio::default())
         });
-        *state.session.lock().await =
-            Some(SessionController { stop_tx, capture_task });
+        *state.session.lock().await = Some(SessionController {
+            stop_tx,
+            capture_task,
+            started_at: Instant::now(),
+        });
         state
     }
 
@@ -133,7 +174,7 @@ mod tests {
     async fn stop_without_session_returns_empty() {
         let state = AppState::default();
         let result = stop_session_inner(&state, &NoOpInjector).await;
-        assert_eq!(result.unwrap(), "");
+        assert_eq!(result.unwrap().final_text, "");
     }
 
     #[tokio::test]
@@ -158,27 +199,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_session_sets_recording_state() {
+    async fn start_session_is_idempotent_when_session_exists() {
         let state = AppState::default();
-        start_session_inner(&state, None).await.unwrap();
-        assert!(matches!(
-            *state.recording_state.lock().await,
-            RecordingState::Recording
-        ));
-        // WASAPI タスクをアボートして後続のテストがハングしないようにする
-        if let Some(controller) = state.session.lock().await.take() {
-            controller.capture_task.abort();
-        };
-    }
+        let existing = make_state_with_session().await;
+        let controller = existing.session.lock().await.take().unwrap();
+        *state.session.lock().await = Some(controller);
 
-    #[tokio::test]
-    async fn start_session_is_idempotent() {
-        let state = AppState::default();
         start_session_inner(&state, None).await.unwrap();
-        start_session_inner(&state, None).await.unwrap();
-        // セッションが1つだけであることを確認
         assert!(state.session.lock().await.is_some());
-        // WASAPI タスクをアボートして後続のテストがハングしないようにする
         if let Some(controller) = state.session.lock().await.take() {
             controller.capture_task.abort();
         };

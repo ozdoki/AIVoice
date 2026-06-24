@@ -5,7 +5,9 @@ import App from "./App";
 import { FloatingBar } from "./components/FloatingBar";
 import "./index.css";
 
-const label = getCurrentWindow().label;
+const previewLabel = new URLSearchParams(window.location.search).get("window");
+const label = previewLabel
+  ?? ("__TAURI_INTERNALS__" in window ? getCurrentWindow().label : "main");
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

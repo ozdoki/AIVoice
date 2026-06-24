@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
+import { Stop16Filled } from "@fluentui/react-icons";
+import { type AppSettings, defaultSettings, formatHotkey } from "../types";
 
 type RecordingState = "idle" | "recording" | "processing";
 type Mode = "raw" | "polish";
@@ -11,19 +13,25 @@ interface SessionUiEvent {
   state: RecordingState;
   mode: Mode;
   final_text: string | null;
+  history_id: string | null;
   error: string | null;
 }
 
+const isTauri = "__TAURI_INTERNALS__" in window;
+
 // 波形バーの基準ゲイン（中央ほど高く）
-const BAR_GAINS = [0.5, 0.8, 1.0, 0.8, 0.5];
-const BAR_MIN_H = 3;
-const BAR_MAX_H = 22;
+const BAR_GAINS = [0.42, 0.7, 0.92, 1.0, 0.92, 0.7, 0.42];
+const BAR_MIN_H = 5;
+const BAR_MAX_H = 36;
 
 export function FloatingBar() {
-  const [recordingState, setRecordingState] = useState<RecordingState>("idle");
+  const [recordingState, setRecordingState] = useState<RecordingState>(
+    isTauri ? "idle" : "recording"
+  );
   const [mode, setMode] = useState<Mode>("raw");
-  const levelRef = useRef(0);
-  const [displayLevel, setDisplayLevel] = useState(0);
+  const [settings, setSettings] = useState<AppSettings>(defaultSettings);
+  const levelRef = useRef(isTauri ? 0 : 0.32);
+  const [displayLevel, setDisplayLevel] = useState(isTauri ? 0 : 0.32);
 
   // 透明背景（ピル以外が透ける）
   useEffect(() => {
@@ -31,25 +39,37 @@ export function FloatingBar() {
     document.documentElement.style.background = "transparent";
   }, []);
 
-  // CSS アニメーション定義
   useEffect(() => {
-    const style = document.createElement("style");
-    style.textContent = `
-      @keyframes rec-pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.35; }
+    if (!isTauri) return;
+    let unlistener: (() => void) | undefined;
+    const win = getCurrentWindow();
+
+    invoke<AppSettings>("get_settings")
+      .then((loaded) => {
+        setSettings(loaded);
+        setMode(loaded.mode);
+      })
+      .catch((error) => console.error(error));
+
+    listen<AppSettings>("settings://changed", (event) => {
+      setSettings(event.payload);
+      setMode(event.payload.mode);
+      if (!event.payload.show_floating_bar) {
+        win.hide().catch((error) => console.error(error));
       }
-      @keyframes dot-bounce {
-        0%, 80%, 100% { transform: scaleY(0.4); }
-        40% { transform: scaleY(1.0); }
-      }
-    `;
-    document.head.appendChild(style);
-    return () => { document.head.removeChild(style); };
+    }).then((off) => {
+      unlistener = off;
+    });
+
+    return () => {
+      unlistener?.();
+    };
   }, []);
 
   // セッション状態リスナー
   useEffect(() => {
+    if (!isTauri) return;
+
     const win = getCurrentWindow();
     let unlistener: (() => void) | undefined;
 
@@ -58,18 +78,20 @@ export function FloatingBar() {
       setRecordingState(state);
       setMode(newMode);
 
-      if (state === "recording") {
+      if (state === "recording" && settings.show_floating_bar) {
         try {
-          const monitor = await win.currentMonitor();
+          const monitor = await currentMonitor();
           if (monitor) {
             const scale = monitor.scaleFactor;
             const logW = monitor.size.width / scale;
             const logH = monitor.size.height / scale;
             // タスクバー（約48px）のちょい上に配置
-            await win.setPosition(new LogicalPosition(logW / 2 - 150, logH - 116));
+            await win.setPosition(new LogicalPosition(logW / 2 - 190, logH - 156));
           }
         } catch { /* モニター取得失敗時はデフォルト位置 */ }
         await win.show();
+      } else if (state === "recording") {
+        await win.hide();
       } else if (state === "idle") {
         levelRef.current = 0;
         setDisplayLevel(0);
@@ -78,10 +100,12 @@ export function FloatingBar() {
     }).then((off) => { unlistener = off; });
 
     return () => { unlistener?.(); };
-  }, []);
+  }, [settings.show_floating_bar]);
 
   // 音量レベルリスナー（60fps でスムーズに追従）
   useEffect(() => {
+    if (!isTauri) return;
+
     let unlistener: (() => void) | undefined;
     let rafId: number;
 
@@ -102,6 +126,10 @@ export function FloatingBar() {
   }, []);
 
   const handleStop = async () => {
+    if (!isTauri) {
+      setRecordingState("idle");
+      return;
+    }
     try { await invoke("stop_recording_session"); } catch (e) { console.error(e); }
   };
 
@@ -109,125 +137,52 @@ export function FloatingBar() {
   const isProcessing = recordingState === "processing";
 
   return (
-    <div style={{
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      width: "100%",
-      height: "100%",
-      background: "transparent",
-    }}>
-      {/* ピル本体 */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 10,
-          padding: "0 14px",
-          height: 44,
-          width: 280,
-          background: "rgba(14, 14, 14, 0.94)",
-          borderRadius: 100,
-          border: "1px solid rgba(255,255,255,0.09)",
-          boxShadow: "0 4px 20px rgba(0,0,0,0.55)",
-          userSelect: "none",
-          WebkitAppRegion: "drag",
-        } as React.CSSProperties}
-      >
-        {/* 録音中インジケーター（赤ドット） */}
-        <span style={{
-          width: 8,
-          height: 8,
-          borderRadius: "50%",
-          background: isRecording ? "#ff3b30" : "#555",
-          flexShrink: 0,
-          animation: isRecording ? "rec-pulse 1.4s ease-in-out infinite" : "none",
-          WebkitAppRegion: "no-drag",
-        } as React.CSSProperties} />
+    <div className="floating-stage">
+      <div className="floating-hint">
+        <kbd>{formatHotkey(settings.push_to_talk_hotkey)}</kbd>
+        <span>を長押しして音声入力</span>
+      </div>
+      <div className={`floating-pill ${isProcessing ? "is-processing" : ""}`}>
+        <span className={`recording-dot ${isRecording ? "is-active" : ""}`} />
+        <span className="floating-mode">{mode === "polish" ? "Polish" : "Raw"}</span>
 
-        {/* 波形バー（録音中）/ 処理中ドット */}
-        <div style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 3,
-          height: BAR_MAX_H + 4,
-          flex: 1,
-          WebkitAppRegion: "no-drag",
-        } as React.CSSProperties}>
+        <div className="floating-waveform">
           {isProcessing ? (
-            // 処理中: 3つのバウンスドット
             [0, 1, 2].map((i) => (
-              <span key={i} style={{
-                display: "inline-block",
-                width: 4,
-                height: 16,
-                borderRadius: 2,
-                background: "rgba(255,255,255,0.45)",
+              <span key={i} className="processing-bar" style={{
                 animation: `dot-bounce 1.1s ${i * 0.18}s ease-in-out infinite`,
-                transformOrigin: "center",
               }} />
             ))
           ) : (
-            // 録音中 / アイドル: 音量波形バー
             BAR_GAINS.map((gain, i) => {
+              const responsiveLevel = Math.min(1, Math.sqrt(Math.max(0, displayLevel)) * 1.2);
               const h = isRecording
-                ? Math.max(BAR_MIN_H, Math.min(BAR_MAX_H, displayLevel * 90 * gain + BAR_MIN_H))
+                ? Math.max(
+                    BAR_MIN_H,
+                    Math.min(
+                      BAR_MAX_H,
+                      BAR_MIN_H + responsiveLevel * (BAR_MAX_H - BAR_MIN_H) * gain
+                    )
+                  )
                 : BAR_MIN_H;
               return (
-                <span key={i} style={{
-                  display: "inline-block",
-                  width: 3,
+                <span key={i} className="waveform-bar" style={{
                   height: h,
-                  borderRadius: 2,
-                  background: isRecording
-                    ? `rgba(255,255,255,${0.5 + gain * 0.5})`
-                    : "rgba(255,255,255,0.18)",
-                  transition: "height 55ms ease-out, background 200ms",
-                  flexShrink: 0,
+                  opacity: isRecording ? 0.5 + gain * 0.5 : 0.2,
                 }} />
               );
             })
           )}
         </div>
 
-        {/* モードバッジ */}
-        <span style={{
-          fontSize: 10,
-          color: "rgba(255,255,255,0.35)",
-          letterSpacing: "0.03em",
-          flexShrink: 0,
-          WebkitAppRegion: "no-drag",
-        } as React.CSSProperties}>
-          {mode === "polish" ? "Polish" : "Raw"}
-        </span>
-
-        {/* 停止ボタン（録音中のみ） */}
         {isRecording && (
           <button
+            className="floating-stop"
             onClick={handleStop}
             title="停止"
-            style={{
-              width: 22,
-              height: 22,
-              borderRadius: "50%",
-              background: "rgba(255,59,48,0.18)",
-              border: "1px solid rgba(255,59,48,0.4)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              cursor: "pointer",
-              flexShrink: 0,
-              padding: 0,
-              WebkitAppRegion: "no-drag",
-            } as React.CSSProperties}
+            aria-label="録音を停止"
           >
-            <span style={{
-              width: 7,
-              height: 7,
-              background: "#ff3b30",
-              borderRadius: 1,
-              display: "block",
-            }} />
+            <Stop16Filled />
           </button>
         )}
       </div>

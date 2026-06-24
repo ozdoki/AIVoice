@@ -2,13 +2,15 @@ use anyhow::Context;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 
-use crate::audio::CapturedAudio;
 use super::SpeechProvider;
+use crate::{audio::CapturedAudio, context, context::FocusedAppContext};
 
 pub struct OpenAiCompatibleProvider {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub dictionary_words: Vec<String>,
+    pub focused_context: Option<FocusedAppContext>,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +52,28 @@ fn encode_wav(audio: &CapturedAudio) -> Vec<u8> {
     buf
 }
 
+fn build_transcription_prompt(
+    dictionary_words: &[String],
+    focused_context: Option<&FocusedAppContext>,
+) -> Option<String> {
+    let mut sections = Vec::new();
+    if !dictionary_words.is_empty() {
+        sections.push(format!(
+            "Prefer these custom words and proper nouns when they match the audio: {}",
+            dictionary_words.join(", ")
+        ));
+    }
+    let context_prompt = context::prompt_fragment(focused_context);
+    if !context_prompt.is_empty() {
+        sections.push(context_prompt);
+    }
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n"))
+    }
+}
+
 #[async_trait::async_trait]
 impl SpeechProvider for OpenAiCompatibleProvider {
     async fn transcribe(&self, audio: &CapturedAudio) -> anyhow::Result<String> {
@@ -59,11 +83,19 @@ impl SpeechProvider for OpenAiCompatibleProvider {
         let part = Part::bytes(wav)
             .file_name("audio.wav")
             .mime_str("audio/wav")?;
-        let form = Form::new()
+        let mut form = Form::new()
             .part("file", part)
             .text("model", self.model.clone());
+        if let Some(prompt) =
+            build_transcription_prompt(&self.dictionary_words, self.focused_context.as_ref())
+        {
+            form = form.text("prompt", prompt);
+        }
 
-        let url = format!("{}/audio/transcriptions", self.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/audio/transcriptions",
+            self.base_url.trim_end_matches('/')
+        );
 
         let resp = client
             .post(&url)
@@ -82,5 +114,27 @@ impl SpeechProvider for OpenAiCompatibleProvider {
         let result: TranscriptionResponse =
             resp.json().await.context("ASR response parse failed")?;
         Ok(result.text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcription_prompt_uses_dictionary_and_context() {
+        let context = FocusedAppContext {
+            process_name: "notepad.exe".to_string(),
+            window_title: "notes".to_string(),
+        };
+        let prompt = build_transcription_prompt(&["Obsidian".to_string()], Some(&context))
+            .expect("prompt should be generated");
+        assert!(prompt.contains("Obsidian"));
+        assert!(prompt.contains("notepad.exe"));
+    }
+
+    #[test]
+    fn transcription_prompt_is_absent_when_empty() {
+        assert!(build_transcription_prompt(&[], None).is_none());
     }
 }

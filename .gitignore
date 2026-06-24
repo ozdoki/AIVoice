@@ -12,11 +12,14 @@ Thumbs.db
 # Environment
 .env
 .env.*
+.codex/*.env
+.codex/**/*.env
 
 # Node / frontend
 node_modules/
 dist/
 coverage/
+.playwright-mcp/
 
 # Tauri
 src-tauri/target/
@@ -27,4 +30,3 @@ target/
 
 # Claude Code local settings
 .claude/settings.local.json
-

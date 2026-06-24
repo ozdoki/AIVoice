@@ -1,11 +1,17 @@
-use crate::{polish, settings::AppSettings, state::Mode};
+use crate::{context::FocusedAppContext, polish, settings::AppSettings, state::Mode};
 
 /// モードに応じてテキストを加工する。
 /// Raw: そのまま返す。Polish: LLM による文章整形。
-pub async fn route(mode: &Mode, settings: &AppSettings, text: &str) -> String {
+pub async fn route(
+    mode: &Mode,
+    settings: &AppSettings,
+    dictionary_words: &[String],
+    focused_context: Option<&FocusedAppContext>,
+    text: &str,
+) -> String {
     match mode {
         Mode::Raw => text.to_string(),
-        Mode::Polish => match polish::polish_text(settings, text).await {
+        Mode::Polish => match polish::polish_text(settings, dictionary_words, focused_context, text).await {
             Ok(polished) if !polished.trim().is_empty() => polished,
             Ok(_) => text.to_string(),
             Err(e) => {
@@ -22,13 +28,13 @@ mod tests {
 
     #[tokio::test]
     async fn raw_mode_returns_text_unchanged() {
-        let result = route(&Mode::Raw, &AppSettings::default(), "テスト入力").await;
+        let result = route(&Mode::Raw, &AppSettings::default(), &[], None, "テスト入力").await;
         assert_eq!(result, "テスト入力");
     }
 
     #[tokio::test]
     async fn raw_mode_empty_string() {
-        let result = route(&Mode::Raw, &AppSettings::default(), "").await;
+        let result = route(&Mode::Raw, &AppSettings::default(), &[], None, "").await;
         assert_eq!(result, "");
     }
 
@@ -36,7 +42,7 @@ mod tests {
     #[tokio::test]
     async fn polish_mode_falls_back_to_raw_on_api_error() {
         let settings = AppSettings::default(); // api_key 空 → API 呼び出し失敗
-        let result = route(&Mode::Polish, &settings, "元の文").await;
+        let result = route(&Mode::Polish, &settings, &[], None, "元の文").await;
         assert_eq!(result, "元の文");
     }
 }

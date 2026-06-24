@@ -1,5 +1,5 @@
-use std::{ptr::null_mut, slice};
 use anyhow::bail;
+use std::{ptr::null_mut, slice};
 use tokio::sync::watch;
 use windows::{
     core::GUID,
@@ -49,9 +49,13 @@ pub struct WasapiInput {
 
 impl AudioInput for WasapiInput {
     fn capture_blocking(&self, stop_rx: watch::Receiver<bool>) -> anyhow::Result<CapturedAudio> {
-        unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
         let result = capture_inner(stop_rx, self.device_id.as_deref(), self.level_tx.clone());
-        unsafe { CoUninitialize(); }
+        unsafe {
+            CoUninitialize();
+        }
         result
     }
 }
@@ -67,14 +71,15 @@ pub fn list_capture_devices() -> anyhow::Result<Vec<AudioDeviceInfo>> {
 }
 
 unsafe fn list_devices_inner() -> anyhow::Result<Vec<AudioDeviceInfo>> {
-    use windows::Win32::Media::Audio::DEVICE_STATE_ACTIVE;
-    use windows::Win32::System::Com::{CoTaskMemFree, STGM_READ};
-    use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
-    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
     use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+    use windows::Win32::Media::Audio::DEVICE_STATE_ACTIVE;
+    use windows::Win32::System::Com::StructuredStorage::{
+        PropVariantClear, PropVariantToStringAlloc,
+    };
+    use windows::Win32::System::Com::{CoTaskMemFree, STGM_READ};
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
-    let enumerator: IMMDeviceEnumerator =
-        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+    let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
     let collection = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
     let count = collection.GetCount()?;
 
@@ -111,7 +116,9 @@ struct CaptureFormat {
 }
 
 fn rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() { return 0.0; }
+    if samples.is_empty() {
+        return 0.0;
+    }
     (samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
@@ -184,16 +191,22 @@ fn capture_inner(
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
                 let sample_count = frames as usize * fmt.channels as usize;
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                    if let Some(tx) = &level_tx { let _ = tx.send(0.0); }
+                    if let Some(tx) = &level_tx {
+                        let _ = tx.send(0.0);
+                    }
                     samples.resize(samples.len() + sample_count, 0.0f32);
                 } else if fmt.is_float {
                     let src = slice::from_raw_parts(data as *const f32, sample_count);
-                    if let Some(tx) = &level_tx { let _ = tx.send(rms(src)); }
+                    if let Some(tx) = &level_tx {
+                        let _ = tx.send(rms(src));
+                    }
                     samples.extend_from_slice(src);
                 } else {
                     let src = slice::from_raw_parts(data as *const i16, sample_count);
                     let normalized: Vec<f32> = src.iter().map(|&v| v as f32 / 32768.0).collect();
-                    if let Some(tx) = &level_tx { let _ = tx.send(rms(&normalized)); }
+                    if let Some(tx) = &level_tx {
+                        let _ = tx.send(rms(&normalized));
+                    }
                     samples.extend(normalized);
                 }
                 capture.ReleaseBuffer(frames)?;

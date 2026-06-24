@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { Mic24Regular, Sparkle24Regular } from "@fluentui/react-icons";
 
 type Mode = "raw" | "polish";
 
@@ -10,33 +11,30 @@ interface Props {
 export function ModeSwitch({ mode, onModeChange }: Props) {
   const toggle = async () => {
     const next: Mode = mode === "raw" ? "polish" : "raw";
-    await invoke("set_mode", { mode: next });
+    if ("__TAURI_INTERNALS__" in window) {
+      await invoke("set_mode", { mode: next });
+    }
     onModeChange(next);
   };
 
   return (
-    <div style={{ textAlign: "center" }}>
-      <p style={{ marginBottom: "0.5rem", fontSize: "0.85rem", color: "#888" }}>
-        現在のモード
-      </p>
+    <div className="mode-switch" role="group" aria-label="入力モード">
       <button
-        onClick={toggle}
-        style={{
-          padding: "0.5rem 2rem",
-          fontSize: "1.2rem",
-          fontWeight: "bold",
-          background: mode === "raw" ? "#2a6" : "#36a",
-          color: "#fff",
-          border: "none",
-          borderRadius: "8px",
-          cursor: "pointer",
-        }}
+        className={`mode-option ${mode === "raw" ? "is-active" : ""}`}
+        onClick={() => mode !== "raw" && toggle()}
+        aria-pressed={mode === "raw"}
       >
-        {mode === "raw" ? "Raw" : "Polish"}
+        <Mic24Regular />
+        <span>Raw</span>
       </button>
-      <p style={{ marginTop: "0.5rem", fontSize: "0.75rem", color: "#666" }}>
-        クリックで切り替え
-      </p>
+      <button
+        className={`mode-option ${mode === "polish" ? "is-active" : ""}`}
+        onClick={() => mode !== "polish" && toggle()}
+        aria-pressed={mode === "polish"}
+      >
+        <Sparkle24Regular />
+        <span>Polish</span>
+      </button>
     </div>
   );
 }

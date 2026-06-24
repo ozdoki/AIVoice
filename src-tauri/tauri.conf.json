@@ -21,8 +21,8 @@
       {
         "label": "floating-bar",
         "title": "AIVoice",
-        "width": 300,
-        "height": 60,
+        "width": 380,
+        "height": 110,
         "resizable": false,
         "fullscreen": false,
         "decorations": false,

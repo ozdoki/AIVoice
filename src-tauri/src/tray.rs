@@ -50,13 +50,19 @@ pub fn handle_menu(app: &AppHandle, event: MenuEvent) {
 
 /// トレイアイコン本体のクリックを処理する（左クリックで表示/非表示トグル）。
 pub fn handle_tray_event(app: &AppHandle, event: TrayIconEvent) {
-    if let TrayIconEvent::Click { button: MouseButton::Left, .. } = event {
+    if let TrayIconEvent::Click {
+        button: MouseButton::Left,
+        ..
+    } = event
+    {
         let _ = toggle_main_window(app);
     }
 }
 
 fn toggle_main_window(app: &AppHandle) -> tauri::Result<()> {
-    let window = app.get_webview_window("main").expect("main window not found");
+    let window = app
+        .get_webview_window("main")
+        .expect("main window not found");
     if window.is_visible()? {
         window.hide()?;
     } else {
@@ -66,7 +72,9 @@ fn toggle_main_window(app: &AppHandle) -> tauri::Result<()> {
 }
 
 fn show_main_window(app: &AppHandle) -> tauri::Result<()> {
-    let window = app.get_webview_window("main").expect("main window not found");
+    let window = app
+        .get_webview_window("main")
+        .expect("main window not found");
     window.show()?;
     window.set_focus()?;
     Ok(())
