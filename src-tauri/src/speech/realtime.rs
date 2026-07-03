@@ -16,7 +16,6 @@ use tokio_tungstenite::{
 
 use crate::audio::AudioChunk;
 
-const REALTIME_SESSION_MODEL: &str = "gpt-realtime-2";
 pub const REALTIME_TRANSCRIPTION_MODEL: &str = "gpt-realtime-whisper";
 const REALTIME_SAMPLE_RATE: u32 = 24_000;
 const LIVE_COMMIT_INTERVAL_MS: u64 = 800;
@@ -62,7 +61,7 @@ pub fn supports_realtime_model(model: &str) -> bool {
 
 fn realtime_url(base_url: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
-    let path = format!("/realtime?model={REALTIME_SESSION_MODEL}");
+    let path = format!("/realtime?model={REALTIME_TRANSCRIPTION_MODEL}");
     if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}{path}")
     } else if let Some(rest) = base.strip_prefix("http://") {
@@ -413,10 +412,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn realtime_url_maps_openai_rest_base_to_ws() {
+    fn realtime_url_maps_openai_rest_base_to_transcription_ws() {
         assert_eq!(
             realtime_url("https://api.openai.com/v1"),
-            "wss://api.openai.com/v1/realtime?model=gpt-realtime-2"
+            "wss://api.openai.com/v1/realtime?model=gpt-realtime-whisper"
         );
     }
 
