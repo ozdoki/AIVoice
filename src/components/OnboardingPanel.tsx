@@ -49,6 +49,29 @@ export function OnboardingPanel({
   }, [settings]);
 
   useEffect(() => {
+    if (!isTauri) return;
+    let cancelled = false;
+    invoke<AppSettings>("get_settings")
+      .then((latest) => {
+        if (cancelled) return;
+        setDraftSettings(latest);
+        setApiReady(Boolean(latest.has_api_key));
+        onSettingsSaved(latest);
+        if (latest.has_api_key) {
+          setError(null);
+        }
+      })
+      .catch((loadError) => {
+        if (!cancelled) {
+          setError(`保存済み設定を確認できませんでした: ${loadError}`);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     const loadDevices = async () => {
       try {
         const next = isTauri
