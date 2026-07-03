@@ -39,6 +39,11 @@ struct SessionUiEvent {
     error: Option<String>,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct PartialTextEvent {
+    text: String,
+}
+
 struct TargetWindowInjector {
     target: Option<FocusedWindowTarget>,
 }
@@ -326,6 +331,12 @@ async fn start_recording_locked(
 
     let (level_tx, mut level_rx) = tokio::sync::mpsc::unbounded_channel::<f32>();
     let settings = state.settings.lock().await.clone();
+    let (partial_tx, mut partial_rx) = if settings.show_live_transcript_in_floating_bar {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let (chunk_tx, realtime_task) =
         if !settings.api_key.trim().is_empty() && supports_realtime_model(&settings.api_model) {
             let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -334,6 +345,7 @@ async fn start_recording_locked(
                 settings.api_key.clone(),
                 settings.api_model.clone(),
                 chunk_rx,
+                partial_tx,
             ));
             (Some(chunk_tx), Some(task))
         } else {
@@ -382,6 +394,20 @@ async fn start_recording_locked(
             let _ = app_level.emit("audio://level", level);
         }
     });
+    if let Some(mut rx) = partial_rx.take() {
+        let app_partial = app.clone();
+        let _ = app_partial.emit(
+            "session://partial-text",
+            PartialTextEvent {
+                text: String::new(),
+            },
+        );
+        tokio::spawn(async move {
+            while let Some(text) = rx.recv().await {
+                let _ = app_partial.emit("session://partial-text", PartialTextEvent { text });
+            }
+        });
+    }
     Ok(())
 }
 

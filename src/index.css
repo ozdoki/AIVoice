@@ -1228,6 +1228,21 @@ kbd {
   -webkit-app-region: no-drag;
 }
 
+.floating-waveform.has-live-text {
+  justify-content: flex-start;
+  padding: 0 10px;
+}
+
+.floating-live-text {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
 .floating-status {
   width: 72px;
   flex: 0 0 72px;

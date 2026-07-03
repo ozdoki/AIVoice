@@ -1310,6 +1310,20 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
             <label className="toggle-row">
               <input
                 type="checkbox"
+                checked={settings.show_live_transcript_in_floating_bar}
+                disabled={!settings.show_floating_bar}
+                onChange={(event) =>
+                  setSettings((current) => ({
+                    ...current,
+                    show_live_transcript_in_floating_bar: event.target.checked,
+                  }))
+                }
+              />
+              <span>録音中の文字起こしをフローティングバーに表示する</span>
+            </label>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
                 checked={settings.launch_at_login}
                 onChange={(event) =>
                   setSettings((current) => ({

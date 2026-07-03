@@ -21,6 +21,16 @@ corepack pnpm run app:restart:fallback-qa
 corepack pnpm run app:restart
 ```
 
+## Live transcript in FloatingBar
+
+1. Open Settings.
+2. Turn on `録音中にフローティングバーを表示する`.
+3. Turn off `録音中の文字起こしをフローティングバーに表示する`, save, and record.
+4. Confirm the FloatingBar shows waveform, state, and seconds only.
+5. Turn on `録音中の文字起こしをフローティングバーに表示する`, save, and record with ASR model `gpt-realtime-whisper`.
+6. Confirm in-progress transcript text appears in the FloatingBar while recording.
+7. Stop recording and confirm final text is still injected into the target app.
+
 ## Launch at login
 
 1. Open Settings.

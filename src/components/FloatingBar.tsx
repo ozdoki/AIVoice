@@ -40,6 +40,7 @@ export function FloatingBar() {
   const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
+  const [liveTranscript, setLiveTranscript] = useState("");
   const levelRef = useRef(isTauri ? 0 : 0.32);
   const [displayLevel, setDisplayLevel] = useState(isTauri ? 0 : 0.32);
 
@@ -96,6 +97,7 @@ export function FloatingBar() {
 
       if (state === "recording" && settings.show_floating_bar) {
         setRecordingStartedAt(Date.now());
+        setLiveTranscript("");
         try {
           const monitor = await currentMonitor();
           if (monitor) {
@@ -112,6 +114,7 @@ export function FloatingBar() {
       } else if (state === "idle") {
         levelRef.current = 0;
         setDisplayLevel(0);
+        setLiveTranscript("");
         setRecordingStartedAt(null);
         if ((nextPhase === "completed" || nextPhase === "failed") && settings.show_floating_bar) {
           await win.show();
@@ -126,6 +129,19 @@ export function FloatingBar() {
 
     return () => { unlistener?.(); };
   }, [settings.show_floating_bar]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    let partialOff: (() => void) | undefined;
+
+    listen<{ text: string }>("session://partial-text", (event) => {
+      setLiveTranscript(event.payload.text);
+    }).then((off) => { partialOff = off; });
+
+    return () => {
+      partialOff?.();
+    };
+  }, []);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -185,6 +201,10 @@ export function FloatingBar() {
     completed: "完了",
     failed: "失敗",
   };
+  const showLiveTranscript =
+    isRecording &&
+    settings.show_live_transcript_in_floating_bar &&
+    Boolean(liveTranscript.trim());
 
   return (
     <div className="floating-stage">
@@ -196,8 +216,10 @@ export function FloatingBar() {
         <span className={`recording-dot ${isRecording ? "is-active" : ""}`} />
         <span className="floating-mode">{mode === "polish" ? "Polish" : "Raw"}</span>
 
-        <div className="floating-waveform">
-          {isProcessing ? (
+        <div className={`floating-waveform ${showLiveTranscript ? "has-live-text" : ""}`}>
+          {showLiveTranscript ? (
+            <span className="floating-live-text">{liveTranscript}</span>
+          ) : isProcessing ? (
             [0, 1, 2].map((i) => (
               <span key={i} className="processing-bar" style={{
                 animation: `dot-bounce 1.1s ${i * 0.18}s ease-in-out infinite`,

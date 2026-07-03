@@ -29,6 +29,7 @@ export interface AppSettings {
   custom_polish_instructions: string;
   deep_context_enabled: boolean;
   show_floating_bar: boolean;
+  show_live_transcript_in_floating_bar: boolean;
   launch_at_login: boolean;
   onboarding_completed: boolean;
   push_to_talk_hotkey: HotkeyBinding;
@@ -110,6 +111,7 @@ export const defaultSettings: AppSettings = {
   custom_polish_instructions: "",
   deep_context_enabled: false,
   show_floating_bar: true,
+  show_live_transcript_in_floating_bar: false,
   launch_at_login: false,
   onboarding_completed: false,
   push_to_talk_hotkey: { ctrl: true, alt: false, shift: true, key: "F4" },

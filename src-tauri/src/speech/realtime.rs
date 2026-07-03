@@ -1,3 +1,11 @@
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -10,6 +18,7 @@ use crate::audio::AudioChunk;
 
 const REALTIME_SESSION_MODEL: &str = "gpt-realtime-2";
 const REALTIME_SAMPLE_RATE: u32 = 24_000;
+const LIVE_COMMIT_INTERVAL_MS: u64 = 1_400;
 
 pub fn supports_realtime_model(model: &str) -> bool {
     matches!(model.trim(), "gpt-realtime-whisper")
@@ -68,6 +77,7 @@ pub async fn transcribe_realtime(
     api_key: String,
     model: String,
     mut audio_rx: mpsc::UnboundedReceiver<AudioChunk>,
+    partial_tx: Option<mpsc::UnboundedSender<String>>,
 ) -> Result<String, String> {
     if std::env::var("AIVOICE_FORCE_REALTIME_FAIL").as_deref() == Ok("1") {
         return Err("Realtime ASR forced failure for fallback QA".to_string());
@@ -111,7 +121,12 @@ pub async fn transcribe_realtime(
         .await
         .map_err(|error| format!("Realtime session update failed: {error}"))?;
 
+    let live_enabled = partial_tx.is_some();
+    let commit_count = Arc::new(AtomicUsize::new(0));
+    let sender_commit_count = commit_count.clone();
     let sender = tokio::spawn(async move {
+        let mut last_commit = Instant::now();
+        let mut has_uncommitted_audio = false;
         while let Some(chunk) = audio_rx.recv().await {
             let pcm = downmix_resample_to_pcm16(&chunk);
             if pcm.is_empty() {
@@ -124,16 +139,37 @@ pub async fn transcribe_realtime(
             if let Err(error) = write.send(Message::Text(append.to_string().into())).await {
                 return Err(format!("Realtime audio send failed: {error}"));
             }
+            has_uncommitted_audio = true;
+
+            if live_enabled
+                && last_commit.elapsed() >= Duration::from_millis(LIVE_COMMIT_INTERVAL_MS)
+            {
+                let commit = serde_json::json!({ "type": "input_audio_buffer.commit" });
+                write
+                    .send(Message::Text(commit.to_string().into()))
+                    .await
+                    .map_err(|error| format!("Realtime live audio commit failed: {error}"))?;
+                sender_commit_count.fetch_add(1, Ordering::SeqCst);
+                has_uncommitted_audio = false;
+                last_commit = Instant::now();
+            }
         }
 
-        let commit = serde_json::json!({ "type": "input_audio_buffer.commit" });
-        write
-            .send(Message::Text(commit.to_string().into()))
-            .await
-            .map_err(|error| format!("Realtime audio commit failed: {error}"))
+        if has_uncommitted_audio || !live_enabled {
+            let commit = serde_json::json!({ "type": "input_audio_buffer.commit" });
+            write
+                .send(Message::Text(commit.to_string().into()))
+                .await
+                .map_err(|error| format!("Realtime audio commit failed: {error}"))?;
+            sender_commit_count.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
     });
 
     let mut final_text = String::new();
+    let mut completed_segments: Vec<String> = Vec::new();
+    let mut current_segment = String::new();
+    let mut completed_count = 0_usize;
     while let Some(message) = read.next().await {
         let message = message.map_err(|error| format!("Realtime receive failed: {error}"))?;
         let Message::Text(text) = message else {
@@ -146,14 +182,53 @@ pub async fn transcribe_realtime(
         match event_type {
             Some("conversation.item.input_audio_transcription.delta") => {
                 if let Some(delta) = event.get("delta").and_then(|value| value.as_str()) {
-                    final_text.push_str(delta);
+                    if live_enabled {
+                        current_segment.push_str(delta);
+                        let mut preview = completed_segments.join(" ");
+                        if !current_segment.trim().is_empty() {
+                            if !preview.is_empty() {
+                                preview.push(' ');
+                            }
+                            preview.push_str(current_segment.trim());
+                        }
+                        if let Some(tx) = &partial_tx {
+                            let _ = tx.send(preview);
+                        }
+                    } else {
+                        final_text.push_str(delta);
+                    }
                 }
             }
             Some("conversation.item.input_audio_transcription.completed") => {
-                if let Some(transcript) = event.get("transcript").and_then(|value| value.as_str()) {
-                    final_text = transcript.to_string();
+                completed_count += 1;
+                if live_enabled {
+                    let segment = event
+                        .get("transcript")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(current_segment.as_str())
+                        .trim()
+                        .to_string();
+                    if !segment.is_empty() {
+                        completed_segments.push(segment);
+                    }
+                    current_segment.clear();
+                    final_text = completed_segments.join(" ");
+                    if let Some(tx) = &partial_tx {
+                        let _ = tx.send(final_text.clone());
+                    }
+                    if sender.is_finished()
+                        && completed_count >= commit_count.load(Ordering::SeqCst)
+                    {
+                        break;
+                    }
+                } else {
+                    if let Some(transcript) =
+                        event.get("transcript").and_then(|value| value.as_str())
+                    {
+                        final_text = transcript.to_string();
+                    }
+                    break;
                 }
-                break;
             }
             Some("error") => {
                 return Err(event

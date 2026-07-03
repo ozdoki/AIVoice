@@ -88,6 +88,7 @@ pub struct AppSettings {
     pub custom_polish_instructions: String,
     pub deep_context_enabled: bool,
     pub show_floating_bar: bool,
+    pub show_live_transcript_in_floating_bar: bool,
     pub launch_at_login: bool,
     pub onboarding_completed: bool,
     pub push_to_talk_hotkey: HotkeyBinding,
@@ -108,6 +109,7 @@ impl Default for AppSettings {
             custom_polish_instructions: String::new(),
             deep_context_enabled: false,
             show_floating_bar: true,
+            show_live_transcript_in_floating_bar: false,
             launch_at_login: false,
             onboarding_completed: false,
             push_to_talk_hotkey: HotkeyBinding::push_to_talk_default(),
@@ -187,6 +189,7 @@ mod tests {
             custom_polish_instructions: "Slackでは短めにする".to_string(),
             deep_context_enabled: true,
             show_floating_bar: false,
+            show_live_transcript_in_floating_bar: true,
             launch_at_login: true,
             onboarding_completed: true,
             push_to_talk_hotkey: HotkeyBinding::push_to_talk_default(),
@@ -208,6 +211,10 @@ mod tests {
         );
         assert_eq!(restored.deep_context_enabled, original.deep_context_enabled);
         assert_eq!(restored.show_floating_bar, original.show_floating_bar);
+        assert_eq!(
+            restored.show_live_transcript_in_floating_bar,
+            original.show_live_transcript_in_floating_bar
+        );
         assert_eq!(restored.launch_at_login, original.launch_at_login);
         assert_eq!(restored.onboarding_completed, original.onboarding_completed);
         assert_eq!(restored.push_to_talk_hotkey, original.push_to_talk_hotkey);
@@ -229,6 +236,7 @@ mod tests {
         assert!(d.custom_polish_instructions.is_empty());
         assert!(!d.deep_context_enabled);
         assert!(d.show_floating_bar);
+        assert!(!d.show_live_transcript_in_floating_bar);
         assert!(!d.launch_at_login);
         assert!(!d.onboarding_completed);
         assert_eq!(d.push_to_talk_hotkey.display(), "Ctrl + Shift + F4");
