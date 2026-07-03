@@ -9,7 +9,7 @@ use tauri::{Emitter, State};
 
 use crate::{
     audio,
-    context::{self, FocusedAppContext},
+    context::{self, FocusedAppContext, FocusedWindowTarget},
     hotkey::{self, HotkeySet},
     local_data::{
         self, DictionarySuggestion, HistoryEntry, SessionMetrics, SnippetEntry, UsageDaySummary,
@@ -17,7 +17,7 @@ use crate::{
     },
     mode,
     recovery::{self, RecoverySessionSummary},
-    session_service::{self, ClipboardInjector},
+    session_service,
     settings::{self, AppSettings},
     speech::{
         openai_compatible::OpenAiCompatibleProvider,
@@ -37,6 +37,28 @@ struct SessionUiEvent {
     final_text: Option<String>,
     history_id: Option<String>,
     error: Option<String>,
+}
+
+struct TargetWindowInjector {
+    target: Option<FocusedWindowTarget>,
+}
+
+impl session_service::TextInjector for TargetWindowInjector {
+    fn inject(&self, text: &str) -> anyhow::Result<()> {
+        if let Some(target) = &self.target {
+            crate::inject::inject_text_to_window(text, target)
+        } else {
+            crate::inject::inject_text(text)
+        }
+    }
+}
+
+struct PreviewInjector;
+
+impl session_service::TextInjector for PreviewInjector {
+    fn inject(&self, _text: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -298,6 +320,10 @@ async fn start_recording_locked(
         return Ok(());
     }
 
+    if let Some(target) = context::current_external_focused_window() {
+        *state.last_target_window.lock().await = Some(target);
+    }
+
     let (level_tx, mut level_rx) = tokio::sync::mpsc::unbounded_channel::<f32>();
     let settings = state.settings.lock().await.clone();
     let (chunk_tx, realtime_task) =
@@ -381,8 +407,10 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
         },
     );
 
-    let result =
-        session_service::stop_session_inner(state, &ClipboardInjector, Some(app.clone())).await;
+    let injector = TargetWindowInjector {
+        target: state.last_target_window.lock().await.clone(),
+    };
+    let result = session_service::stop_session_inner(state, &injector, Some(app.clone())).await;
     *state.recording_trigger.lock().await = None;
 
     let has_error = match &result {
@@ -494,6 +522,96 @@ pub async fn stop_recording_session(
 ) -> Result<String, String> {
     let _guard = state.session_action.lock().await;
     stop_recording_locked(&app, &state).await
+}
+
+async fn stop_recording_preview_locked(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<String, String> {
+    if !matches!(
+        *state.recording_state.lock().await,
+        RecordingState::Recording
+    ) {
+        return Ok(String::new());
+    }
+
+    let mode = state.mode.lock().await.clone();
+    let _ = app.emit(
+        "session://state-changed",
+        SessionUiEvent {
+            state: RecordingState::Processing,
+            mode: mode.clone(),
+            phase: "transcribing".to_string(),
+            raw_text: None,
+            final_text: None,
+            history_id: None,
+            error: None,
+        },
+    );
+
+    let result =
+        session_service::stop_session_inner(state, &PreviewInjector, Some(app.clone())).await;
+    *state.recording_trigger.lock().await = None;
+
+    let has_error = result.is_err();
+    let mode_label = if matches!(mode, Mode::Polish) {
+        "Polish"
+    } else {
+        "Raw"
+    };
+    tray::update_status(
+        app,
+        if !has_error { "待機中" } else { "エラー" },
+        mode_label,
+    );
+
+    if let Ok(outcome) = &result {
+        if let Some(recovery_id) = &outcome.recovery_id {
+            if let Err(error) = recovery::delete_session(app, recovery_id) {
+                tracing::warn!("failed to delete onboarding test recovery session: {error}");
+            }
+        }
+    }
+
+    let _ = app.emit(
+        "session://state-changed",
+        SessionUiEvent {
+            state: RecordingState::Idle,
+            mode,
+            phase: if has_error { "failed" } else { "completed" }.to_string(),
+            raw_text: result
+                .as_ref()
+                .ok()
+                .map(|outcome| outcome.raw_text.clone())
+                .filter(|text| !text.is_empty()),
+            final_text: result
+                .as_ref()
+                .ok()
+                .map(|outcome| outcome.final_text.clone())
+                .filter(|text| !text.is_empty()),
+            history_id: None,
+            error: result.as_ref().err().cloned(),
+        },
+    );
+    result.map(|outcome| outcome.final_text)
+}
+
+#[tauri::command]
+pub async fn start_onboarding_test_recording(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let _guard = state.session_action.lock().await;
+    start_recording_locked(&app, &state, RecordingTrigger::Manual).await
+}
+
+#[tauri::command]
+pub async fn stop_onboarding_test_recording(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let _guard = state.session_action.lock().await;
+    stop_recording_preview_locked(&app, &state).await
 }
 
 #[tauri::command]
@@ -619,11 +737,17 @@ pub async fn copy_text(text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn inject_text(text: String) -> Result<(), String> {
+pub async fn inject_text(state: State<'_, AppState>, text: String) -> Result<(), String> {
     if text.trim().is_empty() {
         return Err("注入するテキストがありません。".to_string());
     }
-    crate::inject::inject_text(&text).map_err(|error| error.to_string())
+    let target = state
+        .last_target_window
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "入力先アプリを一度クリックしてから再注入してください。".to_string())?;
+    crate::inject::inject_text_to_window(&text, &target).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -847,13 +971,20 @@ pub async fn retry_recovery_session(
 #[tauri::command]
 pub async fn inject_recovery_session(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     id: String,
 ) -> Result<RecoverySessionSummary, String> {
     let meta = recovery::load_meta(&app, &id).map_err(|error| error.to_string())?;
     if meta.final_text.trim().is_empty() {
         return Err("再注入できるテキストがありません。".to_string());
     }
-    if let Err(error) = crate::inject::inject_text(&meta.final_text) {
+    let target = state
+        .last_target_window
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "入力先アプリを一度クリックしてから再注入してください。".to_string())?;
+    if let Err(error) = crate::inject::inject_text_to_window(&meta.final_text, &target) {
         let error = error.to_string();
         let _ = recovery::mark_failed(&app, &id, error.clone());
         return Err(error);

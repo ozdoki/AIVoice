@@ -1,7 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use aivoice::{commands, hotkey, local_data, settings, state::AppState, tray};
+use aivoice::{commands, context, hotkey, local_data, settings, state::AppState, tray};
 use tauri::{LogicalPosition, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 fn startup_debug(message: &str) {
@@ -77,6 +77,16 @@ fn main() {
                     startup_debug("delayed: main not found");
                 }
             });
+            let focus_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    if let Some(target) = context::current_external_focused_window() {
+                        let state = focus_handle.state::<AppState>();
+                        *state.last_target_window.lock().await = Some(target);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            });
             startup_debug("setup: done");
             Ok(())
         })
@@ -101,6 +111,8 @@ fn main() {
             commands::get_recording_state,
             commands::start_recording_session,
             commands::stop_recording_session,
+            commands::start_onboarding_test_recording,
+            commands::stop_onboarding_test_recording,
             commands::push_to_talk_down,
             commands::push_to_talk_up,
             commands::toggle_hands_free_recording,

@@ -26,6 +26,7 @@ interface AudioDevice {
 
 interface Props {
   onClose: () => void;
+  onOpenOnboarding: () => void;
   onSaved: (settings: AppSettings) => void;
 }
 
@@ -78,7 +79,7 @@ function historyDictionaryCandidate(
   );
 }
 
-export function SettingsPanel({ onClose, onSaved }: Props) {
+export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
   const apiKeyInputRef = useRef<HTMLInputElement>(null);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [devices, setDevices] = useState<AudioDevice[]>([]);
@@ -108,6 +109,7 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
   const [focusedContext, setFocusedContext] = useState<FocusedAppContext | null>(null);
   const [dataBusy, setDataBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -445,6 +447,7 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
   const addDictionaryWord = async (word: string) => {
     setDataBusy(true);
     setError(null);
+    setStatusMessage(null);
     try {
       const next = isTauri
         ? await invoke<string[]>("add_dictionary_word", { word })
@@ -453,6 +456,7 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
       setDictionarySuggestions((current) =>
         current.filter((item) => item.word.toLowerCase() !== word.toLowerCase())
       );
+      setStatusMessage(`${word} を辞書に追加しました。`);
     } catch (addError) {
       setError(`辞書に追加できませんでした: ${addError}`);
     } finally {
@@ -782,6 +786,9 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
               <Dismiss20Regular />
             </button>
           </div>
+        )}
+        {statusMessage && (
+          <p className="field-success settings-status">{statusMessage}</p>
         )}
 
         <div className="dialog-body settings-body-with-nav">
@@ -1227,6 +1234,12 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
           </SettingsSection>
 
           <SettingsSection id="settings-general" title="一般設定">
+            <div className="section-toolbar">
+              <span>初回設定を後から確認し直せます。</span>
+              <button className="button secondary compact" onClick={onOpenOnboarding}>
+                初回セットアップを再実行
+              </button>
+            </div>
             <label className="toggle-row">
               <input
                 type="checkbox"
@@ -1405,7 +1418,7 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
                           disabled={dataBusy || !dictionaryCandidate}
                           title={dictionaryCandidate ? `${dictionaryCandidate} を追加` : "候補なし"}
                         >
-                          辞書追加
+                          {dictionaryCandidate ? `辞書追加: ${dictionaryCandidate}` : "辞書候補なし"}
                         </button>
                         <button
                           className="button secondary compact"

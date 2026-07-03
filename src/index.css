@@ -569,6 +569,7 @@ kbd {
   background: rgba(255, 255, 255, 0.025);
   color: var(--text-muted);
   font-size: 13px;
+  white-space: pre-wrap;
 }
 
 .onboarding-test-result.is-success {
@@ -777,6 +778,10 @@ kbd {
   font-size: 11px;
   line-height: 1.5;
   margin: -3px 0 12px;
+}
+
+.settings-status {
+  margin: 0 18px 10px;
 }
 
 .field-error,

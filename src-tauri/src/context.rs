@@ -6,8 +6,16 @@ pub struct FocusedAppContext {
     pub window_title: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FocusedWindowTarget {
+    pub hwnd: isize,
+    pub process_id: u32,
+    pub process_name: String,
+    pub window_title: String,
+}
+
 #[cfg(target_os = "windows")]
-pub fn focused_app_context() -> Option<FocusedAppContext> {
+pub fn focused_window_target() -> Option<FocusedWindowTarget> {
     use std::path::Path;
 
     use windows::{
@@ -38,7 +46,9 @@ pub fn focused_app_context() -> Option<FocusedAppContext> {
         let mut pid = 0_u32;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         if pid == 0 {
-            return Some(FocusedAppContext {
+            return Some(FocusedWindowTarget {
+                hwnd: hwnd.0 as isize,
+                process_id: pid,
                 process_name: String::new(),
                 window_title,
             });
@@ -66,7 +76,9 @@ pub fn focused_app_context() -> Option<FocusedAppContext> {
         };
         let _ = CloseHandle(process);
 
-        Some(FocusedAppContext {
+        Some(FocusedWindowTarget {
+            hwnd: hwnd.0 as isize,
+            process_id: pid,
             process_name,
             window_title,
         })
@@ -74,8 +86,55 @@ pub fn focused_app_context() -> Option<FocusedAppContext> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn focused_app_context() -> Option<FocusedAppContext> {
+pub fn focused_window_target() -> Option<FocusedWindowTarget> {
     None
+}
+
+pub fn focused_app_context() -> Option<FocusedAppContext> {
+    focused_window_target().map(|target| FocusedAppContext {
+        process_name: target.process_name,
+        window_title: target.window_title,
+    })
+}
+
+pub fn current_external_focused_window() -> Option<FocusedWindowTarget> {
+    let target = focused_window_target()?;
+    if target.process_id == std::process::id() {
+        return None;
+    }
+    Some(target)
+}
+
+#[cfg(target_os = "windows")]
+pub fn focus_window(target: &FocusedWindowTarget) -> anyhow::Result<()> {
+    use std::{ffi::c_void, thread, time::Duration};
+
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{
+            IsIconic, IsWindow, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        },
+    };
+
+    unsafe {
+        let hwnd = HWND(target.hwnd as *mut c_void);
+        if !IsWindow(hwnd).as_bool() {
+            anyhow::bail!("以前の入力先ウィンドウが見つかりません。入力先アプリを一度クリックしてから再注入してください。");
+        }
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        if !SetForegroundWindow(hwnd).as_bool() {
+            anyhow::bail!("入力先アプリへフォーカスを戻せませんでした。入力先アプリを一度クリックしてから再注入してください。");
+        }
+    }
+    thread::sleep(Duration::from_millis(140));
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn focus_window(_target: &FocusedWindowTarget) -> anyhow::Result<()> {
+    anyhow::bail!("window focus restore is only supported on Windows")
 }
 
 pub fn prompt_fragment(context: Option<&FocusedAppContext>) -> String {

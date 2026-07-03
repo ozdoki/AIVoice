@@ -69,6 +69,10 @@ pub async fn transcribe_realtime(
     model: String,
     mut audio_rx: mpsc::UnboundedReceiver<AudioChunk>,
 ) -> Result<String, String> {
+    if std::env::var("AIVOICE_FORCE_REALTIME_FAIL").as_deref() == Ok("1") {
+        return Err("Realtime ASR forced failure for fallback QA".to_string());
+    }
+
     let url = realtime_url(&base_url);
     let mut request = url
         .into_client_request()

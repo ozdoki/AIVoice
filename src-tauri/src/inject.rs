@@ -15,6 +15,14 @@ pub fn inject_text(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn inject_text_to_window(
+    text: &str,
+    target: &crate::context::FocusedWindowTarget,
+) -> anyhow::Result<()> {
+    crate::context::focus_window(target)?;
+    inject_text(text)
+}
+
 #[cfg(target_os = "windows")]
 fn clipboard_paste(text: &str) -> anyhow::Result<()> {
     use arboard::Clipboard;

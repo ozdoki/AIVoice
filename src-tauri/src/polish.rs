@@ -19,22 +19,22 @@ Core rules:
 fn preset_prompt(preset: &str) -> &'static str {
     match preset {
         "slack" => {
-            "Preset: Slack-style message.\nRewrite as a concise chat message that can be pasted directly into Slack. Use a natural, lightly polite tone for Japanese. Prefer 1-3 short paragraphs or compact bullets. Do not add greetings, subject lines, signatures, or excessive formality unless they were spoken."
+            "Preset: Slack-style message.\nRewrite as a concise chat message that can be pasted directly into Slack. For Japanese, use a natural colleague-to-colleague tone: clear, lightly polite, and not stiff. Prefer 1-3 short paragraphs. Use compact bullets only when the transcript contains multiple separate items. Keep requests, blockers, and next actions easy to scan. Do not add greetings, subject lines, signatures, or excessive formality unless they were spoken."
         }
         "email" => {
-            "Preset: Email-style message.\nRewrite as a polite email body. Use clear paragraphs, natural honorific language for Japanese, and complete sentences. Do not invent a subject, recipient name, sender name, signature, company name, or closing phrase unless spoken. Keep requests and deadlines explicit when they appear in the transcript."
+            "Preset: Email-style message.\nRewrite as a polite email body. For Japanese, use natural business language with complete sentences, clear paragraph breaks, and explicit requests. Keep the tone courteous but avoid over-formal template phrases. Do not invent a subject, recipient name, sender name, company name, signature, or closing phrase unless spoken. Preserve deadlines, dependencies, and asks exactly when they appear in the transcript."
         }
         "prompt" => {
-            "Preset: AI prompt-style instruction.\nRewrite as a clear instruction for an AI assistant. Preserve goal, constraints, inputs, examples, output format, and order of operations. Use bullet points for multiple requirements. Keep imperative wording. Do not answer the prompt; only rewrite the user's intended prompt."
+            "Preset: AI prompt-style instruction.\nRewrite as a clear instruction for an AI assistant. Start with the goal, then list constraints, inputs, output format, and steps when present. Use imperative wording and bullets for multiple requirements. Preserve examples, file names, issue numbers, model names, and acceptance criteria. Do not answer the prompt; only rewrite the user's intended prompt."
         }
         "technical" => {
-            "Preset: Technical note.\nRewrite as an engineering note. Preserve code identifiers, CLI commands, model names, API names, file paths, branch names, issue numbers, English technical terms, symbols, and numbers. Use bullets or short sections when helpful. Do not normalize technical tokens into prose when exact spelling matters."
+            "Preset: Technical note.\nRewrite as an engineering note for later implementation or debugging. Preserve code identifiers, CLI commands, model names, API names, file paths, branch names, issue numbers, English technical terms, symbols, and numbers. Organize into short bullets for facts, hypotheses, decisions, and next actions when helpful. Do not normalize technical tokens into prose when exact spelling matters."
         }
         "memo" | "" => {
-            "Preset: Personal memo.\nRewrite as a personal memo for later review. Make it easy to scan. Use short paragraphs for one topic and bullets for multiple points, tasks, or decisions. Keep the tone neutral and compact. Do not over-polish into formal business writing."
+            "Preset: Personal memo.\nRewrite as a personal memo for later review. Keep it neutral, compact, and easy to scan. Use short paragraphs for one topic and bullets for multiple points, tasks, decisions, or reminders. Preserve uncertainty as uncertainty. Do not over-polish into formal business writing or chat-like wording."
         }
         _ => {
-            "Preset: Personal memo.\nRewrite as a personal memo for later review. Make it easy to scan. Use short paragraphs for one topic and bullets for multiple points, tasks, or decisions. Keep the tone neutral and compact. Do not over-polish into formal business writing."
+            "Preset: Personal memo.\nRewrite as a personal memo for later review. Keep it neutral, compact, and easy to scan. Use short paragraphs for one topic and bullets for multiple points, tasks, decisions, or reminders. Preserve uncertainty as uncertainty. Do not over-polish into formal business writing or chat-like wording."
         }
     }
 }
@@ -197,6 +197,27 @@ mod tests {
         assert!(memo.contains("personal memo"));
         assert!(prompt.contains("Do not answer the prompt"));
         assert!(technical.contains("CLI commands"));
+    }
+
+    #[test]
+    fn preset_prompts_define_quality_criteria_for_offline_review() {
+        let cases = [
+            ("slack", ["colleague-to-colleague", "next actions"]),
+            ("email", ["business language", "explicit requests"]),
+            ("memo", ["Preserve uncertainty", "formal business writing"]),
+            ("prompt", ["goal", "output format"]),
+            (
+                "technical",
+                ["facts, hypotheses, decisions", "next actions"],
+            ),
+        ];
+
+        for (preset, expected_terms) in cases {
+            let prompt = build_system_prompt(SYSTEM_PROMPT, preset, "", &[], None);
+            for term in expected_terms {
+                assert!(prompt.contains(term), "missing {term} for {preset}");
+            }
+        }
     }
 
     #[test]

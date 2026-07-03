@@ -178,6 +178,10 @@ function App() {
       {showSettings && (
         <SettingsPanel
           onClose={() => setShowSettings(false)}
+          onOpenOnboarding={() => {
+            setShowSettings(false);
+            setShowOnboarding(true);
+          }}
           onSaved={(next) => {
             setSettings(next);
             setMode(next.mode);
@@ -190,7 +194,6 @@ function App() {
         <OnboardingPanel
           settings={settings}
           recordingState={recordingState}
-          lastText={lastText}
           onSettingsSaved={(next) => {
             setSettings(next);
             setMode(next.mode);

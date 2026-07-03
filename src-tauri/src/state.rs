@@ -5,7 +5,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{audio::CapturedAudio, settings::AppSettings};
+use crate::{audio::CapturedAudio, context::FocusedWindowTarget, settings::AppSettings};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -58,6 +58,7 @@ pub struct AppState {
     pub session: Mutex<Option<SessionController>>,
     pub recording_trigger: Mutex<Option<RecordingTrigger>>,
     pub session_action: Mutex<()>,
+    pub last_target_window: Mutex<Option<FocusedWindowTarget>>,
 }
 
 impl Default for AppState {
@@ -70,6 +71,7 @@ impl Default for AppState {
             session: Mutex::new(None),
             recording_trigger: Mutex::new(None),
             session_action: Mutex::new(()),
+            last_target_window: Mutex::new(None),
         }
     }
 }

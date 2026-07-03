@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Checkmark20Regular,
@@ -17,7 +17,6 @@ interface AudioDevice {
 interface Props {
   settings: AppSettings;
   recordingState: RecordingState;
-  lastText: string | null;
   onSettingsSaved: (settings: AppSettings) => void;
   onComplete: () => void;
   onClose: () => void;
@@ -28,7 +27,6 @@ const isTauri = "__TAURI_INTERNALS__" in window;
 export function OnboardingPanel({
   settings,
   recordingState,
-  lastText,
   onSettingsSaved,
   onComplete,
   onClose,
@@ -41,7 +39,7 @@ export function OnboardingPanel({
   const [error, setError] = useState<string | null>(null);
   const [apiReady, setApiReady] = useState(Boolean(settings.has_api_key));
   const [testStarted, setTestStarted] = useState(false);
-  const initialLastText = useRef(lastText);
+  const [testPreviewText, setTestPreviewText] = useState("");
 
   useEffect(() => {
     setDraftSettings(settings);
@@ -63,8 +61,8 @@ export function OnboardingPanel({
   }, []);
 
   const testSucceeded = useMemo(
-    () => testStarted && Boolean(lastText && lastText !== initialLastText.current),
-    [lastText, testStarted]
+    () => testStarted && Boolean(testPreviewText.trim()),
+    [testPreviewText, testStarted]
   );
 
   const saveDraftSettings = async (nextSettings: AppSettings) => {
@@ -118,10 +116,10 @@ export function OnboardingPanel({
     setBusy(true);
     setError(null);
     try {
-      initialLastText.current = lastText;
       setTestStarted(true);
+      setTestPreviewText("");
       if (isTauri) {
-        await invoke("start_recording_session");
+        await invoke("start_onboarding_test_recording");
       }
     } catch (startError) {
       setError(`テスト録音を開始できませんでした: ${startError}`);
@@ -135,7 +133,10 @@ export function OnboardingPanel({
     setError(null);
     try {
       if (isTauri) {
-        await invoke("stop_recording_session");
+        const preview = await invoke<string>("stop_onboarding_test_recording");
+        setTestPreviewText(preview);
+      } else {
+        setTestPreviewText("テスト録音のプレビューです。");
       }
     } catch (stopError) {
       setError(`テスト録音を停止できませんでした: ${stopError}`);
@@ -264,7 +265,7 @@ export function OnboardingPanel({
           {step === 3 && (
             <div className="onboarding-pane">
               <h3>テスト録音</h3>
-              <p>短く話して停止し、テキストが入力先へ注入されることを確認します。</p>
+              <p>短く話して停止し、テキスト化結果をプレビューで確認します。入力先へは注入しません。</p>
               <div className="onboarding-test-actions">
                 <button
                   className="button secondary"
@@ -284,7 +285,9 @@ export function OnboardingPanel({
                 </button>
               </div>
               <div className={`onboarding-test-result ${testSucceeded ? "is-success" : ""}`}>
-                {testSucceeded ? "テスト入力を確認しました。" : "停止後、成功するとここに確認状態が出ます。"}
+                {testSucceeded
+                  ? testPreviewText
+                  : "停止後、成功するとここに文字起こし結果が出ます。"}
               </div>
               <button
                 className="button primary"
