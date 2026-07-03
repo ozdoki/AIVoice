@@ -3,12 +3,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Dismiss20Regular, Settings24Regular } from "@fluentui/react-icons";
 import { ModeSwitch } from "./components/ModeSwitch";
+import { OnboardingPanel } from "./components/OnboardingPanel";
 import { SessionPanel } from "./components/SessionPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import {
   type AppSettings,
   type Mode,
   type RecordingState,
+  type SessionPhase,
   defaultSettings,
 } from "./types";
 
@@ -22,12 +24,24 @@ function App() {
   const [lastText, setLastText] = useState<string | null>(
     isTauri ? null : "今日の打ち合わせは午後2時からです。"
   );
+  const [lastRawText, setLastRawText] = useState<string | null>(
+    isTauri ? null : "今日の打ち合わせは午後二時からです"
+  );
+  const [sessionPhase, setSessionPhase] = useState<SessionPhase>("idle");
+  const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
   const [lastError, setLastError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
 
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -36,6 +50,9 @@ function App() {
         setSettings(loaded);
         setMode(loaded.mode);
         modeRef.current = loaded.mode;
+        if (!loaded.onboarding_completed || !loaded.has_api_key) {
+          setShowOnboarding(true);
+        }
       })
       .catch((error) => setLastError(String(error)));
   }, []);
@@ -50,16 +67,27 @@ function App() {
         listen<{
           state: RecordingState;
           mode: Mode;
+          phase?: SessionPhase;
+          raw_text: string | null;
           final_text: string | null;
           history_id: string | null;
           error: string | null;
         }>("session://state-changed", (event) => {
-          const { state, final_text, error } = event.payload;
+          const { state, phase, raw_text, final_text, error } = event.payload;
           setRecordingState(state);
+          setSessionPhase(phase ?? (state === "recording" ? "recording" : state === "processing" ? "transcribing" : "idle"));
+          if (state === "recording") {
+            setRecordingStartedAt(Date.now());
+          }
           if (state === "idle") {
+            setRecordingStartedAt(null);
             setLastError(error ?? null);
+            if (raw_text) setLastRawText(raw_text);
             if (final_text) setLastText(final_text);
           }
+        }),
+        listen<{ phase: SessionPhase }>("session://phase-changed", (event) => {
+          setSessionPhase(event.payload.phase);
         }),
         listen("hotkey://push-to-talk-down", () => {
           invoke("push_to_talk_down").catch((error) => setLastError(String(error)));
@@ -124,7 +152,10 @@ function App() {
         <ModeSwitch mode={mode} onModeChange={handleModeChange} />
         <SessionPanel
           state={recordingState}
+          phase={sessionPhase}
           lastText={lastText}
+          rawText={lastRawText}
+          elapsedMs={recordingStartedAt ? now - recordingStartedAt : 0}
           pushToTalk={settings.push_to_talk_hotkey}
           handsFree={settings.hands_free_hotkey}
           toggleMode={settings.toggle_mode_hotkey}
@@ -152,6 +183,21 @@ function App() {
             setMode(next.mode);
             modeRef.current = next.mode;
           }}
+        />
+      )}
+
+      {showOnboarding && (
+        <OnboardingPanel
+          settings={settings}
+          recordingState={recordingState}
+          lastText={lastText}
+          onSettingsSaved={(next) => {
+            setSettings(next);
+            setMode(next.mode);
+            modeRef.current = next.mode;
+          }}
+          onComplete={() => setShowOnboarding(false)}
+          onClose={() => setShowOnboarding(false)}
         />
       )}
     </main>

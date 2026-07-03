@@ -19,8 +19,7 @@ pub fn focused_app_context() -> Option<FocusedAppContext> {
                 PROCESS_QUERY_LIMITED_INFORMATION,
             },
             UI::WindowsAndMessaging::{
-                GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
-                GetWindowThreadProcessId,
+                GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
             },
         },
     };
@@ -88,9 +87,62 @@ pub fn prompt_fragment(context: Option<&FocusedAppContext>) -> String {
         lines.push(format!("Input target app: {}", context.process_name.trim()));
     }
     if !context.window_title.trim().is_empty() {
-        lines.push(format!("Input target window title: {}", context.window_title.trim()));
+        lines.push(format!(
+            "Input target window title: {}",
+            context.window_title.trim()
+        ));
     }
     lines.join("\n")
+}
+
+fn context_text(context: &FocusedAppContext) -> String {
+    format!(
+        "{}\n{}",
+        context.process_name.trim().to_ascii_lowercase(),
+        context.window_title.trim().to_ascii_lowercase()
+    )
+}
+
+pub fn app_style_hint(context: Option<&FocusedAppContext>) -> String {
+    let Some(context) = context else {
+        return String::new();
+    };
+    let text = context_text(context);
+    let hint = if text.contains("slack")
+        || text.contains("teams")
+        || text.contains("discord")
+        || text.contains("chatwork")
+        || text.contains("line")
+    {
+        "Chat app style hint: keep the text concise, direct, and easy to send as a short message. Avoid email-like openings, closings, and signatures."
+    } else if text.contains("outlook")
+        || text.contains("thunderbird")
+        || text.contains("gmail")
+        || text.contains("mail")
+    {
+        "Email app style hint: use a polite email-body tone with clear paragraphs. Do not invent a subject, recipient, sender, or signature."
+    } else if text.contains("code")
+        || text.contains("cursor")
+        || text.contains("visual studio")
+        || text.contains("jetbrains")
+        || text.contains("intellij")
+        || text.contains("rustrover")
+        || text.contains("webstorm")
+        || text.contains("pycharm")
+        || text.contains("terminal")
+        || text.contains("powershell")
+    {
+        "IDE or terminal style hint: preserve technical terms, code identifiers, commands, file paths, branch names, issue numbers, and symbols exactly where possible."
+    } else if text.contains("chrome")
+        || text.contains("edge")
+        || text.contains("firefox")
+        || text.contains("browser")
+    {
+        "Browser style hint: keep the text suitable for a web text field. Prefer concise wording and avoid app-specific formatting unless the transcript asks for it."
+    } else {
+        ""
+    };
+    hint.to_string()
 }
 
 #[cfg(test)]
@@ -107,5 +159,32 @@ mod tests {
         let prompt = prompt_fragment(Some(&context));
         assert!(prompt.contains("notepad.exe"));
         assert!(prompt.contains("memo"));
+    }
+
+    #[test]
+    fn app_style_hint_detects_chat_email_browser_and_ide() {
+        let slack = FocusedAppContext {
+            process_name: "Slack.exe".to_string(),
+            window_title: "general".to_string(),
+        };
+        assert!(app_style_hint(Some(&slack)).contains("Chat app"));
+
+        let outlook = FocusedAppContext {
+            process_name: "OUTLOOK.EXE".to_string(),
+            window_title: "Inbox".to_string(),
+        };
+        assert!(app_style_hint(Some(&outlook)).contains("Email app"));
+
+        let code = FocusedAppContext {
+            process_name: "Code.exe".to_string(),
+            window_title: "AIVoice - Visual Studio Code".to_string(),
+        };
+        assert!(app_style_hint(Some(&code)).contains("IDE or terminal"));
+
+        let edge = FocusedAppContext {
+            process_name: "msedge.exe".to_string(),
+            window_title: "ChatGPT".to_string(),
+        };
+        assert!(app_style_hint(Some(&edge)).contains("Browser style"));
     }
 }

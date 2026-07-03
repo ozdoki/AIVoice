@@ -11,14 +11,16 @@ pub async fn route(
 ) -> String {
     match mode {
         Mode::Raw => text.to_string(),
-        Mode::Polish => match polish::polish_text(settings, dictionary_words, focused_context, text).await {
-            Ok(polished) if !polished.trim().is_empty() => polished,
-            Ok(_) => text.to_string(),
-            Err(e) => {
-                tracing::warn!("polish_text failed, falling back to raw: {e}");
-                text.to_string()
+        Mode::Polish => {
+            match polish::polish_text(settings, dictionary_words, focused_context, text).await {
+                Ok(polished) if !polished.trim().is_empty() => polished,
+                Ok(_) => text.to_string(),
+                Err(e) => {
+                    tracing::warn!("polish_text failed, falling back to raw: {e}");
+                    text.to_string()
+                }
             }
-        },
+        }
     }
 }
 

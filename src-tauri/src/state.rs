@@ -45,7 +45,9 @@ pub enum RecordingTrigger {
 pub struct SessionController {
     pub stop_tx: watch::Sender<bool>,
     pub capture_task: JoinHandle<anyhow::Result<CapturedAudio>>,
+    pub realtime_task: Option<JoinHandle<Result<String, String>>>,
     pub started_at: Instant,
+    pub recovery_id: Option<String>,
 }
 
 pub struct AppState {

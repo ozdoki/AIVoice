@@ -1,5 +1,14 @@
 export type Mode = "raw" | "polish";
 export type RecordingState = "idle" | "recording" | "processing";
+export type SessionPhase =
+  | "idle"
+  | "recording"
+  | "transcribing"
+  | "polishing"
+  | "injecting"
+  | "completed"
+  | "failed";
+export type PolishPreset = "slack" | "email" | "memo" | "prompt" | "technical";
 
 export interface HotkeyBinding {
   ctrl: boolean;
@@ -16,10 +25,12 @@ export interface AppSettings {
   polish_model: string;
   mode: Mode;
   device_id: string | null;
+  polish_preset: PolishPreset;
   custom_polish_instructions: string;
   deep_context_enabled: boolean;
   show_floating_bar: boolean;
   launch_at_login: boolean;
+  onboarding_completed: boolean;
   push_to_talk_hotkey: HotkeyBinding;
   hands_free_hotkey: HotkeyBinding;
   toggle_mode_hotkey: HotkeyBinding;
@@ -34,6 +45,42 @@ export interface HistoryEntry {
   created_at: number;
   error: string | null;
   status: "success" | "error";
+  pinned: boolean;
+}
+
+export interface DictionarySuggestion {
+  word: string;
+  count: number;
+}
+
+export interface SnippetEntry {
+  id: string;
+  cue: string;
+  text: string;
+  created_at: number;
+}
+
+export type RecoveryStatus =
+  | "recording"
+  | "captured"
+  | "transcribing"
+  | "text_ready"
+  | "completed"
+  | "failed"
+  | "orphaned";
+
+export interface RecoverySessionSummary {
+  id: string;
+  created_at: number;
+  updated_at: number;
+  mode: Mode;
+  status: RecoveryStatus;
+  duration_ms: number;
+  raw_text: string;
+  final_text: string;
+  error: string | null;
+  has_audio: boolean;
+  can_retry: boolean;
 }
 
 export interface UsageDaySummary {
@@ -55,14 +102,16 @@ export interface FocusedAppContext {
 export const defaultSettings: AppSettings = {
   api_base_url: "https://api.openai.com/v1",
   api_key: "",
-  api_model: "whisper-1",
+  api_model: "gpt-realtime-whisper",
   polish_model: "gpt-4o-mini",
   mode: "raw",
   device_id: null,
+  polish_preset: "memo",
   custom_polish_instructions: "",
   deep_context_enabled: false,
   show_floating_bar: true,
   launch_at_login: false,
+  onboarding_completed: false,
   push_to_talk_hotkey: { ctrl: true, alt: false, shift: true, key: "F4" },
   hands_free_hotkey: { ctrl: true, alt: false, shift: true, key: "F6" },
   toggle_mode_hotkey: { ctrl: true, alt: false, shift: true, key: "F5" },

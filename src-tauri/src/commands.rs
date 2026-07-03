@@ -11,9 +11,19 @@ use crate::{
     audio,
     context::{self, FocusedAppContext},
     hotkey::{self, HotkeySet},
-    local_data::{self, HistoryEntry, SessionMetrics, UsageDaySummary, MAX_DICTIONARY_WORDS},
+    local_data::{
+        self, DictionarySuggestion, HistoryEntry, SessionMetrics, SnippetEntry, UsageDaySummary,
+        MAX_DICTIONARY_WORDS, MAX_SNIPPETS,
+    },
+    mode,
+    recovery::{self, RecoverySessionSummary},
     session_service::{self, ClipboardInjector},
     settings::{self, AppSettings},
+    speech::{
+        openai_compatible::OpenAiCompatibleProvider,
+        realtime::{supports_realtime_model, transcribe_realtime},
+        SpeechProvider,
+    },
     state::{AppState, Mode, RecordingState, RecordingTrigger},
     tray,
 };
@@ -22,6 +32,8 @@ use crate::{
 struct SessionUiEvent {
     state: RecordingState,
     mode: Mode,
+    phase: String,
+    raw_text: Option<String>,
     final_text: Option<String>,
     history_id: Option<String>,
     error: Option<String>,
@@ -73,6 +85,15 @@ fn hands_free_action(recording_state: &RecordingState) -> ShortcutAction {
         RecordingState::Recording => ShortcutAction::Stop,
         RecordingState::Processing => ShortcutAction::Ignore,
     }
+}
+
+fn trigger_label(trigger: &RecordingTrigger) -> String {
+    match trigger {
+        RecordingTrigger::PushToTalk => "push_to_talk",
+        RecordingTrigger::HandsFree => "hands_free",
+        RecordingTrigger::Manual => "manual",
+    }
+    .to_string()
 }
 
 fn parse_model_ids(body: &str) -> Result<Vec<String>, String> {
@@ -278,10 +299,38 @@ async fn start_recording_locked(
     }
 
     let (level_tx, mut level_rx) = tokio::sync::mpsc::unbounded_channel::<f32>();
-    session_service::start_session_inner(state, Some(level_tx)).await?;
+    let settings = state.settings.lock().await.clone();
+    let (chunk_tx, realtime_task) =
+        if !settings.api_key.trim().is_empty() && supports_realtime_model(&settings.api_model) {
+            let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(transcribe_realtime(
+                settings.api_base_url.clone(),
+                settings.api_key.clone(),
+                settings.api_model.clone(),
+                chunk_rx,
+            ));
+            (Some(chunk_tx), Some(task))
+        } else {
+            (None, None)
+        };
+    let mode = state.mode.lock().await.clone();
+    let recovery_session = recovery::create_session(app, mode.clone(), trigger_label(&trigger))
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = session_service::start_session_inner(
+        state,
+        Some(level_tx),
+        chunk_tx,
+        realtime_task,
+        Some(recovery_session.id.clone()),
+        Some(recovery_session.audio_path.clone()),
+    )
+    .await
+    {
+        let _ = recovery::delete_session(app, &recovery_session.id);
+        return Err(error);
+    }
     *state.recording_trigger.lock().await = Some(trigger);
 
-    let mode = state.mode.lock().await.clone();
     let mode_label = if matches!(mode, Mode::Polish) {
         "Polish"
     } else {
@@ -293,6 +342,8 @@ async fn start_recording_locked(
         SessionUiEvent {
             state: RecordingState::Recording,
             mode,
+            phase: "recording".to_string(),
+            raw_text: None,
             final_text: None,
             history_id: None,
             error: None,
@@ -322,15 +373,22 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
         SessionUiEvent {
             state: RecordingState::Processing,
             mode: mode.clone(),
+            phase: "transcribing".to_string(),
+            raw_text: None,
             final_text: None,
             history_id: None,
             error: None,
         },
     );
 
-    let result = session_service::stop_session_inner(state, &ClipboardInjector).await;
+    let result =
+        session_service::stop_session_inner(state, &ClipboardInjector, Some(app.clone())).await;
     *state.recording_trigger.lock().await = None;
 
+    let has_error = match &result {
+        Ok(outcome) => outcome.inject_error.is_some(),
+        Err(_) => true,
+    };
     let mode_label = if matches!(mode, Mode::Polish) {
         "Polish"
     } else {
@@ -338,15 +396,11 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
     };
     tray::update_status(
         app,
-        if result.is_ok() {
-            "待機中"
-        } else {
-            "エラー"
-        },
+        if !has_error { "待機中" } else { "エラー" },
         mode_label,
     );
     let history_id = match &result {
-        Ok(outcome) if !outcome.final_text.is_empty() => {
+        Ok(outcome) if !outcome.final_text.is_empty() && outcome.inject_error.is_none() => {
             let entry = local_data::make_history_entry(
                 outcome.raw_text.clone(),
                 outcome.final_text.clone(),
@@ -358,6 +412,14 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
                 .map(|entry| entry.id)
                 .map_err(|error| tracing::warn!("failed to save history: {error}"))
                 .ok();
+            if let (Some(recovery_id), Some(_)) = (&outcome.recovery_id, &saved_id) {
+                if let Err(error) = recovery::delete_session(app, recovery_id) {
+                    tracing::warn!("failed to delete completed recovery session: {error}");
+                }
+            } else if let Some(recovery_id) = &outcome.recovery_id {
+                let _ =
+                    recovery::mark_failed(app, recovery_id, "履歴保存に失敗しました。".to_string());
+            }
             let settings = state.settings.lock().await.clone();
             if let Err(error) = local_data::record_usage(
                 app,
@@ -374,6 +436,7 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
             }
             saved_id
         }
+        Ok(_) => None,
         Err(error) => {
             let entry = local_data::make_history_entry(
                 String::new(),
@@ -387,7 +450,6 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
                 .map_err(|save_error| tracing::warn!("failed to save error history: {save_error}"))
                 .ok()
         }
-        _ => None,
     };
 
     let _ = app.emit(
@@ -395,13 +457,22 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
         SessionUiEvent {
             state: RecordingState::Idle,
             mode,
+            phase: if has_error { "failed" } else { "completed" }.to_string(),
+            raw_text: result
+                .as_ref()
+                .ok()
+                .map(|outcome| outcome.raw_text.clone())
+                .filter(|text| !text.is_empty()),
             final_text: result
                 .as_ref()
                 .ok()
                 .map(|outcome| outcome.final_text.clone())
                 .filter(|text| !text.is_empty()),
             history_id,
-            error: result.as_ref().err().cloned(),
+            error: match &result {
+                Ok(outcome) => outcome.inject_error.clone(),
+                Err(error) => Some(error.clone()),
+            },
         },
     );
     result.map(|outcome| outcome.final_text)
@@ -569,6 +640,63 @@ pub async fn delete_history_item(
 }
 
 #[tauri::command]
+pub async fn toggle_history_pin(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<Vec<HistoryEntry>, String> {
+    local_data::toggle_history_pin(&app, &id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn rerun_history_polish(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<HistoryEntry>, String> {
+    let mut history = local_data::load_history(&app).map_err(|error| error.to_string())?;
+    let index = history
+        .iter()
+        .position(|item| item.id == id)
+        .ok_or_else(|| "履歴が見つかりません。".to_string())?;
+    let source_text = if !history[index].raw_text.trim().is_empty() {
+        history[index].raw_text.clone()
+    } else {
+        history[index].final_text.clone()
+    };
+    if source_text.trim().is_empty() {
+        return Err("Polish再実行に使えるテキストがありません。".to_string());
+    }
+
+    let current_settings = state.settings.lock().await.clone();
+    if current_settings.api_key.is_empty() {
+        return Err("APIキーが設定されていません。設定画面から入力してください。".to_string());
+    }
+    let dictionary_words = state.dictionary_words.lock().await.clone();
+    let focused_context = if current_settings.deep_context_enabled {
+        context::focused_app_context()
+    } else {
+        None
+    };
+    let polished = mode::route(
+        &Mode::Polish,
+        &current_settings,
+        &dictionary_words,
+        focused_context.as_ref(),
+        &source_text,
+    )
+    .await;
+    let snippets = local_data::load_snippets(&app).map_err(|error| error.to_string())?;
+    let final_text = local_data::expand_snippets(&polished, &snippets);
+    history[index].raw_text = source_text;
+    history[index].final_text = final_text;
+    history[index].mode = Mode::Polish;
+    history[index].status = local_data::HistoryStatus::Success;
+    history[index].error = None;
+    local_data::save_history(&app, &history).map_err(|error| error.to_string())?;
+    Ok(history)
+}
+
+#[tauri::command]
 pub async fn clear_history(app: tauri::AppHandle) -> Result<(), String> {
     local_data::clear_history(&app).map_err(|error| error.to_string())
 }
@@ -576,6 +704,13 @@ pub async fn clear_history(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn get_dictionary(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     local_data::load_dictionary(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_dictionary_suggestions(
+    app: tauri::AppHandle,
+) -> Result<Vec<DictionarySuggestion>, String> {
+    local_data::dictionary_suggestions(&app).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -602,8 +737,165 @@ pub async fn remove_dictionary_word(
 }
 
 #[tauri::command]
+pub async fn get_snippets(app: tauri::AppHandle) -> Result<Vec<SnippetEntry>, String> {
+    local_data::load_snippets(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn add_snippet(
+    app: tauri::AppHandle,
+    cue: String,
+    text: String,
+) -> Result<Vec<SnippetEntry>, String> {
+    local_data::add_snippet(&app, &cue, &text).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn remove_snippet(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<Vec<SnippetEntry>, String> {
+    local_data::remove_snippet(&app, &id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn get_usage_summary(app: tauri::AppHandle) -> Result<Vec<UsageDaySummary>, String> {
     local_data::load_usage(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_recovery_sessions(
+    app: tauri::AppHandle,
+) -> Result<Vec<RecoverySessionSummary>, String> {
+    recovery::list_sessions(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn retry_recovery_session(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<RecoverySessionSummary, String> {
+    let meta = recovery::load_meta(&app, &id).map_err(|error| error.to_string())?;
+    let wav_path = recovery::audio_path(&app, &id).map_err(|error| error.to_string())?;
+    if !wav_path.exists() {
+        return Err("復元できる音声ファイルがありません。".to_string());
+    }
+    let wav_info = recovery::repair_wav_header(&wav_path).map_err(|error| error.to_string())?;
+    recovery::mark_captured(
+        &app,
+        &id,
+        wav_info.sample_rate,
+        wav_info.channels,
+        wav_info.frame_count,
+        wav_info.duration_ms,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let current_settings = state.settings.lock().await.clone();
+    if current_settings.api_key.is_empty() {
+        let error = "APIキーが設定されていません。設定画面から入力してください。".to_string();
+        let _ = recovery::mark_failed(&app, &id, error.clone());
+        return Err(error);
+    }
+    let dictionary_words = state.dictionary_words.lock().await.clone();
+    let focused_context = if current_settings.deep_context_enabled {
+        context::focused_app_context()
+    } else {
+        None
+    };
+    recovery::mark_transcribing(&app, &id).map_err(|error| error.to_string())?;
+
+    let audio = audio::CapturedAudio {
+        samples: Vec::new(),
+        sample_rate: wav_info.sample_rate,
+        channels: wav_info.channels,
+        wav_path: Some(wav_path),
+        frame_count: wav_info.frame_count,
+    };
+    let provider = OpenAiCompatibleProvider {
+        base_url: current_settings.api_base_url.clone(),
+        api_key: current_settings.api_key.clone(),
+        model: current_settings.api_model.clone(),
+        dictionary_words: dictionary_words.clone(),
+        focused_context: focused_context.clone(),
+        partial_tx: None,
+    };
+    let raw_text = match provider.transcribe(&audio).await {
+        Ok(text) => text,
+        Err(error) => {
+            let error = error.to_string();
+            let _ = recovery::mark_failed(&app, &id, error.clone());
+            return Err(error);
+        }
+    };
+    let final_text = mode::route(
+        &meta.mode,
+        &current_settings,
+        &dictionary_words,
+        focused_context.as_ref(),
+        &raw_text,
+    )
+    .await;
+    let snippets = local_data::load_snippets(&app).map_err(|error| error.to_string())?;
+    let final_text = local_data::expand_snippets(&final_text, &snippets);
+    recovery::mark_text_ready(&app, &id, raw_text, final_text)
+        .map_err(|error| error.to_string())?;
+    recovery::summarize(&app, &id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn inject_recovery_session(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<RecoverySessionSummary, String> {
+    let meta = recovery::load_meta(&app, &id).map_err(|error| error.to_string())?;
+    if meta.final_text.trim().is_empty() {
+        return Err("再注入できるテキストがありません。".to_string());
+    }
+    if let Err(error) = crate::inject::inject_text(&meta.final_text) {
+        let error = error.to_string();
+        let _ = recovery::mark_failed(&app, &id, error.clone());
+        return Err(error);
+    }
+    recovery::update_meta(&app, &id, |meta| {
+        meta.status = recovery::RecoveryStatus::TextReady;
+        meta.error = None;
+    })
+    .map_err(|error| error.to_string())?;
+    recovery::summarize(&app, &id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn save_recovery_session_to_history(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<HistoryEntry, String> {
+    let meta = recovery::load_meta(&app, &id).map_err(|error| error.to_string())?;
+    if meta.final_text.trim().is_empty() {
+        return Err("履歴に保存できるテキストがありません。".to_string());
+    }
+    let entry = local_data::make_history_entry(
+        meta.raw_text.clone(),
+        meta.final_text.clone(),
+        meta.mode.clone(),
+        meta.duration_ms,
+        None,
+    );
+    let saved = local_data::append_history(&app, entry).map_err(|error| error.to_string())?;
+    recovery::mark_completed(&app, &id, Some(saved.id.clone()))
+        .map_err(|error| error.to_string())?;
+    recovery::delete_session(&app, &id).map_err(|error| error.to_string())?;
+    Ok(saved)
+}
+
+#[tauri::command]
+pub async fn delete_recovery_session(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<Vec<RecoverySessionSummary>, String> {
+    recovery::delete_session(&app, &id).map_err(|error| error.to_string())?;
+    recovery::list_sessions(&app).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -614,6 +906,11 @@ pub async fn get_focused_app_context() -> Result<Option<FocusedAppContext>, Stri
 #[tauri::command]
 pub async fn dictionary_limit() -> Result<usize, String> {
     Ok(MAX_DICTIONARY_WORDS)
+}
+
+#[tauri::command]
+pub async fn snippet_limit() -> Result<usize, String> {
+    Ok(MAX_SNIPPETS)
 }
 
 #[tauri::command]
@@ -683,7 +980,9 @@ pub async fn save_settings(
     if previous.launch_at_login != new_settings.launch_at_login {
         if let Err(error) = crate::startup::set_launch_at_login(new_settings.launch_at_login) {
             let _ = hotkey::reconfigure_hotkeys(hotkey_set(&previous));
-            return Err(format!("ログイン時起動の設定を変更できませんでした: {error}"));
+            return Err(format!(
+                "ログイン時起動の設定を変更できませんでした: {error}"
+            ));
         }
     }
 

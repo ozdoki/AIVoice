@@ -84,10 +84,12 @@ pub struct AppSettings {
     pub polish_model: String,
     pub mode: Mode,
     pub device_id: Option<String>,
+    pub polish_preset: String,
     pub custom_polish_instructions: String,
     pub deep_context_enabled: bool,
     pub show_floating_bar: bool,
     pub launch_at_login: bool,
+    pub onboarding_completed: bool,
     pub push_to_talk_hotkey: HotkeyBinding,
     pub hands_free_hotkey: HotkeyBinding,
     pub toggle_mode_hotkey: HotkeyBinding,
@@ -98,14 +100,16 @@ impl Default for AppSettings {
         Self {
             api_base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
-            api_model: "whisper-1".to_string(),
+            api_model: "gpt-realtime-whisper".to_string(),
             polish_model: "gpt-4o-mini".to_string(),
             mode: Mode::default(),
             device_id: None,
+            polish_preset: "memo".to_string(),
             custom_polish_instructions: String::new(),
             deep_context_enabled: false,
             show_floating_bar: true,
             launch_at_login: false,
+            onboarding_completed: false,
             push_to_talk_hotkey: HotkeyBinding::push_to_talk_default(),
             hands_free_hotkey: HotkeyBinding::hands_free_default(),
             toggle_mode_hotkey: HotkeyBinding::toggle_mode_default(),
@@ -175,14 +179,16 @@ mod tests {
         let original = AppSettings {
             api_base_url: "https://example.com/v1".to_string(),
             api_key: "sk-test".to_string(),
-            api_model: "whisper-1".to_string(),
+            api_model: "gpt-realtime-whisper".to_string(),
             polish_model: "gpt-4o".to_string(),
             mode: Mode::Polish,
             device_id: Some("dev-001".to_string()),
+            polish_preset: "slack".to_string(),
             custom_polish_instructions: "Slackでは短めにする".to_string(),
             deep_context_enabled: true,
             show_floating_bar: false,
             launch_at_login: true,
+            onboarding_completed: true,
             push_to_talk_hotkey: HotkeyBinding::push_to_talk_default(),
             hands_free_hotkey: HotkeyBinding::hands_free_default(),
             toggle_mode_hotkey: HotkeyBinding::toggle_mode_default(),
@@ -195,6 +201,7 @@ mod tests {
         assert_eq!(restored.polish_model, original.polish_model);
         assert_eq!(restored.device_id, original.device_id);
         assert_eq!(restored.mode, original.mode);
+        assert_eq!(restored.polish_preset, original.polish_preset);
         assert_eq!(
             restored.custom_polish_instructions,
             original.custom_polish_instructions
@@ -202,6 +209,7 @@ mod tests {
         assert_eq!(restored.deep_context_enabled, original.deep_context_enabled);
         assert_eq!(restored.show_floating_bar, original.show_floating_bar);
         assert_eq!(restored.launch_at_login, original.launch_at_login);
+        assert_eq!(restored.onboarding_completed, original.onboarding_completed);
         assert_eq!(restored.push_to_talk_hotkey, original.push_to_talk_hotkey);
         assert_eq!(restored.hands_free_hotkey, original.hands_free_hotkey);
         assert_eq!(restored.toggle_mode_hotkey, original.toggle_mode_hotkey);
@@ -214,13 +222,15 @@ mod tests {
         let d = AppSettings::default();
         assert!(d.api_key.is_empty());
         assert_eq!(d.api_base_url, "https://api.openai.com/v1");
-        assert_eq!(d.api_model, "whisper-1");
+        assert_eq!(d.api_model, "gpt-realtime-whisper");
         assert!(d.device_id.is_none());
         assert_eq!(d.mode, Mode::Raw);
+        assert_eq!(d.polish_preset, "memo");
         assert!(d.custom_polish_instructions.is_empty());
         assert!(!d.deep_context_enabled);
         assert!(d.show_floating_bar);
         assert!(!d.launch_at_login);
+        assert!(!d.onboarding_completed);
         assert_eq!(d.push_to_talk_hotkey.display(), "Ctrl + Shift + F4");
         assert_eq!(d.hands_free_hotkey.display(), "Ctrl + Shift + F6");
         assert_eq!(d.toggle_mode_hotkey.display(), "Ctrl + Shift + F5");
@@ -231,7 +241,7 @@ mod tests {
         // device_id が JSON にない場合、#[serde(default)] で None になること
         let json = serde_json::json!({
             "api_base_url": "https://api.openai.com/v1",
-            "api_model": "whisper-1",
+            "api_model": "gpt-4o-mini-transcribe",
             "polish_model": "gpt-4o-mini",
             "mode": "raw"
         });
@@ -240,6 +250,18 @@ mod tests {
         assert_eq!(s.push_to_talk_hotkey, HotkeyBinding::push_to_talk_default());
         assert_eq!(s.hands_free_hotkey, HotkeyBinding::hands_free_default());
         assert_eq!(s.toggle_mode_hotkey, HotkeyBinding::toggle_mode_default());
+    }
+
+    #[test]
+    fn settings_missing_polish_preset_uses_default() {
+        let json = serde_json::json!({
+            "api_base_url": "https://api.openai.com/v1",
+            "api_model": "gpt-4o-mini-transcribe",
+            "polish_model": "gpt-4o-mini",
+            "mode": "polish"
+        });
+        let s: AppSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(s.polish_preset, "memo");
     }
 
     #[test]

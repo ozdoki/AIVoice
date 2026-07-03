@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build": "tauri build --no-bundle",
+    "app:restart": "powershell -ExecutionPolicy Bypass -File scripts/restart-aivoice-release.ps1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.10.1",

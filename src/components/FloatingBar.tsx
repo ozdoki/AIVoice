@@ -4,14 +4,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
 import { Stop16Filled } from "@fluentui/react-icons";
-import { type AppSettings, defaultSettings, formatHotkey } from "../types";
-
-type RecordingState = "idle" | "recording" | "processing";
-type Mode = "raw" | "polish";
+import {
+  type AppSettings,
+  type Mode,
+  type RecordingState,
+  type SessionPhase,
+  defaultSettings,
+  formatHotkey,
+} from "../types";
 
 interface SessionUiEvent {
   state: RecordingState;
   mode: Mode;
+  phase?: SessionPhase;
   final_text: string | null;
   history_id: string | null;
   error: string | null;
@@ -29,6 +34,9 @@ export function FloatingBar() {
     isTauri ? "idle" : "recording"
   );
   const [mode, setMode] = useState<Mode>("raw");
+  const [phase, setPhase] = useState<SessionPhase>(isTauri ? "idle" : "recording");
+  const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const levelRef = useRef(isTauri ? 0 : 0.32);
   const [displayLevel, setDisplayLevel] = useState(isTauri ? 0 : 0.32);
@@ -37,6 +45,11 @@ export function FloatingBar() {
   useEffect(() => {
     document.body.style.background = "transparent";
     document.documentElement.style.background = "transparent";
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -74,11 +87,13 @@ export function FloatingBar() {
     let unlistener: (() => void) | undefined;
 
     listen<SessionUiEvent>("session://state-changed", async (event) => {
-      const { state, mode: newMode } = event.payload;
+      const { state, mode: newMode, phase: nextPhase } = event.payload;
       setRecordingState(state);
       setMode(newMode);
+      setPhase(nextPhase ?? (state === "recording" ? "recording" : state === "processing" ? "transcribing" : "idle"));
 
       if (state === "recording" && settings.show_floating_bar) {
+        setRecordingStartedAt(Date.now());
         try {
           const monitor = await currentMonitor();
           if (monitor) {
@@ -95,12 +110,33 @@ export function FloatingBar() {
       } else if (state === "idle") {
         levelRef.current = 0;
         setDisplayLevel(0);
-        await win.hide();
+        setRecordingStartedAt(null);
+        if ((nextPhase === "completed" || nextPhase === "failed") && settings.show_floating_bar) {
+          await win.show();
+          window.setTimeout(() => {
+            win.hide().catch((error) => console.error(error));
+          }, 1200);
+        } else {
+          await win.hide();
+        }
       }
     }).then((off) => { unlistener = off; });
 
     return () => { unlistener?.(); };
   }, [settings.show_floating_bar]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    let phaseOff: (() => void) | undefined;
+
+    listen<{ phase: SessionPhase }>("session://phase-changed", (event) => {
+      setPhase(event.payload.phase);
+    }).then((off) => { phaseOff = off; });
+
+    return () => {
+      phaseOff?.();
+    };
+  }, []);
 
   // 音量レベルリスナー（60fps でスムーズに追従）
   useEffect(() => {
@@ -135,6 +171,18 @@ export function FloatingBar() {
 
   const isRecording = recordingState === "recording";
   const isProcessing = recordingState === "processing";
+  const elapsedSeconds = recordingStartedAt
+    ? Math.max(0, Math.floor((now - recordingStartedAt) / 1000))
+    : 0;
+  const phaseLabel: Record<SessionPhase, string> = {
+    idle: "待機中",
+    recording: "録音中",
+    transcribing: "文字起こし中",
+    polishing: "整形中",
+    injecting: "注入中",
+    completed: "完了",
+    failed: "失敗",
+  };
 
   return (
     <div className="floating-stage">
@@ -174,6 +222,11 @@ export function FloatingBar() {
             })
           )}
         </div>
+
+        <span className="floating-status">
+          {phaseLabel[phase]}
+          {isRecording && ` ${elapsedSeconds}s`}
+        </span>
 
         {isRecording && (
           <button

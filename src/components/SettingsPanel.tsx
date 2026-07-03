@@ -8,9 +8,12 @@ import {
 } from "@fluentui/react-icons";
 import {
   type AppSettings,
+  type DictionarySuggestion,
   type FocusedAppContext,
   type HistoryEntry,
   type HotkeyBinding,
+  type RecoverySessionSummary,
+  type SnippetEntry,
   type UsageDaySummary,
   defaultSettings,
   formatHotkey,
@@ -61,6 +64,20 @@ function bindingSignature(binding: HotkeyBinding): string {
   return `${binding.ctrl}:${binding.alt}:${binding.shift}:${binding.key.toUpperCase()}`;
 }
 
+function historyDictionaryCandidate(
+  item: HistoryEntry,
+  dictionaryWords: string[]
+): string | null {
+  const text = `${item.final_text} ${item.raw_text}`;
+  const matches = text.match(/[A-Za-z][A-Za-z0-9._/+@#-]{1,63}|[\u30A0-\u30FF]{3,}/g) ?? [];
+  return (
+    matches.find(
+      (candidate) =>
+        !dictionaryWords.some((word) => word.toLowerCase() === candidate.toLowerCase())
+    ) ?? null
+  );
+}
+
 export function SettingsPanel({ onClose, onSaved }: Props) {
   const apiKeyInputRef = useRef<HTMLInputElement>(null);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
@@ -76,9 +93,17 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
   const [apiKeyImportPath, setApiKeyImportPath] = useState("");
   const [apiKeyBusy, setApiKeyBusy] = useState(false);
   const [dictionaryWords, setDictionaryWords] = useState<string[]>([]);
+  const [dictionarySuggestions, setDictionarySuggestions] = useState<DictionarySuggestion[]>([]);
   const [dictionaryDraft, setDictionaryDraft] = useState("");
   const [dictionaryLimit, setDictionaryLimit] = useState(800);
+  const [snippets, setSnippets] = useState<SnippetEntry[]>([]);
+  const [snippetCueDraft, setSnippetCueDraft] = useState("");
+  const [snippetTextDraft, setSnippetTextDraft] = useState("");
+  const [snippetLimit, setSnippetLimit] = useState(100);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [historySearch, setHistorySearch] = useState("");
+  const [historyRawVisible, setHistoryRawVisible] = useState<Record<string, boolean>>({});
+  const [recoverySessions, setRecoverySessions] = useState<RecoverySessionSummary[]>([]);
   const [usage, setUsage] = useState<UsageDaySummary[]>([]);
   const [focusedContext, setFocusedContext] = useState<FocusedAppContext | null>(null);
   const [dataBusy, setDataBusy] = useState(false);
@@ -119,7 +144,14 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
             baseUrl: source.api_base_url,
             apiKey: apiKeyOverride,
           })
-        : ["gpt-4o-mini", "gpt-4.1-mini", "whisper-1"];
+        : [
+            "gpt-realtime-whisper",
+            "gpt-4o-mini-transcribe",
+            "gpt-4o-transcribe",
+            "whisper-1",
+            "gpt-4o-mini",
+            "gpt-4.1-mini",
+          ];
       setModels(next);
       setModelsLoadedFor(target);
     } catch (loadError) {
@@ -135,6 +167,19 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
     try {
       if (!isTauri) {
         setDictionaryWords(["Obsidian", "AIVoice", "Antigravity"]);
+        setDictionarySuggestions([
+          { word: "Slack", count: 3 },
+          { word: "Cursor", count: 2 },
+          { word: "Whisper", count: 1 },
+        ]);
+        setSnippets([
+          {
+            id: "preview-snippet",
+            cue: "署名",
+            text: "山田太郎\nhttps://example.com",
+            created_at: Math.floor(Date.now() / 1000),
+          },
+        ]);
         setHistory([
           {
             id: "preview-history",
@@ -145,8 +190,10 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
             created_at: Math.floor(Date.now() / 1000),
             error: null,
             status: "success",
+            pinned: false,
           },
         ]);
+        setRecoverySessions([]);
         setUsage([
           {
             day: new Date().toISOString().slice(0, 10),
@@ -161,16 +208,33 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
         ]);
         return;
       }
-      const [words, historyItems, usageItems, limit] = await Promise.all([
+      const [
+        words,
+        suggestions,
+        snippetItems,
+        historyItems,
+        usageItems,
+        recoveryItems,
+        limit,
+        snippetsMax,
+      ] = await Promise.all([
         invoke<string[]>("get_dictionary"),
+        invoke<DictionarySuggestion[]>("get_dictionary_suggestions"),
+        invoke<SnippetEntry[]>("get_snippets"),
         invoke<HistoryEntry[]>("get_history"),
         invoke<UsageDaySummary[]>("get_usage_summary"),
+        invoke<RecoverySessionSummary[]>("get_recovery_sessions"),
         invoke<number>("dictionary_limit"),
+        invoke<number>("snippet_limit"),
       ]);
       setDictionaryWords(words);
+      setDictionarySuggestions(suggestions);
+      setSnippets(snippetItems);
       setHistory(historyItems);
       setUsage(usageItems);
+      setRecoverySessions(recoveryItems);
       setDictionaryLimit(limit);
+      setSnippetLimit(snippetsMax);
     } catch (loadError) {
       setError(String(loadError));
     }
@@ -374,6 +438,11 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
   const handleAddDictionaryWord = async () => {
     const word = dictionaryDraft.trim();
     if (!word) return;
+    await addDictionaryWord(word);
+    setDictionaryDraft("");
+  };
+
+  const addDictionaryWord = async (word: string) => {
     setDataBusy(true);
     setError(null);
     try {
@@ -381,7 +450,9 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
         ? await invoke<string[]>("add_dictionary_word", { word })
         : [...new Set([...dictionaryWords, word])].sort();
       setDictionaryWords(next);
-      setDictionaryDraft("");
+      setDictionarySuggestions((current) =>
+        current.filter((item) => item.word.toLowerCase() !== word.toLowerCase())
+      );
     } catch (addError) {
       setError(`辞書に追加できませんでした: ${addError}`);
     } finally {
@@ -397,8 +468,55 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
         ? await invoke<string[]>("remove_dictionary_word", { word })
         : dictionaryWords.filter((item) => item !== word);
       setDictionaryWords(next);
+      if (isTauri) {
+        const suggestions = await invoke<DictionarySuggestion[]>("get_dictionary_suggestions");
+        setDictionarySuggestions(suggestions);
+      }
     } catch (removeError) {
       setError(`辞書から削除できませんでした: ${removeError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
+  const handleAddSnippet = async () => {
+    const cue = snippetCueDraft.trim();
+    const text = snippetTextDraft.trim();
+    if (!cue || !text) return;
+    setDataBusy(true);
+    setError(null);
+    try {
+      const next = isTauri
+        ? await invoke<SnippetEntry[]>("add_snippet", { cue, text })
+        : [
+            {
+              id: `preview-snippet-${Date.now()}`,
+              cue,
+              text,
+              created_at: Math.floor(Date.now() / 1000),
+            },
+            ...snippets.filter((item) => item.cue.toLowerCase() !== cue.toLowerCase()),
+          ];
+      setSnippets(next);
+      setSnippetCueDraft("");
+      setSnippetTextDraft("");
+    } catch (addError) {
+      setError(`スニペットを追加できませんでした: ${addError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
+  const handleRemoveSnippet = async (id: string) => {
+    setDataBusy(true);
+    setError(null);
+    try {
+      const next = isTauri
+        ? await invoke<SnippetEntry[]>("remove_snippet", { id })
+        : snippets.filter((item) => item.id !== id);
+      setSnippets(next);
+    } catch (removeError) {
+      setError(`スニペットを削除できませんでした: ${removeError}`);
     } finally {
       setDataBusy(false);
     }
@@ -412,11 +530,70 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
         ? await invoke<HistoryEntry[]>("delete_history_item", { id })
         : history.filter((item) => item.id !== id);
       setHistory(next);
+      setHistoryRawVisible((current) => {
+        const { [id]: _removed, ...rest } = current;
+        return rest;
+      });
+      if (isTauri) {
+        const suggestions = await invoke<DictionarySuggestion[]>("get_dictionary_suggestions");
+        setDictionarySuggestions(suggestions);
+      }
     } catch (deleteError) {
       setError(`履歴を削除できませんでした: ${deleteError}`);
     } finally {
       setDataBusy(false);
     }
+  };
+
+  const handleToggleHistoryPin = async (id: string) => {
+    setDataBusy(true);
+    setError(null);
+    try {
+      const next = isTauri
+        ? await invoke<HistoryEntry[]>("toggle_history_pin", { id })
+        : history.map((item) =>
+            item.id === id ? { ...item, pinned: !item.pinned } : item
+          );
+      setHistory(next);
+    } catch (pinError) {
+      setError(`履歴のピン留めを変更できませんでした: ${pinError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
+  const handleRerunHistoryPolish = async (id: string) => {
+    setDataBusy(true);
+    setError(null);
+    try {
+      const next = isTauri
+        ? await invoke<HistoryEntry[]>("rerun_history_polish", { id })
+        : history.map((item) =>
+            item.id === id
+              ? {
+                  ...item,
+                  mode: "polish" as const,
+                  final_text: `${item.final_text}\n\nPolish preview`,
+                  status: "success" as const,
+                  error: null,
+                }
+              : item
+          );
+      setHistory(next);
+    } catch (polishError) {
+      setError(`Polishを再実行できませんでした: ${polishError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
+  const handleAddHistoryCandidate = async (item: HistoryEntry) => {
+    const candidate = historyDictionaryCandidate(item, dictionaryWords);
+    if (!candidate) {
+      setError("この履歴から追加できる辞書候補が見つかりませんでした。");
+      return;
+    }
+    await addDictionaryWord(candidate);
   };
 
   const handleClearHistory = async () => {
@@ -427,6 +604,7 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
         await invoke("clear_history");
       }
       setHistory([]);
+      setDictionarySuggestions([]);
     } catch (deleteError) {
       setError(`履歴を全削除できませんでした: ${deleteError}`);
     } finally {
@@ -458,6 +636,68 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
     }
   };
 
+  const handleRetryRecovery = async (id: string) => {
+    setDataBusy(true);
+    setError(null);
+    try {
+      if (!isTauri) return;
+      const updated = await invoke<RecoverySessionSummary>("retry_recovery_session", { id });
+      setRecoverySessions((current) =>
+        current.map((item) => (item.id === id ? updated : item))
+      );
+    } catch (retryError) {
+      setError(`未完了の録音を再文字起こしできませんでした: ${retryError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
+  const handleInjectRecovery = async (id: string) => {
+    setDataBusy(true);
+    setError(null);
+    try {
+      if (!isTauri) return;
+      const updated = await invoke<RecoverySessionSummary>("inject_recovery_session", { id });
+      setRecoverySessions((current) =>
+        current.map((item) => (item.id === id ? updated : item))
+      );
+    } catch (injectError) {
+      setError(`未完了の録音を再注入できませんでした: ${injectError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
+  const handleSaveRecoveryToHistory = async (id: string) => {
+    setDataBusy(true);
+    setError(null);
+    try {
+      if (!isTauri) return;
+      const saved = await invoke<HistoryEntry>("save_recovery_session_to_history", { id });
+      setHistory((current) => [saved, ...current]);
+      setRecoverySessions((current) => current.filter((item) => item.id !== id));
+    } catch (saveError) {
+      setError(`未完了の録音を履歴へ保存できませんでした: ${saveError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
+  const handleDeleteRecovery = async (id: string) => {
+    setDataBusy(true);
+    setError(null);
+    try {
+      const next = isTauri
+        ? await invoke<RecoverySessionSummary[]>("delete_recovery_session", { id })
+        : recoverySessions.filter((item) => item.id !== id);
+      setRecoverySessions(next);
+    } catch (deleteError) {
+      setError(`未完了の録音を削除できませんでした: ${deleteError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
   const handlePreviewContext = async () => {
     setDataBusy(true);
     setError(null);
@@ -476,7 +716,41 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
   const formatHistoryTime = (seconds: number) =>
     new Date(seconds * 1000).toLocaleString();
 
+  const recoveryStatusLabel = (status: RecoverySessionSummary["status"]) => {
+    switch (status) {
+      case "recording":
+        return "録音中";
+      case "captured":
+        return "録音済み";
+      case "transcribing":
+        return "文字起こし中";
+      case "text_ready":
+        return "テキスト復元済み";
+      case "failed":
+        return "失敗";
+      case "orphaned":
+        return "中断";
+      case "completed":
+        return "完了";
+      default:
+        return status;
+    }
+  };
+
   const formatCost = (value: number) => `$${value.toFixed(4)}`;
+  const historyQuery = historySearch.trim().toLowerCase();
+  const visibleHistory = history
+    .filter((item) => {
+      if (!historyQuery) return true;
+      return [item.raw_text, item.final_text, item.error ?? "", item.mode]
+        .join(" ")
+        .toLowerCase()
+        .includes(historyQuery);
+    })
+    .sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      return b.created_at - a.created_at;
+    });
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
@@ -513,16 +787,11 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
         <div className="dialog-body settings-body-with-nav">
           <nav className="settings-side-nav" aria-label="設定カテゴリ">
             {[
-              ["settings-api", "API"],
-              ["settings-models", "モデル"],
-              ["settings-audio", "オーディオ"],
-              ["settings-hotkeys", "ショートカット"],
-              ["settings-custom", "カスタム指示"],
-              ["settings-dictionary", "辞書"],
-              ["settings-context", "コンテキスト"],
-              ["settings-general", "一般"],
-              ["settings-history", "履歴"],
-              ["settings-usage", "ステータス"],
+              ["settings-input", "入力"],
+              ["settings-ai", "AI"],
+              ["settings-dictionary-category", "辞書"],
+              ["settings-history-category", "履歴"],
+              ["settings-details", "詳細"],
             ].map(([id, label]) => (
               <button
                 key={id}
@@ -534,6 +803,11 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
             ))}
           </nav>
           <div className="settings-pane">
+          <SettingsCategory
+            id="settings-ai"
+            title="AI"
+            description="APIキー、モデル、Polishの出力品質をまとめて調整します。"
+          />
           <SettingsSection id="settings-api" title="API">
             <FormField label="API Base URL">
               <input
@@ -660,6 +934,11 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
             )}
           </SettingsSection>
 
+          <SettingsCategory
+            id="settings-input"
+            title="入力"
+            description="毎日の音声入力で触るマイク、ショートカット、表示をまとめています。"
+          />
           <SettingsSection
             id="settings-audio"
             title="オーディオ"
@@ -737,6 +1016,23 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
           </SettingsSection>
 
           <SettingsSection id="settings-custom" title="カスタム指示">
+            <FormField label="Polish プリセット">
+              <select
+                value={settings.polish_preset}
+                onChange={(event) =>
+                  setSettings((current) => ({
+                    ...current,
+                    polish_preset: event.target.value as AppSettings["polish_preset"],
+                  }))
+                }
+              >
+                <option value="slack">Slack風（短く自然に）</option>
+                <option value="email">メール風（丁寧に整える）</option>
+                <option value="memo">メモ風（要点を読みやすく）</option>
+                <option value="prompt">AIプロンプト風（指示を明確に）</option>
+                <option value="technical">技術メモ風（固有名詞と記号を保持）</option>
+              </select>
+            </FormField>
             <FormField label="Polish モードの出力指示">
               <textarea
                 className="settings-textarea"
@@ -751,10 +1047,15 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
               />
             </FormField>
             <p className="settings-note">
-              Polish モードのときだけ使用します。本文だけを出力する制約は固定で維持されます。
+              プリセットと追加指示はPolishモードのときだけ使用します。本文だけを出力する制約は固定で維持されます。
             </p>
           </SettingsSection>
 
+          <SettingsCategory
+            id="settings-dictionary-category"
+            title="辞書"
+            description="固有名詞、技術語、定型文を個人用に管理します。"
+          />
           <SettingsSection id="settings-dictionary" title="辞書">
             <div className="dictionary-header">
               <span>{dictionaryWords.length}/{dictionaryLimit} 語</span>
@@ -797,11 +1098,102 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
                 ))
               )}
             </div>
+            <div className="dictionary-suggestions">
+              <div className="section-toolbar">
+                <span>履歴からの候補</span>
+                <span>{dictionarySuggestions.length} 件</span>
+              </div>
+              {dictionarySuggestions.length === 0 ? (
+                <p className="settings-note">
+                  履歴に固有名詞や技術語の候補が見つかると、ここから辞書へ追加できます。
+                </p>
+              ) : (
+                <div className="suggestion-chips">
+                  {dictionarySuggestions.map((item) => (
+                    <button
+                      className="suggestion-chip"
+                      key={item.word}
+                      onClick={() => addDictionaryWord(item.word)}
+                      disabled={dataBusy || dictionaryWords.length >= dictionaryLimit}
+                      title={`${item.count} 回出現`}
+                    >
+                      <span>{item.word}</span>
+                      <small>{item.count}</small>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <p className="settings-note">
               辞書は最大 {dictionaryLimit} 語までです。ASRの補助プロンプトとPolishの固有名詞候補として使います。
             </p>
           </SettingsSection>
 
+          <SettingsSection id="settings-snippets" title="スニペット">
+            <div className="section-toolbar">
+              <span>{snippets.length}/{snippetLimit} 件</span>
+              <span>音声キューをfinal text内で展開します</span>
+            </div>
+            <div className="snippet-editor">
+              <FormField label="音声キュー">
+                <input
+                  value={snippetCueDraft}
+                  placeholder="例: 署名"
+                  onChange={(event) => setSnippetCueDraft(event.target.value)}
+                />
+              </FormField>
+              <FormField label="展開テキスト">
+                <textarea
+                  className="settings-textarea"
+                  value={snippetTextDraft}
+                  placeholder="例: 山田太郎&#10;https://example.com"
+                  onChange={(event) => setSnippetTextDraft(event.target.value)}
+                />
+              </FormField>
+              <button
+                className="button secondary compact"
+                onClick={handleAddSnippet}
+                disabled={
+                  dataBusy ||
+                  !snippetCueDraft.trim() ||
+                  !snippetTextDraft.trim() ||
+                  snippets.length >= snippetLimit
+                }
+              >
+                追加
+              </button>
+            </div>
+            <div className="snippet-list">
+              {snippets.length === 0 ? (
+                <p className="settings-note">登録済みのスニペットはありません。</p>
+              ) : (
+                snippets.map((snippet) => (
+                  <article className="snippet-row" key={snippet.id}>
+                    <div>
+                      <strong>{snippet.cue}</strong>
+                      <p>{snippet.text}</p>
+                    </div>
+                    <button
+                      className="text-button"
+                      onClick={() => handleRemoveSnippet(snippet.id)}
+                      disabled={dataBusy}
+                    >
+                      削除
+                    </button>
+                  </article>
+                ))
+              )}
+            </div>
+            <p className="settings-note">
+              Raw/Polishの処理後、入力先へ注入する直前に展開します。Polishによる書き換え対象にはしません。
+            </p>
+          </SettingsSection>
+
+          <SettingsCategory
+            id="settings-details"
+            title="詳細"
+            description="コンテキスト確認や利用量など、必要な時だけ見る項目です。"
+          />
           <SettingsSection id="settings-context" title="コンテキスト">
             <label className="toggle-row">
               <input
@@ -817,7 +1209,7 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
               <span>前面アプリ名とウィンドウタイトルをプロンプト補助に使う</span>
             </label>
             <p className="settings-note">
-              取得対象は前面アプリ名とウィンドウタイトルのみです。入力欄本文は読み取りません。取得したコンテキストは保存せず、文字起こし/Polishリクエスト時だけ使用します。
+              取得対象は前面アプリ名とウィンドウタイトルのみです。入力欄本文は読み取りません。Slack、メール、ブラウザ、IDE系ではPolishの文体補助にも使います。取得したコンテキストは保存せず、文字起こし/Polishリクエスト時だけ使用します。
             </p>
             <button
               className="button secondary compact"
@@ -863,6 +1255,11 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
             </label>
           </SettingsSection>
 
+          <SettingsCategory
+            id="settings-history-category"
+            title="履歴"
+            description="過去の入力、未完了の録音、利用量を確認します。"
+          />
           <SettingsSection id="settings-history" title="履歴">
             <div className="section-toolbar">
               <span>最大200件まで保存します。古い履歴から自動的に整理されます。</span>
@@ -874,43 +1271,160 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
                 全削除
               </button>
             </div>
+            <div className="history-tools">
+              <input
+                className="history-search"
+                value={historySearch}
+                placeholder="履歴を検索"
+                onChange={(event) => setHistorySearch(event.target.value)}
+              />
+              <span>{visibleHistory.length} 件</span>
+            </div>
+            {recoverySessions.length > 0 && (
+              <div className="history-list recovery-list">
+                <p className="settings-note">
+                  未完了の録音があります。成功した録音の音声は削除済みで、失敗・中断した録音だけ復元候補として残ります。
+                </p>
+                {recoverySessions.map((item) => {
+                  const text = item.final_text || item.raw_text;
+                  return (
+                    <article className="history-card recovery-card" key={item.id}>
+                      <div className="history-meta">
+                        <span>{formatHistoryTime(item.created_at)}</span>
+                        <span>{item.mode === "polish" ? "Polish" : "Raw"}</span>
+                        <span>{recoveryStatusLabel(item.status)}</span>
+                        <span>{Math.round(item.duration_ms / 1000)}秒</span>
+                      </div>
+                      <p>{text || item.error || "音声のみ保存されています。"}</p>
+                      <div className="history-actions">
+                        <button
+                          className="button secondary compact"
+                          onClick={() => handleRetryRecovery(item.id)}
+                          disabled={dataBusy || !item.can_retry}
+                        >
+                          再文字起こし
+                        </button>
+                        <button
+                          className="button secondary compact"
+                          onClick={() => handleCopyHistory(text)}
+                          disabled={!text}
+                        >
+                          コピー
+                        </button>
+                        <button
+                          className="button secondary compact"
+                          onClick={() => handleInjectRecovery(item.id)}
+                          disabled={dataBusy || !item.final_text}
+                        >
+                          再注入
+                        </button>
+                        <button
+                          className="button secondary compact"
+                          onClick={() => handleSaveRecoveryToHistory(item.id)}
+                          disabled={dataBusy || !item.final_text}
+                        >
+                          履歴へ保存
+                        </button>
+                        <button
+                          className="button danger compact"
+                          onClick={() => handleDeleteRecovery(item.id)}
+                          disabled={dataBusy}
+                        >
+                          削除
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
             <div className="history-list">
               {history.length === 0 ? (
                 <p className="settings-note">履歴はまだありません。</p>
+              ) : visibleHistory.length === 0 ? (
+                <p className="settings-note">検索条件に一致する履歴はありません。</p>
               ) : (
-                history.slice(0, 20).map((item) => (
-                  <article className="history-card" key={item.id}>
-                    <div className="history-meta">
-                      <span>{formatHistoryTime(item.created_at)}</span>
-                      <span>{item.mode === "polish" ? "Polish" : "Raw"}</span>
-                      <span>{Math.round(item.duration_ms / 1000)}秒</span>
-                    </div>
-                    <p>{item.final_text || item.error || "テキストなし"}</p>
-                    <div className="history-actions">
-                      <button
-                        className="button secondary compact"
-                        onClick={() => handleCopyHistory(item.final_text)}
-                        disabled={!item.final_text}
-                      >
-                        コピー
-                      </button>
-                      <button
-                        className="button secondary compact"
-                        onClick={() => handleInjectHistory(item.final_text)}
-                        disabled={!item.final_text}
-                      >
-                        再注入
-                      </button>
-                      <button
-                        className="button danger compact"
-                        onClick={() => handleDeleteHistory(item.id)}
-                        disabled={dataBusy}
-                      >
-                        削除
-                      </button>
-                    </div>
-                  </article>
-                ))
+                visibleHistory.slice(0, 50).map((item) => {
+                  const canShowRaw = Boolean(item.raw_text && item.raw_text !== item.final_text);
+                  const showRawText = Boolean(historyRawVisible[item.id] && canShowRaw);
+                  const text = showRawText ? item.raw_text : item.final_text;
+                  const dictionaryCandidate = historyDictionaryCandidate(item, dictionaryWords);
+                  return (
+                    <article
+                      className={`history-card ${item.pinned ? "is-pinned" : ""} ${
+                        item.status === "error" ? "is-error" : ""
+                      }`}
+                      key={item.id}
+                    >
+                      <div className="history-meta">
+                        <span>{formatHistoryTime(item.created_at)}</span>
+                        <span>{item.mode === "polish" ? "Polish" : "Raw"}</span>
+                        <span>{item.status === "error" ? "失敗" : "成功"}</span>
+                        {item.pinned && <span>ピン留め</span>}
+                        <span>{Math.round(item.duration_ms / 1000)}秒</span>
+                      </div>
+                      <p>{text || item.error || "テキストなし"}</p>
+                      <div className="history-actions">
+                        <button
+                          className="button secondary compact"
+                          onClick={() => handleToggleHistoryPin(item.id)}
+                          disabled={dataBusy}
+                        >
+                          {item.pinned ? "ピン解除" : "ピン留め"}
+                        </button>
+                        {canShowRaw && (
+                          <button
+                            className="button secondary compact"
+                            onClick={() =>
+                              setHistoryRawVisible((current) => ({
+                                ...current,
+                                [item.id]: !current[item.id],
+                              }))
+                            }
+                          >
+                            {showRawText ? "Final" : "Raw"}
+                          </button>
+                        )}
+                        <button
+                          className="button secondary compact"
+                          onClick={() => handleCopyHistory(text)}
+                          disabled={!text}
+                        >
+                          コピー
+                        </button>
+                        <button
+                          className="button secondary compact"
+                          onClick={() => handleInjectHistory(text)}
+                          disabled={!text}
+                        >
+                          再注入
+                        </button>
+                        <button
+                          className="button secondary compact"
+                          onClick={() => handleAddHistoryCandidate(item)}
+                          disabled={dataBusy || !dictionaryCandidate}
+                          title={dictionaryCandidate ? `${dictionaryCandidate} を追加` : "候補なし"}
+                        >
+                          辞書追加
+                        </button>
+                        <button
+                          className="button secondary compact"
+                          onClick={() => handleRerunHistoryPolish(item.id)}
+                          disabled={dataBusy || !(item.raw_text || item.final_text)}
+                        >
+                          Polish再実行
+                        </button>
+                        <button
+                          className="button danger compact"
+                          onClick={() => handleDeleteHistory(item.id)}
+                          disabled={dataBusy}
+                        >
+                          削除
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })
               )}
             </div>
           </SettingsSection>
@@ -980,6 +1494,23 @@ function SettingsSection({
       </div>
       {children}
     </section>
+  );
+}
+
+function SettingsCategory({
+  id,
+  title,
+  description,
+}: {
+  id: string;
+  title: string;
+  description: string;
+}) {
+  return (
+    <div id={id} className="settings-category">
+      <h3>{title}</h3>
+      <p>{description}</p>
+    </div>
   );
 }
 
