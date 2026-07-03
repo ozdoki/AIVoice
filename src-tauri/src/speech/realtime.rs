@@ -21,6 +21,41 @@ pub const REALTIME_TRANSCRIPTION_MODEL: &str = "gpt-realtime-whisper";
 const REALTIME_SAMPLE_RATE: u32 = 24_000;
 const LIVE_COMMIT_INTERVAL_MS: u64 = 800;
 
+#[derive(Clone, Debug)]
+pub struct RealtimeStatus {
+    pub state: String,
+    pub detail: Option<String>,
+}
+
+fn live_debug(message: impl AsRef<str>) {
+    let path = std::env::temp_dir().join("aivoice-live-transcript-debug.log");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| {
+            use std::io::Write;
+            writeln!(file, "{now} {}", message.as_ref())
+        });
+}
+
+fn send_status(
+    status_tx: &Option<mpsc::UnboundedSender<RealtimeStatus>>,
+    state: impl Into<String>,
+    detail: Option<String>,
+) {
+    if let Some(tx) = status_tx {
+        let _ = tx.send(RealtimeStatus {
+            state: state.into(),
+            detail,
+        });
+    }
+}
+
 pub fn supports_realtime_model(model: &str) -> bool {
     model.trim() == REALTIME_TRANSCRIPTION_MODEL
 }
@@ -79,11 +114,19 @@ pub async fn transcribe_realtime(
     model: String,
     mut audio_rx: mpsc::UnboundedReceiver<AudioChunk>,
     partial_tx: Option<mpsc::UnboundedSender<String>>,
+    status_tx: Option<mpsc::UnboundedSender<RealtimeStatus>>,
 ) -> Result<String, String> {
     if std::env::var("AIVOICE_FORCE_REALTIME_FAIL").as_deref() == Ok("1") {
+        send_status(
+            &status_tx,
+            "error",
+            Some("Realtime ASR forced failure for fallback QA".to_string()),
+        );
         return Err("Realtime ASR forced failure for fallback QA".to_string());
     }
 
+    send_status(&status_tx, "connecting", None);
+    live_debug(format!("connecting realtime model={model} live={}", partial_tx.is_some()));
     let url = realtime_url(&base_url);
     let mut request = url
         .into_client_request()
@@ -94,10 +137,18 @@ pub async fn transcribe_realtime(
             .parse()
             .map_err(|error| format!("Realtime auth header is invalid: {error}"))?,
     );
-    let (ws, _) = connect_async(request)
-        .await
-        .map_err(|error| format!("Realtime connection failed: {error}"))?;
+    let (ws, _) = match connect_async(request).await {
+        Ok(result) => result,
+        Err(error) => {
+            let message = format!("Realtime connection failed: {error}");
+            live_debug(&message);
+            send_status(&status_tx, "error", Some(message.clone()));
+            return Err(message);
+        }
+    };
     let (mut write, mut read) = ws.split();
+    send_status(&status_tx, "connected", None);
+    live_debug("connected realtime websocket");
 
     let live_enabled = partial_tx.is_some();
     tracing::info!(
@@ -131,13 +182,21 @@ pub async fn transcribe_realtime(
             }
         }
     });
-    write
+    if let Err(error) = write
         .send(Message::Text(session_update.to_string().into()))
         .await
-        .map_err(|error| format!("Realtime session update failed: {error}"))?;
+    {
+        let message = format!("Realtime session update failed: {error}");
+        live_debug(&message);
+        send_status(&status_tx, "error", Some(message.clone()));
+        return Err(message);
+    }
+    send_status(&status_tx, "session_ready", None);
+    live_debug("sent realtime session.update");
 
     let commit_count = Arc::new(AtomicUsize::new(0));
     let sender_commit_count = commit_count.clone();
+    let sender_status_tx = status_tx.clone();
     let sender = tokio::spawn(async move {
         let mut last_commit = Instant::now();
         let mut has_uncommitted_audio = false;
@@ -151,7 +210,10 @@ pub async fn transcribe_realtime(
                 "audio": STANDARD.encode(pcm)
             });
             if let Err(error) = write.send(Message::Text(append.to_string().into())).await {
-                return Err(format!("Realtime audio send failed: {error}"));
+                let message = format!("Realtime audio send failed: {error}");
+                live_debug(&message);
+                send_status(&sender_status_tx, "error", Some(message.clone()));
+                return Err(message);
             }
             has_uncommitted_audio = true;
 
@@ -162,8 +224,16 @@ pub async fn transcribe_realtime(
                 write
                     .send(Message::Text(commit.to_string().into()))
                     .await
-                    .map_err(|error| format!("Realtime live audio commit failed: {error}"))?;
-                sender_commit_count.fetch_add(1, Ordering::SeqCst);
+                    .map_err(|error| {
+                        let message = format!("Realtime live audio commit failed: {error}");
+                        live_debug(&message);
+                        send_status(&sender_status_tx, "error", Some(message.clone()));
+                        message
+                    })?;
+                let commits = sender_commit_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if commits <= 3 || commits % 10 == 0 {
+                    live_debug(format!("sent realtime audio commit count={commits}"));
+                }
                 has_uncommitted_audio = false;
                 last_commit = Instant::now();
             }
@@ -174,8 +244,14 @@ pub async fn transcribe_realtime(
             write
                 .send(Message::Text(commit.to_string().into()))
                 .await
-                .map_err(|error| format!("Realtime audio commit failed: {error}"))?;
-            sender_commit_count.fetch_add(1, Ordering::SeqCst);
+                .map_err(|error| {
+                    let message = format!("Realtime audio commit failed: {error}");
+                    live_debug(&message);
+                    send_status(&sender_status_tx, "error", Some(message.clone()));
+                    message
+                })?;
+            let commits = sender_commit_count.fetch_add(1, Ordering::SeqCst) + 1;
+            live_debug(format!("sent final realtime audio commit count={commits}"));
         }
         Ok(())
     });
@@ -204,7 +280,15 @@ pub async fn transcribe_realtime(
         let Some(message) = maybe_message else {
             break;
         };
-        let message = message.map_err(|error| format!("Realtime receive failed: {error}"))?;
+        let message = match message {
+            Ok(message) => message,
+            Err(error) => {
+                let message = format!("Realtime receive failed: {error}");
+                live_debug(&message);
+                send_status(&status_tx, "error", Some(message.clone()));
+                return Err(message);
+            }
+        };
         let Message::Text(text) = message else {
             continue;
         };
@@ -222,7 +306,12 @@ pub async fn transcribe_realtime(
                             delta_chars = delta.chars().count(),
                             "received realtime transcription delta"
                         );
+                        live_debug(format!(
+                            "received realtime delta count={delta_count} chars={}",
+                            delta.chars().count()
+                        ));
                     }
+                    send_status(&status_tx, "delta", None);
                     if live_enabled {
                         current_segment.push_str(delta);
                         let mut preview = completed_segments.join(" ");
@@ -247,6 +336,10 @@ pub async fn transcribe_realtime(
                     delta_count,
                     "received realtime transcription completed"
                 );
+                live_debug(format!(
+                    "received realtime completed count={completed_count} delta_count={delta_count}"
+                ));
+                send_status(&status_tx, "completed", None);
                 if live_enabled {
                     let segment = event
                         .get("transcript")
@@ -277,14 +370,22 @@ pub async fn transcribe_realtime(
                 }
             }
             Some("error") => {
-                return Err(event
+                let message = event
                     .get("error")
                     .and_then(|error| error.get("message"))
                     .and_then(|message| message.as_str())
                     .unwrap_or("Realtime API error")
-                    .to_string());
+                    .to_string();
+                live_debug(format!("received realtime api error: {message}"));
+                send_status(&status_tx, "error", Some(message.clone()));
+                return Err(message);
             }
-            _ => {}
+            Some(other) => {
+                if delta_count == 0 && completed_count == 0 {
+                    live_debug(format!("received realtime event before transcript: {other}"));
+                }
+            }
+            None => {}
         }
     }
 
@@ -300,6 +401,10 @@ pub async fn transcribe_realtime(
         final_chars = final_text.chars().count(),
         "finished realtime transcription"
     );
+    live_debug(format!(
+        "finished realtime completed_count={completed_count} delta_count={delta_count} final_chars={}",
+        final_text.chars().count()
+    ));
     Ok(final_text.trim().to_string())
 }
 

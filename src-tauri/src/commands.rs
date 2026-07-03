@@ -21,7 +21,10 @@ use crate::{
     settings::{self, AppSettings},
     speech::{
         openai_compatible::OpenAiCompatibleProvider,
-        realtime::{supports_realtime_model, transcribe_realtime, REALTIME_TRANSCRIPTION_MODEL},
+        realtime::{
+            supports_realtime_model, transcribe_realtime, RealtimeStatus,
+            REALTIME_TRANSCRIPTION_MODEL,
+        },
         SpeechProvider,
     },
     state::{AppState, Mode, RecordingState, RecordingTrigger},
@@ -42,6 +45,12 @@ struct SessionUiEvent {
 #[derive(Clone, serde::Serialize)]
 struct PartialTextEvent {
     text: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct LiveTranscriptStatusEvent {
+    state: String,
+    detail: Option<String>,
 }
 
 struct TargetWindowInjector {
@@ -337,6 +346,12 @@ async fn start_recording_locked(
     } else {
         (None, None)
     };
+    let (status_tx, mut status_rx) = if settings.show_live_transcript_in_floating_bar {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RealtimeStatus>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let realtime_model = if settings.api_key.trim().is_empty() {
         None
     } else if supports_realtime_model(&settings.api_model) {
@@ -361,6 +376,7 @@ async fn start_recording_locked(
                 realtime_model,
                 chunk_rx,
                 partial_tx,
+                status_tx,
             ));
             (Some(chunk_tx), Some(task))
         } else {
@@ -370,6 +386,22 @@ async fn start_recording_locked(
                 live_transcript = settings.show_live_transcript_in_floating_bar,
                 "starting recording without realtime ASR"
             );
+            if settings.show_live_transcript_in_floating_bar {
+                let detail = if settings.api_key.trim().is_empty() {
+                    "APIキーが未設定のため、録音中の文字表示を開始できません。".to_string()
+                } else {
+                    format!(
+                        "ASR Model {} は録音中の文字表示に未対応です。",
+                        settings.api_model
+                    )
+                };
+                if let Some(tx) = &status_tx {
+                    let _ = tx.send(RealtimeStatus {
+                        state: "error".to_string(),
+                        detail: Some(detail),
+                    });
+                }
+            }
             (None, None)
         };
     let mode = state.mode.lock().await.clone();
@@ -426,6 +458,20 @@ async fn start_recording_locked(
         tokio::spawn(async move {
             while let Some(text) = rx.recv().await {
                 let _ = app_partial.emit("session://partial-text", PartialTextEvent { text });
+            }
+        });
+    }
+    if let Some(mut rx) = status_rx.take() {
+        let app_status = app.clone();
+        tokio::spawn(async move {
+            while let Some(status) = rx.recv().await {
+                let _ = app_status.emit(
+                    "session://live-transcript-status",
+                    LiveTranscriptStatusEvent {
+                        state: status.state,
+                        detail: status.detail,
+                    },
+                );
             }
         });
     }

@@ -1279,6 +1279,12 @@ kbd {
   overflow: hidden;
 }
 
+.floating-live-strip.is-error {
+  border-color: rgba(248, 113, 113, 0.45);
+  background: rgba(68, 22, 24, 0.9);
+  color: #fecaca;
+}
+
 .floating-stop {
   width: 36px;
   height: 36px;

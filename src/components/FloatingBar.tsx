@@ -22,6 +22,11 @@ interface SessionUiEvent {
   error: string | null;
 }
 
+interface LiveTranscriptStatusEvent {
+  state: string;
+  detail?: string | null;
+}
+
 const isTauri = "__TAURI_INTERNALS__" in window;
 
 // 波形バーの基準ゲイン（中央ほど高く）
@@ -41,6 +46,7 @@ export function FloatingBar() {
   const [now, setNow] = useState(Date.now());
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [liveTranscript, setLiveTranscript] = useState("");
+  const [liveTranscriptError, setLiveTranscriptError] = useState("");
   const levelRef = useRef(isTauri ? 0 : 0.32);
   const [displayLevel, setDisplayLevel] = useState(isTauri ? 0 : 0.32);
 
@@ -98,6 +104,7 @@ export function FloatingBar() {
       if (state === "recording" && settings.show_floating_bar) {
         setRecordingStartedAt(Date.now());
         setLiveTranscript("");
+        setLiveTranscriptError("");
         try {
           const monitor = await currentMonitor();
           if (monitor) {
@@ -115,6 +122,7 @@ export function FloatingBar() {
         levelRef.current = 0;
         setDisplayLevel(0);
         setLiveTranscript("");
+        setLiveTranscriptError("");
         setRecordingStartedAt(null);
         if ((nextPhase === "completed" || nextPhase === "failed") && settings.show_floating_bar) {
           await win.show();
@@ -133,13 +141,24 @@ export function FloatingBar() {
   useEffect(() => {
     if (!isTauri) return;
     let partialOff: (() => void) | undefined;
+    let statusOff: (() => void) | undefined;
 
     listen<{ text: string }>("session://partial-text", (event) => {
       setLiveTranscript(event.payload.text);
+      if (event.payload.text.trim()) {
+        setLiveTranscriptError("");
+      }
     }).then((off) => { partialOff = off; });
+
+    listen<LiveTranscriptStatusEvent>("session://live-transcript-status", (event) => {
+      if (event.payload.state === "error") {
+        setLiveTranscriptError(event.payload.detail ?? "録音中の文字表示を開始できませんでした。");
+      }
+    }).then((off) => { statusOff = off; });
 
     return () => {
       partialOff?.();
+      statusOff?.();
     };
   }, []);
 
@@ -205,6 +224,11 @@ export function FloatingBar() {
     isRecording &&
     settings.show_live_transcript_in_floating_bar &&
     Boolean(liveTranscript.trim());
+  const showLiveTranscriptError =
+    isRecording &&
+    settings.show_live_transcript_in_floating_bar &&
+    Boolean(liveTranscriptError.trim()) &&
+    !showLiveTranscript;
 
   return (
     <div className="floating-stage">
@@ -268,6 +292,11 @@ export function FloatingBar() {
       {showLiveTranscript && (
         <div className="floating-live-strip">
           <span>{liveTranscript}</span>
+        </div>
+      )}
+      {showLiveTranscriptError && (
+        <div className="floating-live-strip is-error">
+          <span>ライブ文字表示: {liveTranscriptError}</span>
         </div>
       )}
     </div>
