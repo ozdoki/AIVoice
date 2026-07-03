@@ -1,4 +1,4 @@
-# Polish Preset Offline Evaluation
+# Polish Preset Evaluation
 
 This fixture is for prompt quality review without calling the live API.
 
@@ -69,3 +69,37 @@ Score: 4/5. Clear assistant instruction. The final output requirement is inferre
 - Follow-up: write progress to GitHub issues
 
 Score: 5/5. Preserves tokens and organizes implementation facts.
+
+## Live API evaluation: 2026-07-03
+
+Model: `gpt-4o-mini`  
+Temperature: `0.1`  
+Runs: 3 per preset, using the shared input above.
+
+### Findings before prompt tuning
+
+- Slack sometimes collapsed multiple tasks into prose instead of scan-friendly bullets.
+- Some outputs weakened the requested action from `確認する` / `見る` to `検討する`.
+- Some outputs localized the technical token `batch` to `バッチ`.
+- AI Prompt and Technical Note did not reliably produce distinct structures.
+
+### Changes applied
+
+- Added guardrails to preserve Latin technical tokens such as `batch`, `fallback`, `Realtime ASR`, `gpt-realtime-whisper`, `Cursor`, and `GitHub`.
+- Added guardrails to avoid weakening spoken actions such as `確認する`, `見る`, and `分かるようにする`.
+- Lowered Polish temperature to `0.1` for more stable rewrites.
+- Made multi-task output shape explicit:
+  - Slack: lead sentence plus compact bullets.
+  - Memo: bullets for multiple tasks.
+  - AI Prompt: `目的`, `タスク`, `条件`, `報告` headings.
+  - Technical Note: labeled bullets such as `Deadline`, `Check`, `UI`, `Follow-up`.
+
+### Final live evaluation result
+
+| Preset | `batch` preserved | `gpt-realtime-whisper` preserved | No weakening/localization | Preset shape |
+| --- | --- | --- | --- | --- |
+| Slack | 3/3 | 3/3 | 3/3 | 3/3 |
+| Email | 3/3 | 3/3 | 3/3 | 3/3 |
+| Memo | 3/3 | 3/3 | 3/3 | 3/3 |
+| AI Prompt | 3/3 | 3/3 | 3/3 | 3/3 |
+| Technical Note | 3/3 | 3/3 | 3/3 | 3/3 |
