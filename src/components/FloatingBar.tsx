@@ -48,6 +48,7 @@ export function FloatingBar() {
   const [liveTranscript, setLiveTranscript] = useState("");
   const [liveTranscriptError, setLiveTranscriptError] = useState("");
   const levelRef = useRef(isTauri ? 0 : 0.32);
+  const liveStripRef = useRef<HTMLDivElement>(null);
   const [displayLevel, setDisplayLevel] = useState(isTauri ? 0 : 0.32);
 
   // 透明背景（ピル以外が透ける）
@@ -230,6 +231,16 @@ export function FloatingBar() {
     Boolean(liveTranscriptError.trim()) &&
     !showLiveTranscript;
 
+  useEffect(() => {
+    if (!showLiveTranscript) return;
+    window.requestAnimationFrame(() => {
+      const strip = liveStripRef.current;
+      if (strip) {
+        strip.scrollTop = strip.scrollHeight;
+      }
+    });
+  }, [liveTranscript, showLiveTranscript]);
+
   return (
     <div className="floating-stage">
       <div className="floating-hint">
@@ -290,7 +301,7 @@ export function FloatingBar() {
         )}
       </div>
       {showLiveTranscript && (
-        <div className="floating-live-strip">
+        <div className="floating-live-strip" ref={liveStripRef}>
           <span>{liveTranscript}</span>
         </div>
       )}
