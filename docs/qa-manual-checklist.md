@@ -49,4 +49,5 @@ Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Na
 2. Click `初回セットアップを再実行`.
 3. Complete the test recording step.
 4. Confirm recognized text appears in the onboarding preview.
-5. Confirm no text is pasted into the previously focused external app.
+5. Click `プレビューをコピー` and confirm the preview text is copied.
+6. Confirm no text is pasted into the previously focused external app.

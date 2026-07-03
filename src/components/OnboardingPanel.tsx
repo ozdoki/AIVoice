@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Checkmark20Regular,
+  Copy20Regular,
   Dismiss20Regular,
   Mic20Regular,
   Play20Regular,
@@ -40,6 +41,7 @@ export function OnboardingPanel({
   const [apiReady, setApiReady] = useState(Boolean(settings.has_api_key));
   const [testStarted, setTestStarted] = useState(false);
   const [testPreviewText, setTestPreviewText] = useState("");
+  const [copySucceeded, setCopySucceeded] = useState(false);
 
   useEffect(() => {
     setDraftSettings(settings);
@@ -131,6 +133,7 @@ export function OnboardingPanel({
   const handleStopTest = async () => {
     setBusy(true);
     setError(null);
+    setCopySucceeded(false);
     try {
       if (isTauri) {
         const preview = await invoke<string>("stop_onboarding_test_recording");
@@ -142,6 +145,17 @@ export function OnboardingPanel({
       setError(`テスト録音を停止できませんでした: ${stopError}`);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleCopyPreview = async () => {
+    if (!testPreviewText.trim()) return;
+    try {
+      await navigator.clipboard?.writeText(testPreviewText);
+      setCopySucceeded(true);
+      window.setTimeout(() => setCopySucceeded(false), 1600);
+    } catch (copyError) {
+      setError(`プレビューをコピーできませんでした: ${copyError}`);
     }
   };
 
@@ -289,6 +303,14 @@ export function OnboardingPanel({
                   ? testPreviewText
                   : "停止後、成功するとここに文字起こし結果が出ます。"}
               </div>
+              <button
+                className="button secondary compact"
+                onClick={handleCopyPreview}
+                disabled={!testSucceeded}
+              >
+                {copySucceeded ? <Checkmark20Regular /> : <Copy20Regular />}
+                {copySucceeded ? "コピー済み" : "プレビューをコピー"}
+              </button>
               <button
                 className="button primary"
                 onClick={handleComplete}
