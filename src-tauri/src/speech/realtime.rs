@@ -17,11 +17,12 @@ use tokio_tungstenite::{
 use crate::audio::AudioChunk;
 
 const REALTIME_SESSION_MODEL: &str = "gpt-realtime-2";
+pub const REALTIME_TRANSCRIPTION_MODEL: &str = "gpt-realtime-whisper";
 const REALTIME_SAMPLE_RATE: u32 = 24_000;
 const LIVE_COMMIT_INTERVAL_MS: u64 = 800;
 
 pub fn supports_realtime_model(model: &str) -> bool {
-    matches!(model.trim(), "gpt-realtime-whisper")
+    model.trim() == REALTIME_TRANSCRIPTION_MODEL
 }
 
 fn realtime_url(base_url: &str) -> String {
@@ -99,6 +100,11 @@ pub async fn transcribe_realtime(
     let (mut write, mut read) = ws.split();
 
     let live_enabled = partial_tx.is_some();
+    tracing::info!(
+        model = %model,
+        live_enabled,
+        "starting realtime transcription"
+    );
     let transcription = if live_enabled {
         serde_json::json!({
             "model": model,
@@ -178,6 +184,7 @@ pub async fn transcribe_realtime(
     let mut completed_segments: Vec<String> = Vec::new();
     let mut current_segment = String::new();
     let mut completed_count = 0_usize;
+    let mut delta_count = 0_usize;
     loop {
         let maybe_message = if live_enabled {
             tokio::select! {
@@ -208,6 +215,14 @@ pub async fn transcribe_realtime(
         match event_type {
             Some("conversation.item.input_audio_transcription.delta") => {
                 if let Some(delta) = event.get("delta").and_then(|value| value.as_str()) {
+                    delta_count += 1;
+                    if delta_count <= 3 || delta_count % 10 == 0 {
+                        tracing::debug!(
+                            delta_count,
+                            delta_chars = delta.chars().count(),
+                            "received realtime transcription delta"
+                        );
+                    }
                     if live_enabled {
                         current_segment.push_str(delta);
                         let mut preview = completed_segments.join(" ");
@@ -227,6 +242,11 @@ pub async fn transcribe_realtime(
             }
             Some("conversation.item.input_audio_transcription.completed") => {
                 completed_count += 1;
+                tracing::info!(
+                    completed_count,
+                    delta_count,
+                    "received realtime transcription completed"
+                );
                 if live_enabled {
                     let segment = event
                         .get("transcript")
@@ -274,6 +294,12 @@ pub async fn transcribe_realtime(
         Err(error) => return Err(format!("Realtime sender task failed: {error}")),
     }
 
+    tracing::info!(
+        completed_count,
+        delta_count,
+        final_chars = final_text.chars().count(),
+        "finished realtime transcription"
+    );
     Ok(final_text.trim().to_string())
 }
 

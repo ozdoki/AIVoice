@@ -31,6 +31,11 @@ interface Props {
 }
 
 const isTauri = "__TAURI_INTERNALS__" in window;
+const LIVE_TRANSCRIPT_MODEL = "gpt-realtime-whisper";
+
+function supportsLiveTranscriptModel(model: string): boolean {
+  return model.trim() === LIVE_TRANSCRIPT_MODEL;
+}
 
 const settingsNavGroups = [
   {
@@ -387,6 +392,23 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
         {!models.includes(model) ? "（現在値）" : ""}
       </option>
     ));
+  };
+
+  const handleAsrModelChange = (model: string) => {
+    setSettings((current) => ({
+      ...current,
+      api_model: model,
+      show_live_transcript_in_floating_bar:
+        supportsLiveTranscriptModel(model) && current.show_live_transcript_in_floating_bar,
+    }));
+  };
+
+  const handleLiveTranscriptToggle = (enabled: boolean) => {
+    setSettings((current) => ({
+      ...current,
+      api_model: enabled ? LIVE_TRANSCRIPT_MODEL : current.api_model,
+      show_live_transcript_in_floating_bar: enabled,
+    }));
   };
 
   const handleSaveApiKey = async () => {
@@ -959,16 +981,17 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
               <select
                 value={settings.api_model}
                 disabled={!modelsReady}
-                onChange={(event) =>
-                  setSettings((current) => ({
-                    ...current,
-                    api_model: event.target.value,
-                  }))
-                }
+                onChange={(event) => handleAsrModelChange(event.target.value)}
               >
                 {modelOptions(settings.api_model)}
               </select>
             </FormField>
+            {settings.show_live_transcript_in_floating_bar &&
+              !supportsLiveTranscriptModel(settings.api_model) && (
+                <p className="field-warning">
+                  録音中の文字表示は {LIVE_TRANSCRIPT_MODEL} でのみ有効です。保存前にモデルを切り替えてください。
+                </p>
+              )}
             <FormField label="Polish Model">
               <select
                 value={settings.polish_model}
@@ -1312,15 +1335,15 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                 type="checkbox"
                 checked={settings.show_live_transcript_in_floating_bar}
                 disabled={!settings.show_floating_bar}
-                onChange={(event) =>
-                  setSettings((current) => ({
-                    ...current,
-                    show_live_transcript_in_floating_bar: event.target.checked,
-                  }))
-                }
+                onChange={(event) => handleLiveTranscriptToggle(event.target.checked)}
               />
               <span>録音中の文字起こしをフローティングバーに表示する</span>
             </label>
+            {settings.show_live_transcript_in_floating_bar && (
+              <p className="settings-note">
+                この設定をONにすると、ASR Modelは {LIVE_TRANSCRIPT_MODEL} に切り替わります。
+              </p>
+            )}
             <label className="toggle-row">
               <input
                 type="checkbox"

@@ -21,7 +21,7 @@ use crate::{
     settings::{self, AppSettings},
     speech::{
         openai_compatible::OpenAiCompatibleProvider,
-        realtime::{supports_realtime_model, transcribe_realtime},
+        realtime::{supports_realtime_model, transcribe_realtime, REALTIME_TRANSCRIPTION_MODEL},
         SpeechProvider,
     },
     state::{AppState, Mode, RecordingState, RecordingTrigger},
@@ -337,18 +337,39 @@ async fn start_recording_locked(
     } else {
         (None, None)
     };
+    let realtime_model = if settings.api_key.trim().is_empty() {
+        None
+    } else if supports_realtime_model(&settings.api_model) {
+        Some(settings.api_model.clone())
+    } else if settings.show_live_transcript_in_floating_bar {
+        Some(REALTIME_TRANSCRIPTION_MODEL.to_string())
+    } else {
+        None
+    };
     let (chunk_tx, realtime_task) =
-        if !settings.api_key.trim().is_empty() && supports_realtime_model(&settings.api_model) {
+        if let Some(realtime_model) = realtime_model {
+            tracing::info!(
+                configured_model = %settings.api_model,
+                realtime_model = %realtime_model,
+                live_transcript = settings.show_live_transcript_in_floating_bar,
+                "starting recording with realtime ASR"
+            );
             let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel();
             let task = tokio::spawn(transcribe_realtime(
                 settings.api_base_url.clone(),
                 settings.api_key.clone(),
-                settings.api_model.clone(),
+                realtime_model,
                 chunk_rx,
                 partial_tx,
             ));
             (Some(chunk_tx), Some(task))
         } else {
+            tracing::info!(
+                model = %settings.api_model,
+                has_api_key = !settings.api_key.trim().is_empty(),
+                live_transcript = settings.show_live_transcript_in_floating_bar,
+                "starting recording without realtime ASR"
+            );
             (None, None)
         };
     let mode = state.mode.lock().await.clone();

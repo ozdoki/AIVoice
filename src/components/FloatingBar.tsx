@@ -105,7 +105,7 @@ export function FloatingBar() {
             const logW = monitor.size.width / scale;
             const logH = monitor.size.height / scale;
             // タスクバー（約48px）のちょい上に配置
-            await win.setPosition(new LogicalPosition(logW / 2 - 190, logH - 188));
+            await win.setPosition(new LogicalPosition(logW / 2 - 190, logH - 220));
           }
         } catch { /* モニター取得失敗時はデフォルト位置 */ }
         await win.show();
