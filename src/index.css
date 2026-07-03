@@ -580,7 +580,7 @@ kbd {
 .settings-body-with-nav {
   padding: 0;
   display: grid;
-  grid-template-columns: 142px minmax(0, 1fr);
+  grid-template-columns: 176px minmax(0, 1fr);
   min-height: 0;
 }
 
@@ -595,16 +595,51 @@ kbd {
   align-self: start;
 }
 
+.settings-nav-group {
+  padding: 5px 0 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.055);
+}
+
+.settings-nav-group:last-child {
+  border-bottom: 0;
+}
+
 .settings-side-nav button {
-  min-height: 32px;
-  padding: 0 10px;
   border: 0;
   border-radius: 8px;
   background: transparent;
-  color: var(--text-muted);
   text-align: left;
-  font-size: 12px;
   cursor: pointer;
+}
+
+.settings-nav-parent {
+  width: 100%;
+  min-height: 30px;
+  padding: 0 10px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.settings-nav-child {
+  width: calc(100% - 10px);
+  min-height: 25px;
+  margin-left: 10px;
+  padding: 0 9px 0 13px;
+  color: var(--text-dim);
+  font-size: 11px;
+  position: relative;
+}
+
+.settings-nav-child::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
 }
 
 .settings-side-nav button:hover {
@@ -679,20 +714,26 @@ kbd {
 }
 
 .settings-section {
-  padding: 20px 0 6px;
+  margin-left: 12px;
+  padding: 18px 0 8px 18px;
+  border-left: 2px solid rgba(255, 255, 255, 0.08);
   border-bottom: 1px solid var(--line);
 }
 
 .settings-category {
-  padding: 22px 0 8px;
-  border-bottom: 1px solid var(--line);
+  margin: 18px 0 8px;
+  padding: 14px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
 }
 
 .settings-category h3 {
   margin: 0 0 4px;
   color: var(--text);
-  font-size: 15px;
-  font-weight: 700;
+  font-size: 16px;
+  font-weight: 760;
 }
 
 .settings-category p {
@@ -732,8 +773,8 @@ kbd {
 }
 
 .settings-section-header h3 {
-  color: var(--text);
-  font-size: 14px;
+  color: var(--text-muted);
+  font-size: 13px;
   font-weight: 650;
   letter-spacing: 0.02em;
 }

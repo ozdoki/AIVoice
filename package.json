@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:build": "tauri build --no-bundle",
-    "app:restart": "powershell -ExecutionPolicy Bypass -File scripts/restart-aivoice-release.ps1"
+    "app:restart": "powershell -ExecutionPolicy Bypass -File scripts/restart-aivoice-release.ps1",
+    "app:restart:fallback-qa": "powershell -ExecutionPolicy Bypass -File scripts/restart-aivoice-fallback-qa.ps1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.10.1",

@@ -26,10 +26,10 @@ const isTauri = "__TAURI_INTERNALS__" in window;
 
 // 波形バーの基準ゲイン（中央ほど高く）
 const BAR_GAINS = [0.42, 0.7, 0.92, 1.0, 0.92, 0.7, 0.42];
-const BAR_MIN_H = 7;
-const BAR_MAX_H = 36;
-const WAVEFORM_DISPLAY_GAIN = 5.2;
-const WAVEFORM_NOISE_FLOOR = 0.006;
+const BAR_MIN_H = 8;
+const BAR_MAX_H = 38;
+const WAVEFORM_DISPLAY_GAIN = 95;
+const WAVEFORM_NOISE_FLOOR = 0.0008;
 
 export function FloatingBar() {
   const [recordingState, setRecordingState] = useState<RecordingState>(
@@ -152,7 +152,7 @@ export function FloatingBar() {
     }).then((off) => { unlistener = off; });
 
     const tick = () => {
-      setDisplayLevel((prev) => prev * 0.42 + levelRef.current * 0.58);
+      setDisplayLevel((prev) => prev * 0.25 + levelRef.current * 0.75);
       rafId = requestAnimationFrame(tick);
     };
     rafId = requestAnimationFrame(tick);
@@ -208,7 +208,7 @@ export function FloatingBar() {
               const boostedLevel = Math.max(0, displayLevel - WAVEFORM_NOISE_FLOOR);
               const responsiveLevel = Math.min(
                 1,
-                Math.sqrt(boostedLevel * WAVEFORM_DISPLAY_GAIN) * 1.35
+                Math.pow(boostedLevel * WAVEFORM_DISPLAY_GAIN, 0.45) * 1.45
               );
               const h = isRecording
                 ? Math.max(

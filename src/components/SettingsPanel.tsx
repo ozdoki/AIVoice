@@ -32,6 +32,48 @@ interface Props {
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 
+const settingsNavGroups = [
+  {
+    id: "settings-input",
+    label: "入力",
+    items: [
+      ["settings-audio", "オーディオ"],
+      ["settings-hotkeys", "ショートカット"],
+      ["settings-general", "一般設定"],
+    ],
+  },
+  {
+    id: "settings-ai",
+    label: "AI",
+    items: [
+      ["settings-api", "API"],
+      ["settings-models", "モデル"],
+      ["settings-custom", "カスタム指示"],
+    ],
+  },
+  {
+    id: "settings-dictionary-category",
+    label: "辞書",
+    items: [
+      ["settings-dictionary", "辞書"],
+      ["settings-snippets", "スニペット"],
+    ],
+  },
+  {
+    id: "settings-history-category",
+    label: "履歴",
+    items: [
+      ["settings-history", "履歴"],
+      ["settings-usage", "ステータス"],
+    ],
+  },
+  {
+    id: "settings-details",
+    label: "詳細",
+    items: [["settings-context", "コンテキスト"]],
+  },
+] as const;
+
 function connectionKey(settings: AppSettings): string {
   return settings.api_base_url.trim();
 }
@@ -793,20 +835,32 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
 
         <div className="dialog-body settings-body-with-nav">
           <nav className="settings-side-nav" aria-label="設定カテゴリ">
-            {[
-              ["settings-input", "入力"],
-              ["settings-ai", "AI"],
-              ["settings-dictionary-category", "辞書"],
-              ["settings-history-category", "履歴"],
-              ["settings-details", "詳細"],
-            ].map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                onClick={() => document.getElementById(id)?.scrollIntoView({ block: "start" })}
-              >
-                {label}
-              </button>
+            {settingsNavGroups.map((group) => (
+              <div className="settings-nav-group" key={group.id}>
+                <button
+                  className="settings-nav-parent"
+                  type="button"
+                  onClick={() =>
+                    document.getElementById(group.id)?.scrollIntoView({ block: "start" })
+                  }
+                >
+                  {group.label}
+                </button>
+                <div className="settings-nav-children">
+                  {group.items.map(([id, label]) => (
+                    <button
+                      key={id}
+                      className="settings-nav-child"
+                      type="button"
+                      onClick={() =>
+                        document.getElementById(id)?.scrollIntoView({ block: "start" })
+                      }
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
             ))}
           </nav>
           <div className="settings-pane">
