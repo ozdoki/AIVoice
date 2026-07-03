@@ -61,7 +61,7 @@ pub fn supports_realtime_model(model: &str) -> bool {
 
 fn realtime_url(base_url: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
-    let path = format!("/realtime?model={REALTIME_TRANSCRIPTION_MODEL}");
+    let path = "/realtime?model=gpt-realtime-2&intent=transcription";
     if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}{path}")
     } else if let Some(rest) = base.strip_prefix("http://") {
@@ -415,7 +415,7 @@ mod tests {
     fn realtime_url_maps_openai_rest_base_to_transcription_ws() {
         assert_eq!(
             realtime_url("https://api.openai.com/v1"),
-            "wss://api.openai.com/v1/realtime?model=gpt-realtime-whisper"
+            "wss://api.openai.com/v1/realtime?model=gpt-realtime-2&intent=transcription"
         );
     }
 
