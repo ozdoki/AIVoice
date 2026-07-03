@@ -201,10 +201,10 @@ export function FloatingBar() {
     completed: "完了",
     failed: "失敗",
   };
-  const showLiveTranscript =
+  const showLiveArea =
     isRecording &&
-    settings.show_live_transcript_in_floating_bar &&
-    Boolean(liveTranscript.trim());
+    settings.show_live_transcript_in_floating_bar;
+  const showLiveTranscript = showLiveArea && Boolean(liveTranscript.trim());
 
   return (
     <div className="floating-stage">
@@ -216,9 +216,11 @@ export function FloatingBar() {
         <span className={`recording-dot ${isRecording ? "is-active" : ""}`} />
         <span className="floating-mode">{mode === "polish" ? "Polish" : "Raw"}</span>
 
-        <div className={`floating-waveform ${showLiveTranscript ? "has-live-text" : ""}`}>
-          {showLiveTranscript ? (
-            <span className="floating-live-text">{liveTranscript}</span>
+        <div className={`floating-waveform ${showLiveArea ? "has-live-text" : ""}`}>
+          {showLiveArea ? (
+            <span className={`floating-live-text ${showLiveTranscript ? "" : "is-waiting"}`}>
+              {showLiveTranscript ? liveTranscript : "文字起こし待機中..."}
+            </span>
           ) : isProcessing ? (
             [0, 1, 2].map((i) => (
               <span key={i} className="processing-bar" style={{

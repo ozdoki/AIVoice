@@ -18,7 +18,7 @@ use crate::audio::AudioChunk;
 
 const REALTIME_SESSION_MODEL: &str = "gpt-realtime-2";
 const REALTIME_SAMPLE_RATE: u32 = 24_000;
-const LIVE_COMMIT_INTERVAL_MS: u64 = 1_400;
+const LIVE_COMMIT_INTERVAL_MS: u64 = 800;
 
 pub fn supports_realtime_model(model: &str) -> bool {
     matches!(model.trim(), "gpt-realtime-whisper")
@@ -98,6 +98,17 @@ pub async fn transcribe_realtime(
         .map_err(|error| format!("Realtime connection failed: {error}"))?;
     let (mut write, mut read) = ws.split();
 
+    let live_enabled = partial_tx.is_some();
+    let transcription = if live_enabled {
+        serde_json::json!({
+            "model": model,
+            "delay": "minimal"
+        })
+    } else {
+        serde_json::json!({
+            "model": model
+        })
+    };
     let session_update = serde_json::json!({
         "type": "session.update",
         "session": {
@@ -108,9 +119,7 @@ pub async fn transcribe_realtime(
                         "type": "audio/pcm",
                         "rate": REALTIME_SAMPLE_RATE
                     },
-                    "transcription": {
-                        "model": model
-                    },
+                    "transcription": transcription,
                     "turn_detection": null
                 }
             }
@@ -121,7 +130,6 @@ pub async fn transcribe_realtime(
         .await
         .map_err(|error| format!("Realtime session update failed: {error}"))?;
 
-    let live_enabled = partial_tx.is_some();
     let commit_count = Arc::new(AtomicUsize::new(0));
     let sender_commit_count = commit_count.clone();
     let sender = tokio::spawn(async move {
@@ -170,7 +178,25 @@ pub async fn transcribe_realtime(
     let mut completed_segments: Vec<String> = Vec::new();
     let mut current_segment = String::new();
     let mut completed_count = 0_usize;
-    while let Some(message) = read.next().await {
+    loop {
+        let maybe_message = if live_enabled {
+            tokio::select! {
+                message = read.next() => message,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if sender.is_finished()
+                        && completed_count >= commit_count.load(Ordering::SeqCst)
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            read.next().await
+        };
+        let Some(message) = maybe_message else {
+            break;
+        };
         let message = message.map_err(|error| format!("Realtime receive failed: {error}"))?;
         let Message::Text(text) = message else {
             continue;

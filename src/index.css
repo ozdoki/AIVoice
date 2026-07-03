@@ -1243,6 +1243,10 @@ kbd {
   line-height: 1.3;
 }
 
+.floating-live-text.is-waiting {
+  color: var(--text-dim);
+}
+
 .floating-status {
   width: 72px;
   flex: 0 0 72px;
