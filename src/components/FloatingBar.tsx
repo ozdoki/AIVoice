@@ -105,7 +105,7 @@ export function FloatingBar() {
             const logW = monitor.size.width / scale;
             const logH = monitor.size.height / scale;
             // タスクバー（約48px）のちょい上に配置
-            await win.setPosition(new LogicalPosition(logW / 2 - 190, logH - 156));
+            await win.setPosition(new LogicalPosition(logW / 2 - 190, logH - 188));
           }
         } catch { /* モニター取得失敗時はデフォルト位置 */ }
         await win.show();
@@ -201,10 +201,10 @@ export function FloatingBar() {
     completed: "完了",
     failed: "失敗",
   };
-  const showLiveArea =
+  const showLiveTranscript =
     isRecording &&
-    settings.show_live_transcript_in_floating_bar;
-  const showLiveTranscript = showLiveArea && Boolean(liveTranscript.trim());
+    settings.show_live_transcript_in_floating_bar &&
+    Boolean(liveTranscript.trim());
 
   return (
     <div className="floating-stage">
@@ -216,12 +216,8 @@ export function FloatingBar() {
         <span className={`recording-dot ${isRecording ? "is-active" : ""}`} />
         <span className="floating-mode">{mode === "polish" ? "Polish" : "Raw"}</span>
 
-        <div className={`floating-waveform ${showLiveArea ? "has-live-text" : ""}`}>
-          {showLiveArea ? (
-            <span className={`floating-live-text ${showLiveTranscript ? "" : "is-waiting"}`}>
-              {showLiveTranscript ? liveTranscript : "文字起こし待機中..."}
-            </span>
-          ) : isProcessing ? (
+        <div className="floating-waveform">
+          {isProcessing ? (
             [0, 1, 2].map((i) => (
               <span key={i} className="processing-bar" style={{
                 animation: `dot-bounce 1.1s ${i * 0.18}s ease-in-out infinite`,
@@ -269,6 +265,11 @@ export function FloatingBar() {
           </button>
         )}
       </div>
+      {showLiveTranscript && (
+        <div className="floating-live-strip">
+          <span>{liveTranscript}</span>
+        </div>
+      )}
     </div>
   );
 }

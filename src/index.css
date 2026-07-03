@@ -1228,25 +1228,6 @@ kbd {
   -webkit-app-region: no-drag;
 }
 
-.floating-waveform.has-live-text {
-  justify-content: flex-start;
-  padding: 0 10px;
-}
-
-.floating-live-text {
-  max-width: 100%;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  color: var(--text);
-  font-size: 12px;
-  line-height: 1.3;
-}
-
-.floating-live-text.is-waiting {
-  color: var(--text-dim);
-}
-
 .floating-status {
   width: 72px;
   flex: 0 0 72px;
@@ -1273,6 +1254,29 @@ kbd {
   height: 16px;
   background: var(--text-muted);
   transform-origin: center;
+}
+
+.floating-live-strip {
+  width: 360px;
+  max-height: 38px;
+  margin: 6px auto 0;
+  padding: 7px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(22, 24, 27, 0.86);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.36);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow: hidden;
+  -webkit-app-region: no-drag;
+}
+
+.floating-live-strip span {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .floating-stop {
