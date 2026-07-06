@@ -125,7 +125,10 @@ pub async fn transcribe_realtime(
     }
 
     send_status(&status_tx, "connecting", None);
-    live_debug(format!("connecting realtime model={model} live={}", partial_tx.is_some()));
+    live_debug(format!(
+        "connecting realtime model={model} live={}",
+        partial_tx.is_some()
+    ));
     let url = realtime_url(&base_url);
     let mut request = url
         .into_client_request()
@@ -381,7 +384,9 @@ pub async fn transcribe_realtime(
             }
             Some(other) => {
                 if delta_count == 0 && completed_count == 0 {
-                    live_debug(format!("received realtime event before transcript: {other}"));
+                    live_debug(format!(
+                        "received realtime event before transcript: {other}"
+                    ));
                 }
             }
             None => {}

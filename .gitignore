@@ -20,6 +20,7 @@ node_modules/
 dist/
 coverage/
 .playwright-mcp/
+build/
 
 # Tauri
 src-tauri/target/

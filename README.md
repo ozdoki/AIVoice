@@ -4,6 +4,17 @@ AIVoice は、個人利用を前提にした Windows 先行の音声入力アプ
 
 BYOK（自分の OpenAI API キー）で使い、設定・辞書・履歴はローカルに保存します。
 
+## OSS としての目的
+
+AIVoice は、個人が安全に BYOK で使える音声入力アプリの実装例として公開しています。Tauri / Rust / React による Windows デスクトップアプリで、OpenAI 互換 ASR、ローカル設定、Windows Credential Manager、履歴復元、テキスト注入を組み合わせた実用的な構成を検証します。
+
+特に以下を重視します。
+
+- API キーをアプリ内で安全に扱う
+- 音声入力、文章整形、履歴復元をローカルファーストに設計する
+- Tauri コマンドと Windows ネイティブ処理の境界を小さく保つ
+- 依存関係とデスクトップ権限を継続的に見直す
+
 ## 現在の実装
 
 - Tauri 2 / React / Rust によるデスクトップアプリ
@@ -56,6 +67,14 @@ npm install
 ```
 
 OpenAI API キーはアプリの設定画面から保存します。キーは Windows Credential Manager に保存され、設定 JSON には書き出しません。
+
+## セキュリティとプライバシー
+
+- API キーは Windows Credential Manager に保存し、設定 JSON には保存しません。
+- `.env` / `.env.*` は Git 管理対象外です。
+- 履歴、辞書、スニペット、利用量、復元データはローカル保存です。
+- 前面アプリ情報を使う設定では、アプリ名とウィンドウタイトルのみをプロンプト補助に使います。入力欄本文は読み取りません。
+- 脆弱性や秘密情報に関わる報告は [SECURITY.md](SECURITY.md) を参照してください。
 
 ## 開発コマンド
 
@@ -110,3 +129,11 @@ cargo test --no-run
 - API キーはローカルで安全に扱う
 - 履歴、辞書、スニペット、設定はローカル保存を基本にする
 - 音声入力の安定性と復旧性を優先する
+
+## コントリビューション
+
+開発方針、対象外スコープ、Pull Request の確認項目は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+
+## ライセンス
+
+MIT License です。詳細は [LICENSE](LICENSE) を参照してください。
