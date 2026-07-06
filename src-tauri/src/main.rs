@@ -49,8 +49,8 @@ fn main() {
                 &app.handle(),
                 hotkey::HotkeySet::new(
                     loaded_settings.push_to_talk_hotkey,
-                    loaded_settings.hands_free_hotkey,
-                    loaded_settings.toggle_mode_hotkey,
+                    loaded_settings.hands_free_raw_hotkey,
+                    loaded_settings.hands_free_polish_hotkey,
                 ),
             )?;
             // システムトレイを作成
@@ -116,6 +116,8 @@ fn main() {
             commands::push_to_talk_down,
             commands::push_to_talk_up,
             commands::toggle_hands_free_recording,
+            commands::toggle_hands_free_recording_for_mode,
+            commands::set_active_polish_preset,
             commands::get_settings,
             commands::save_settings,
             commands::save_api_key,

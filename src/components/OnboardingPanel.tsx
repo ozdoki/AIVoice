@@ -288,10 +288,10 @@ export function OnboardingPanel({
               <div className="onboarding-hotkeys">
                 <span>押している間録音</span>
                 <kbd>{formatHotkey(draftSettings.push_to_talk_hotkey)}</kbd>
-                <span>ハンズフリー録音</span>
-                <kbd>{formatHotkey(draftSettings.hands_free_hotkey)}</kbd>
-                <span>モード切替</span>
-                <kbd>{formatHotkey(draftSettings.toggle_mode_hotkey)}</kbd>
+                <span>Rawハンズフリー</span>
+                <kbd>{formatHotkey(draftSettings.hands_free_raw_hotkey)}</kbd>
+                <span>Polishハンズフリー</span>
+                <kbd>{formatHotkey(draftSettings.hands_free_polish_hotkey)}</kbd>
               </div>
               <button className="button primary" onClick={() => setStep(3)}>
                 確認して次へ

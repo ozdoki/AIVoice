@@ -39,10 +39,23 @@ impl HotkeyBinding {
     }
 
     pub fn hands_free_default() -> Self {
+        Self::hands_free_raw_default()
+    }
+
+    pub fn hands_free_raw_default() -> Self {
         Self {
             ctrl: true,
             shift: true,
             key: "F6".to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn hands_free_polish_default() -> Self {
+        Self {
+            ctrl: true,
+            shift: true,
+            key: "F7".to_string(),
             ..Default::default()
         }
     }
@@ -92,7 +105,11 @@ pub struct AppSettings {
     pub launch_at_login: bool,
     pub onboarding_completed: bool,
     pub push_to_talk_hotkey: HotkeyBinding,
+    pub hands_free_raw_hotkey: HotkeyBinding,
+    pub hands_free_polish_hotkey: HotkeyBinding,
+    #[serde(skip_serializing, default)]
     pub hands_free_hotkey: HotkeyBinding,
+    #[serde(skip_serializing, default)]
     pub toggle_mode_hotkey: HotkeyBinding,
 }
 
@@ -114,6 +131,8 @@ impl Default for AppSettings {
             onboarding_completed: false,
             push_to_talk_hotkey: HotkeyBinding::push_to_talk_default(),
             hands_free_hotkey: HotkeyBinding::hands_free_default(),
+            hands_free_raw_hotkey: HotkeyBinding::hands_free_raw_default(),
+            hands_free_polish_hotkey: HotkeyBinding::hands_free_polish_default(),
             toggle_mode_hotkey: HotkeyBinding::toggle_mode_default(),
         }
     }
@@ -154,7 +173,20 @@ pub fn delete_api_key() -> anyhow::Result<()> {
 pub fn load(app: &AppHandle) -> anyhow::Result<AppSettings> {
     let store = app.store(STORE_PATH)?;
     let mut s: AppSettings = match store.get("settings") {
-        Some(v) => serde_json::from_value(v)?,
+        Some(v) => {
+            let legacy_hands_free = v
+                .get("hands_free_hotkey")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let raw_missing = v.get("hands_free_raw_hotkey").is_none();
+            let mut settings: AppSettings = serde_json::from_value(v)?;
+            if raw_missing {
+                if let Some(legacy) = legacy_hands_free {
+                    settings.hands_free_raw_hotkey = legacy;
+                }
+            }
+            settings
+        }
         None => AppSettings::default(),
     };
     s.api_key = load_api_key();
@@ -193,8 +225,9 @@ mod tests {
             launch_at_login: true,
             onboarding_completed: true,
             push_to_talk_hotkey: HotkeyBinding::push_to_talk_default(),
-            hands_free_hotkey: HotkeyBinding::hands_free_default(),
-            toggle_mode_hotkey: HotkeyBinding::toggle_mode_default(),
+            hands_free_raw_hotkey: HotkeyBinding::hands_free_raw_default(),
+            hands_free_polish_hotkey: HotkeyBinding::hands_free_polish_default(),
+            ..Default::default()
         };
         let json = serde_json::to_value(&original).unwrap();
         let restored: AppSettings = serde_json::from_value(json).unwrap();
@@ -218,8 +251,14 @@ mod tests {
         assert_eq!(restored.launch_at_login, original.launch_at_login);
         assert_eq!(restored.onboarding_completed, original.onboarding_completed);
         assert_eq!(restored.push_to_talk_hotkey, original.push_to_talk_hotkey);
-        assert_eq!(restored.hands_free_hotkey, original.hands_free_hotkey);
-        assert_eq!(restored.toggle_mode_hotkey, original.toggle_mode_hotkey);
+        assert_eq!(
+            restored.hands_free_raw_hotkey,
+            original.hands_free_raw_hotkey
+        );
+        assert_eq!(
+            restored.hands_free_polish_hotkey,
+            original.hands_free_polish_hotkey
+        );
         // api_key は serde(skip) のため JSON 経由では復元されない
         assert!(restored.api_key.is_empty());
     }
@@ -240,8 +279,8 @@ mod tests {
         assert!(!d.launch_at_login);
         assert!(!d.onboarding_completed);
         assert_eq!(d.push_to_talk_hotkey.display(), "Ctrl + Shift + F4");
-        assert_eq!(d.hands_free_hotkey.display(), "Ctrl + Shift + F6");
-        assert_eq!(d.toggle_mode_hotkey.display(), "Ctrl + Shift + F5");
+        assert_eq!(d.hands_free_raw_hotkey.display(), "Ctrl + Shift + F6");
+        assert_eq!(d.hands_free_polish_hotkey.display(), "Ctrl + Shift + F7");
     }
 
     #[test]
@@ -256,8 +295,14 @@ mod tests {
         let s: AppSettings = serde_json::from_value(json).unwrap();
         assert!(s.device_id.is_none());
         assert_eq!(s.push_to_talk_hotkey, HotkeyBinding::push_to_talk_default());
-        assert_eq!(s.hands_free_hotkey, HotkeyBinding::hands_free_default());
-        assert_eq!(s.toggle_mode_hotkey, HotkeyBinding::toggle_mode_default());
+        assert_eq!(
+            s.hands_free_raw_hotkey,
+            HotkeyBinding::hands_free_raw_default()
+        );
+        assert_eq!(
+            s.hands_free_polish_hotkey,
+            HotkeyBinding::hands_free_polish_default()
+        );
     }
 
     #[test]

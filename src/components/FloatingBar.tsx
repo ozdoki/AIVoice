@@ -7,6 +7,7 @@ import { Stop16Filled } from "@fluentui/react-icons";
 import {
   type AppSettings,
   type Mode,
+  type PolishPreset,
   type RecordingState,
   type SessionPhase,
   defaultSettings,
@@ -16,6 +17,7 @@ import {
 interface SessionUiEvent {
   state: RecordingState;
   mode: Mode;
+  polish_preset?: PolishPreset | null;
   phase?: SessionPhase;
   final_text: string | null;
   history_id: string | null;
@@ -35,6 +37,13 @@ const BAR_MIN_H = 8;
 const BAR_MAX_H = 38;
 const WAVEFORM_DISPLAY_GAIN = 95;
 const WAVEFORM_NOISE_FLOOR = 0.0008;
+const POLISH_PRESETS: Array<{ value: PolishPreset; label: string }> = [
+  { value: "slack", label: "Slack" },
+  { value: "email", label: "Mail" },
+  { value: "memo", label: "Memo" },
+  { value: "prompt", label: "Prompt" },
+  { value: "technical", label: "Tech" },
+];
 
 export function FloatingBar() {
   const [recordingState, setRecordingState] = useState<RecordingState>(
@@ -45,6 +54,9 @@ export function FloatingBar() {
   const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
+  const [activePolishPreset, setActivePolishPreset] = useState<PolishPreset>(
+    defaultSettings.polish_preset
+  );
   const [liveTranscript, setLiveTranscript] = useState("");
   const [liveTranscriptError, setLiveTranscriptError] = useState("");
   const levelRef = useRef(isTauri ? 0 : 0.32);
@@ -77,6 +89,7 @@ export function FloatingBar() {
     listen<AppSettings>("settings://changed", (event) => {
       setSettings(event.payload);
       setMode(event.payload.mode);
+      setActivePolishPreset(event.payload.polish_preset);
       if (!event.payload.show_floating_bar) {
         win.hide().catch((error) => console.error(error));
       }
@@ -97,9 +110,12 @@ export function FloatingBar() {
     let unlistener: (() => void) | undefined;
 
     listen<SessionUiEvent>("session://state-changed", async (event) => {
-      const { state, mode: newMode, phase: nextPhase } = event.payload;
+      const { state, mode: newMode, phase: nextPhase, polish_preset } = event.payload;
       setRecordingState(state);
       setMode(newMode);
+      if (polish_preset) {
+        setActivePolishPreset(polish_preset);
+      }
       setPhase(nextPhase ?? (state === "recording" ? "recording" : state === "processing" ? "transcribing" : "idle"));
 
       if (state === "recording" && settings.show_floating_bar) {
@@ -124,6 +140,7 @@ export function FloatingBar() {
         setDisplayLevel(0);
         setLiveTranscript("");
         setLiveTranscriptError("");
+        setActivePolishPreset(settings.polish_preset);
         setRecordingStartedAt(null);
         if ((nextPhase === "completed" || nextPhase === "failed") && settings.show_floating_bar) {
           await win.show();
@@ -207,6 +224,17 @@ export function FloatingBar() {
     try { await invoke("stop_recording_session"); } catch (e) { console.error(e); }
   };
 
+  const handlePolishPresetChange = async (preset: PolishPreset) => {
+    setActivePolishPreset(preset);
+    if (!isTauri) return;
+    try {
+      const next = await invoke<PolishPreset>("set_active_polish_preset", { preset });
+      setActivePolishPreset(next);
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
   const isRecording = recordingState === "recording";
   const isProcessing = recordingState === "processing";
   const elapsedSeconds = recordingStartedAt
@@ -230,6 +258,7 @@ export function FloatingBar() {
     settings.show_live_transcript_in_floating_bar &&
     Boolean(liveTranscriptError.trim()) &&
     !showLiveTranscript;
+  const showPolishPresetControl = isRecording && mode === "polish";
 
   useEffect(() => {
     if (!showLiveTranscript) return;
@@ -303,6 +332,20 @@ export function FloatingBar() {
       {showLiveTranscript && (
         <div className="floating-live-strip" ref={liveStripRef}>
           <span>{liveTranscript}</span>
+        </div>
+      )}
+      {showPolishPresetControl && (
+        <div className="floating-preset-strip" aria-label="Polishプリセット">
+          {POLISH_PRESETS.map((preset) => (
+            <button
+              key={preset.value}
+              className={activePolishPreset === preset.value ? "is-active" : ""}
+              onClick={() => handlePolishPresetChange(preset.value)}
+              type="button"
+            >
+              {preset.label}
+            </button>
+          ))}
         </div>
       )}
       {showLiveTranscriptError && (

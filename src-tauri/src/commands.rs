@@ -35,6 +35,7 @@ use crate::{
 struct SessionUiEvent {
     state: RecordingState,
     mode: Mode,
+    polish_preset: Option<String>,
     phase: String,
     raw_text: Option<String>,
     final_text: Option<String>,
@@ -150,9 +151,14 @@ fn parse_model_ids(body: &str) -> Result<Vec<String>, String> {
 fn hotkey_set(settings: &AppSettings) -> HotkeySet {
     HotkeySet::new(
         settings.push_to_talk_hotkey.clone(),
-        settings.hands_free_hotkey.clone(),
-        settings.toggle_mode_hotkey.clone(),
+        settings.hands_free_raw_hotkey.clone(),
+        settings.hands_free_polish_hotkey.clone(),
     )
+}
+
+fn should_start_realtime_asr(settings: &AppSettings, session_mode: &Mode) -> bool {
+    !settings.api_key.trim().is_empty()
+        && (settings.show_live_transcript_in_floating_bar || !matches!(session_mode, Mode::Raw))
 }
 
 fn settings_for_ui(settings: &AppSettings) -> Result<serde_json::Value, String> {
@@ -329,17 +335,35 @@ async fn start_recording_locked(
     app: &tauri::AppHandle,
     state: &AppState,
     trigger: RecordingTrigger,
+    mode_override: Option<Mode>,
 ) -> Result<(), String> {
     if !matches!(*state.recording_state.lock().await, RecordingState::Idle) {
         return Ok(());
     }
 
-    if let Some(target) = context::current_external_focused_window() {
-        *state.last_target_window.lock().await = Some(target);
+    let focused_target = context::current_external_focused_window();
+    if let Some(target) = &focused_target {
+        *state.last_target_window.lock().await = Some(target.clone());
     }
 
     let (level_tx, mut level_rx) = tokio::sync::mpsc::unbounded_channel::<f32>();
     let settings = state.settings.lock().await.clone();
+    let session_mode = match mode_override {
+        Some(mode) => mode,
+        None => state.mode.lock().await.clone(),
+    };
+    let focused_context_for_preset = focused_target.as_ref().map(|target| FocusedAppContext {
+        process_name: target.process_name.clone(),
+        window_title: target.window_title.clone(),
+    });
+    let session_polish_preset = if matches!(session_mode, Mode::Polish) {
+        context::suggested_polish_preset(
+            focused_context_for_preset.as_ref(),
+            &settings.polish_preset,
+        )
+    } else {
+        settings.polish_preset.clone()
+    };
     let (partial_tx, mut partial_rx) = if settings.show_live_transcript_in_floating_bar {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         (Some(tx), Some(rx))
@@ -352,7 +376,8 @@ async fn start_recording_locked(
     } else {
         (None, None)
     };
-    let realtime_model = if settings.api_key.trim().is_empty() {
+    let should_start_realtime = should_start_realtime_asr(&settings, &session_mode);
+    let realtime_model = if !should_start_realtime {
         None
     } else if supports_realtime_model(&settings.api_model) {
         Some(settings.api_model.clone())
@@ -361,52 +386,53 @@ async fn start_recording_locked(
     } else {
         None
     };
-    let (chunk_tx, realtime_task) =
-        if let Some(realtime_model) = realtime_model {
-            tracing::info!(
-                configured_model = %settings.api_model,
-                realtime_model = %realtime_model,
-                live_transcript = settings.show_live_transcript_in_floating_bar,
-                "starting recording with realtime ASR"
-            );
-            let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel();
-            let task = tokio::spawn(transcribe_realtime(
-                settings.api_base_url.clone(),
-                settings.api_key.clone(),
-                realtime_model,
-                chunk_rx,
-                partial_tx,
-                status_tx,
-            ));
-            (Some(chunk_tx), Some(task))
-        } else {
-            tracing::info!(
-                model = %settings.api_model,
-                has_api_key = !settings.api_key.trim().is_empty(),
-                live_transcript = settings.show_live_transcript_in_floating_bar,
-                "starting recording without realtime ASR"
-            );
-            if settings.show_live_transcript_in_floating_bar {
-                let detail = if settings.api_key.trim().is_empty() {
-                    "APIキーが未設定のため、録音中の文字表示を開始できません。".to_string()
-                } else {
-                    format!(
-                        "ASR Model {} は録音中の文字表示に未対応です。",
-                        settings.api_model
-                    )
-                };
-                if let Some(tx) = &status_tx {
-                    let _ = tx.send(RealtimeStatus {
-                        state: "error".to_string(),
-                        detail: Some(detail),
-                    });
-                }
+    let (chunk_tx, realtime_task) = if let Some(realtime_model) = realtime_model {
+        tracing::info!(
+            configured_model = %settings.api_model,
+            realtime_model = %realtime_model,
+            live_transcript = settings.show_live_transcript_in_floating_bar,
+            mode = ?session_mode,
+            "starting recording with realtime ASR"
+        );
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(transcribe_realtime(
+            settings.api_base_url.clone(),
+            settings.api_key.clone(),
+            realtime_model,
+            chunk_rx,
+            partial_tx,
+            status_tx,
+        ));
+        (Some(chunk_tx), Some(task))
+    } else {
+        tracing::info!(
+            model = %settings.api_model,
+            has_api_key = !settings.api_key.trim().is_empty(),
+            live_transcript = settings.show_live_transcript_in_floating_bar,
+            mode = ?session_mode,
+            "starting recording without realtime ASR"
+        );
+        if settings.show_live_transcript_in_floating_bar {
+            let detail = if settings.api_key.trim().is_empty() {
+                "APIキーが未設定のため、録音中の文字表示を開始できません。".to_string()
+            } else {
+                format!(
+                    "ASR Model {} は録音中の文字表示に未対応です。",
+                    settings.api_model
+                )
+            };
+            if let Some(tx) = &status_tx {
+                let _ = tx.send(RealtimeStatus {
+                    state: "error".to_string(),
+                    detail: Some(detail),
+                });
             }
-            (None, None)
-        };
-    let mode = state.mode.lock().await.clone();
-    let recovery_session = recovery::create_session(app, mode.clone(), trigger_label(&trigger))
-        .map_err(|error| error.to_string())?;
+        }
+        (None, None)
+    };
+    let recovery_session =
+        recovery::create_session(app, session_mode.clone(), trigger_label(&trigger))
+            .map_err(|error| error.to_string())?;
     if let Err(error) = session_service::start_session_inner(
         state,
         Some(level_tx),
@@ -414,6 +440,8 @@ async fn start_recording_locked(
         realtime_task,
         Some(recovery_session.id.clone()),
         Some(recovery_session.audio_path.clone()),
+        session_mode.clone(),
+        session_polish_preset.clone(),
     )
     .await
     {
@@ -422,7 +450,7 @@ async fn start_recording_locked(
     }
     *state.recording_trigger.lock().await = Some(trigger);
 
-    let mode_label = if matches!(mode, Mode::Polish) {
+    let mode_label = if matches!(session_mode, Mode::Polish) {
         "Polish"
     } else {
         "Raw"
@@ -432,7 +460,8 @@ async fn start_recording_locked(
         "session://state-changed",
         SessionUiEvent {
             state: RecordingState::Recording,
-            mode,
+            mode: session_mode,
+            polish_preset: Some(session_polish_preset),
             phase: "recording".to_string(),
             raw_text: None,
             final_text: None,
@@ -478,6 +507,18 @@ async fn start_recording_locked(
     Ok(())
 }
 
+async fn active_session_mode_and_preset(state: &AppState) -> (Mode, Option<String>) {
+    if let Some((mode, preset)) = {
+        let session = state.session.lock().await;
+        session
+            .as_ref()
+            .map(|controller| (controller.mode.clone(), controller.polish_preset.clone()))
+    } {
+        return (mode, Some(preset));
+    }
+    (state.mode.lock().await.clone(), None)
+}
+
 async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Result<String, String> {
     if !matches!(
         *state.recording_state.lock().await,
@@ -486,12 +527,13 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
         return Ok(String::new());
     }
 
-    let mode = state.mode.lock().await.clone();
+    let (mode, polish_preset) = active_session_mode_and_preset(state).await;
     let _ = app.emit(
         "session://state-changed",
         SessionUiEvent {
             state: RecordingState::Processing,
             mode: mode.clone(),
+            polish_preset: polish_preset.clone(),
             phase: "transcribing".to_string(),
             raw_text: None,
             final_text: None,
@@ -578,6 +620,7 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
         SessionUiEvent {
             state: RecordingState::Idle,
             mode,
+            polish_preset,
             phase: if has_error { "failed" } else { "completed" }.to_string(),
             raw_text: result
                 .as_ref()
@@ -605,7 +648,7 @@ pub async fn start_recording_session(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let _guard = state.session_action.lock().await;
-    start_recording_locked(&app, &state, RecordingTrigger::Manual).await
+    start_recording_locked(&app, &state, RecordingTrigger::Manual, None).await
 }
 
 #[tauri::command]
@@ -628,12 +671,13 @@ async fn stop_recording_preview_locked(
         return Ok(String::new());
     }
 
-    let mode = state.mode.lock().await.clone();
+    let (mode, polish_preset) = active_session_mode_and_preset(state).await;
     let _ = app.emit(
         "session://state-changed",
         SessionUiEvent {
             state: RecordingState::Processing,
             mode: mode.clone(),
+            polish_preset: polish_preset.clone(),
             phase: "transcribing".to_string(),
             raw_text: None,
             final_text: None,
@@ -671,6 +715,7 @@ async fn stop_recording_preview_locked(
         SessionUiEvent {
             state: RecordingState::Idle,
             mode,
+            polish_preset,
             phase: if has_error { "failed" } else { "completed" }.to_string(),
             raw_text: result
                 .as_ref()
@@ -695,7 +740,7 @@ pub async fn start_onboarding_test_recording(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let _guard = state.session_action.lock().await;
-    start_recording_locked(&app, &state, RecordingTrigger::Manual).await
+    start_recording_locked(&app, &state, RecordingTrigger::Manual, None).await
 }
 
 #[tauri::command]
@@ -715,7 +760,7 @@ pub async fn push_to_talk_down(
     let _guard = state.session_action.lock().await;
     let recording_state = state.recording_state.lock().await.clone();
     match push_to_talk_down_action(&recording_state) {
-        ShortcutAction::Start(trigger) => start_recording_locked(&app, &state, trigger).await,
+        ShortcutAction::Start(trigger) => start_recording_locked(&app, &state, trigger, None).await,
         ShortcutAction::Stop => {
             stop_recording_locked(&app, &state).await?;
             Ok(())
@@ -746,16 +791,51 @@ pub async fn toggle_hands_free_recording(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    toggle_hands_free_recording_for_mode(app, state, Mode::Raw).await
+}
+
+#[tauri::command]
+pub async fn toggle_hands_free_recording_for_mode(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    mode: Mode,
+) -> Result<(), String> {
     let _guard = state.session_action.lock().await;
     let recording_state = state.recording_state.lock().await.clone();
     match hands_free_action(&recording_state) {
-        ShortcutAction::Start(trigger) => start_recording_locked(&app, &state, trigger).await,
+        ShortcutAction::Start(trigger) => {
+            start_recording_locked(&app, &state, trigger, Some(mode)).await
+        }
         ShortcutAction::Stop => {
             stop_recording_locked(&app, &state).await?;
             Ok(())
         }
         ShortcutAction::Ignore => Ok(()),
     }
+}
+
+fn normalize_polish_preset(preset: &str) -> Result<String, String> {
+    match preset.trim() {
+        "slack" | "email" | "memo" | "prompt" | "technical" => Ok(preset.trim().to_string()),
+        _ => Err("未対応のPolishプリセットです。".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn set_active_polish_preset(
+    state: State<'_, AppState>,
+    preset: String,
+) -> Result<String, String> {
+    let preset = normalize_polish_preset(&preset)?;
+    let mut session = state.session.lock().await;
+    let Some(controller) = session.as_mut() else {
+        return Err("録音中のPolishセッションがありません。".to_string());
+    };
+    if !matches!(controller.mode, Mode::Polish) {
+        return Err("Raw録音中はPolishプリセットを変更できません。".to_string());
+    }
+    controller.polish_preset = preset.clone();
+    Ok(preset)
 }
 
 #[tauri::command]
@@ -1199,8 +1279,8 @@ pub async fn save_settings(
     }
     let normalized = hotkey::reconfigure_hotkeys(hotkey_set(&new_settings))?;
     new_settings.push_to_talk_hotkey = normalized.push_to_talk;
-    new_settings.hands_free_hotkey = normalized.hands_free;
-    new_settings.toggle_mode_hotkey = normalized.toggle_mode;
+    new_settings.hands_free_raw_hotkey = normalized.hands_free_raw;
+    new_settings.hands_free_polish_hotkey = normalized.hands_free_polish;
     if previous.launch_at_login != new_settings.launch_at_login {
         if let Err(error) = crate::startup::set_launch_at_login(new_settings.launch_at_login) {
             let _ = hotkey::reconfigure_hotkeys(hotkey_set(&previous));
@@ -1241,7 +1321,8 @@ mod tests {
     use super::{
         cleanup_api_key_import_file, extract_openai_api_key_env, hands_free_action,
         list_models_with_key, parse_model_ids, push_to_talk_down_action, push_to_talk_up_action,
-        read_api_key_from_env_file, select_api_key, settings_for_ui, ShortcutAction,
+        read_api_key_from_env_file, select_api_key, settings_for_ui, should_start_realtime_asr,
+        ShortcutAction,
     };
     use crate::{
         settings::{AppSettings, HotkeyBinding},
@@ -1289,8 +1370,8 @@ mod tests {
         let settings = AppSettings {
             api_key: "sk-test-secret".to_string(),
             push_to_talk_hotkey: HotkeyBinding::push_to_talk_default(),
-            hands_free_hotkey: HotkeyBinding::hands_free_default(),
-            toggle_mode_hotkey: HotkeyBinding::toggle_mode_default(),
+            hands_free_raw_hotkey: HotkeyBinding::hands_free_raw_default(),
+            hands_free_polish_hotkey: HotkeyBinding::hands_free_polish_default(),
             mode: Mode::Raw,
             ..Default::default()
         };
@@ -1298,6 +1379,39 @@ mod tests {
         assert_eq!(payload.get("api_key").unwrap(), "");
         assert_eq!(payload.get("has_api_key").unwrap(), true);
         assert!(!payload.to_string().contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn raw_live_transcript_off_skips_realtime_asr() {
+        let settings = AppSettings {
+            api_key: "sk-test".to_string(),
+            show_live_transcript_in_floating_bar: false,
+            ..Default::default()
+        };
+
+        assert!(!should_start_realtime_asr(&settings, &Mode::Raw));
+    }
+
+    #[test]
+    fn raw_live_transcript_on_uses_realtime_asr() {
+        let settings = AppSettings {
+            api_key: "sk-test".to_string(),
+            show_live_transcript_in_floating_bar: true,
+            ..Default::default()
+        };
+
+        assert!(should_start_realtime_asr(&settings, &Mode::Raw));
+    }
+
+    #[test]
+    fn polish_live_transcript_off_keeps_realtime_asr() {
+        let settings = AppSettings {
+            api_key: "sk-test".to_string(),
+            show_live_transcript_in_floating_bar: false,
+            ..Default::default()
+        };
+
+        assert!(should_start_realtime_asr(&settings, &Mode::Polish));
     }
 
     #[test]

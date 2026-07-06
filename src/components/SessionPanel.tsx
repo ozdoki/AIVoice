@@ -20,8 +20,8 @@ interface Props {
   rawText: string | null;
   elapsedMs: number;
   pushToTalk: HotkeyBinding;
-  handsFree: HotkeyBinding;
-  toggleMode: HotkeyBinding;
+  handsFreeRaw: HotkeyBinding;
+  handsFreePolish: HotkeyBinding;
 }
 
 const stateLabel: Record<RecordingState, string> = {
@@ -39,8 +39,8 @@ export function SessionPanel({
   rawText,
   elapsedMs,
   pushToTalk,
-  handsFree,
-  toggleMode,
+  handsFreeRaw,
+  handsFreePolish,
 }: Props) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
   const [copyError, setCopyError] = useState<string | null>(null);
@@ -161,8 +161,8 @@ export function SessionPanel({
 
       <div className="shortcut-strip">
         <Shortcut binding={pushToTalk} label="押している間録音" />
-        <Shortcut binding={handsFree} label="ハンズフリー" />
-        <Shortcut binding={toggleMode} label="モード切替" />
+        <Shortcut binding={handsFreeRaw} label="Rawハンズフリー" />
+        <Shortcut binding={handsFreePolish} label="Polishハンズフリー" />
       </div>
     </div>
   );

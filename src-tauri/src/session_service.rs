@@ -57,6 +57,8 @@ pub async fn start_session_inner(
     realtime_task: Option<tokio::task::JoinHandle<Result<String, String>>>,
     recovery_id: Option<String>,
     recovery_audio_path: Option<std::path::PathBuf>,
+    mode: Mode,
+    polish_preset: String,
 ) -> Result<(), String> {
     let mut session = state.session.lock().await;
     if session.is_some() {
@@ -79,6 +81,8 @@ pub async fn start_session_inner(
         realtime_task,
         started_at: Instant::now(),
         recovery_id,
+        mode,
+        polish_preset,
     });
     *state.recording_state.lock().await = RecordingState::Recording;
     Ok(())
@@ -106,8 +110,11 @@ pub async fn stop_session_inner(
 
     *state.recording_state.lock().await = RecordingState::Processing;
     let recovery_id = controller.recovery_id.clone();
+    let session_mode = controller.mode.clone();
+    let session_polish_preset = controller.polish_preset.clone();
 
     let result: Result<SessionOutcome, String> = async {
+        let stop_started = Instant::now();
         let _ = controller.stop_tx.send(true);
 
         let audio = controller
@@ -115,6 +122,7 @@ pub async fn stop_session_inner(
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
+        let capture_stop_ms = stop_started.elapsed().as_millis() as u64;
 
         let duration_ms = controller.started_at.elapsed().as_millis() as u64;
         if let (Some(app), Some(id)) = (app.as_ref(), recovery_id.as_ref()) {
@@ -150,6 +158,7 @@ pub async fn stop_session_inner(
             recovery::mark_transcribing(app, id).map_err(|e| e.to_string())?;
         }
 
+        let realtime_wait_started = Instant::now();
         let realtime_text = match controller.realtime_task {
             Some(task) => match tokio::time::timeout(Duration::from_secs(8), task).await {
                 Ok(Ok(Ok(text))) if !text.trim().is_empty() => Some(text),
@@ -174,6 +183,7 @@ pub async fn stop_session_inner(
             },
             None => None,
         };
+        let realtime_wait_ms = realtime_wait_started.elapsed().as_millis() as u64;
 
         let provider = OpenAiCompatibleProvider {
             base_url: current_settings.api_base_url,
@@ -183,24 +193,41 @@ pub async fn stop_session_inner(
             focused_context: focused_context.clone(),
             partial_tx: None,
         };
+        let mut batch_asr_ms = 0_u64;
         let raw_text = match realtime_text {
             Some(text) => text,
-            None => match provider.transcribe(&audio).await {
-                Ok(text) => text,
-                Err(error) => {
-                    drop(provider);
-                    let error = error.to_string();
-                    if let (Some(app), Some(id)) = (app.as_ref(), recovery_id.as_ref()) {
-                        let _ = recovery::mark_failed(app, id, error.clone());
+            None => {
+                let batch_started = Instant::now();
+                match provider.transcribe(&audio).await {
+                    Ok(text) => {
+                        batch_asr_ms = batch_started.elapsed().as_millis() as u64;
+                        text
                     }
-                    return Err(error);
+                    Err(error) => {
+                        batch_asr_ms = batch_started.elapsed().as_millis() as u64;
+                        drop(provider);
+                        let error = error.to_string();
+                        if let (Some(app), Some(id)) = (app.as_ref(), recovery_id.as_ref()) {
+                            let _ = recovery::mark_failed(app, id, error.clone());
+                        }
+                        tracing::info!(
+                            capture_stop_ms,
+                            realtime_wait_ms,
+                            batch_asr_ms,
+                            total_after_stop_ms = stop_started.elapsed().as_millis() as u64,
+                            mode = ?session_mode,
+                            "session failed during ASR"
+                        );
+                        return Err(error);
+                    }
                 }
-            },
+            }
         };
         drop(provider);
 
-        let current_mode = state.mode.lock().await.clone();
-        let current_settings_for_mode = state.settings.lock().await.clone();
+        let current_mode = session_mode.clone();
+        let mut current_settings_for_mode = state.settings.lock().await.clone();
+        current_settings_for_mode.polish_preset = session_polish_preset;
         let current_dictionary_words = state.dictionary_words.lock().await.clone();
         if matches!(current_mode, Mode::Polish) {
             emit_phase(app.as_ref(), "polishing");
@@ -226,6 +253,7 @@ pub async fn stop_session_inner(
         }
 
         emit_phase(app.as_ref(), "injecting");
+        let inject_started = Instant::now();
         let inject_error = match injector.inject(&final_text) {
             Ok(()) => None,
             Err(error) => {
@@ -236,6 +264,16 @@ pub async fn stop_session_inner(
                 Some(error)
             }
         };
+        let inject_ms = inject_started.elapsed().as_millis() as u64;
+        tracing::info!(
+            capture_stop_ms,
+            realtime_wait_ms,
+            batch_asr_ms,
+            inject_ms,
+            total_after_stop_ms = stop_started.elapsed().as_millis() as u64,
+            mode = ?current_mode,
+            "session processing timings"
+        );
 
         Ok(SessionOutcome {
             raw_text,
@@ -288,6 +326,8 @@ mod tests {
             realtime_task: None,
             started_at: Instant::now(),
             recovery_id: None,
+            mode: Mode::Raw,
+            polish_preset: "memo".to_string(),
         });
         state
     }
@@ -327,9 +367,18 @@ mod tests {
         let controller = existing.session.lock().await.take().unwrap();
         *state.session.lock().await = Some(controller);
 
-        start_session_inner(&state, None, None, None, None, None)
-            .await
-            .unwrap();
+        start_session_inner(
+            &state,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Mode::Raw,
+            "memo".to_string(),
+        )
+        .await
+        .unwrap();
         assert!(state.session.lock().await.is_some());
         if let Some(controller) = state.session.lock().await.take() {
             controller.capture_task.abort();

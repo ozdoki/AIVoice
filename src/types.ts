@@ -33,8 +33,8 @@ export interface AppSettings {
   launch_at_login: boolean;
   onboarding_completed: boolean;
   push_to_talk_hotkey: HotkeyBinding;
-  hands_free_hotkey: HotkeyBinding;
-  toggle_mode_hotkey: HotkeyBinding;
+  hands_free_raw_hotkey: HotkeyBinding;
+  hands_free_polish_hotkey: HotkeyBinding;
 }
 
 export interface HistoryEntry {
@@ -115,8 +115,8 @@ export const defaultSettings: AppSettings = {
   launch_at_login: false,
   onboarding_completed: false,
   push_to_talk_hotkey: { ctrl: true, alt: false, shift: true, key: "F4" },
-  hands_free_hotkey: { ctrl: true, alt: false, shift: true, key: "F6" },
-  toggle_mode_hotkey: { ctrl: true, alt: false, shift: true, key: "F5" },
+  hands_free_raw_hotkey: { ctrl: true, alt: false, shift: true, key: "F6" },
+  hands_free_polish_hotkey: { ctrl: true, alt: false, shift: true, key: "F7" },
 };
 
 export function hotkeyParts(binding: HotkeyBinding): string[] {

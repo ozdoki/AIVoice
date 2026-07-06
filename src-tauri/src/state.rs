@@ -48,6 +48,8 @@ pub struct SessionController {
     pub realtime_task: Option<JoinHandle<Result<String, String>>>,
     pub started_at: Instant,
     pub recovery_id: Option<String>,
+    pub mode: Mode,
+    pub polish_preset: String,
 }
 
 pub struct AppState {

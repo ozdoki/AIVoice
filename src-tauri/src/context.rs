@@ -162,6 +162,54 @@ fn context_text(context: &FocusedAppContext) -> String {
     )
 }
 
+pub fn suggested_polish_preset(context: Option<&FocusedAppContext>, fallback: &str) -> String {
+    let Some(context) = context else {
+        return normalized_polish_preset(fallback);
+    };
+    let text = context_text(context);
+    if text.contains("slack")
+        || text.contains("teams")
+        || text.contains("discord")
+        || text.contains("chatwork")
+        || text.contains("line")
+    {
+        "slack".to_string()
+    } else if text.contains("outlook")
+        || text.contains("thunderbird")
+        || text.contains("gmail")
+        || text.contains("mail")
+    {
+        "email".to_string()
+    } else if text.contains("code")
+        || text.contains("cursor")
+        || text.contains("visual studio")
+        || text.contains("jetbrains")
+        || text.contains("intellij")
+        || text.contains("rustrover")
+        || text.contains("webstorm")
+        || text.contains("pycharm")
+        || text.contains("terminal")
+        || text.contains("powershell")
+    {
+        "technical".to_string()
+    } else if text.contains("chatgpt")
+        || text.contains("claude")
+        || text.contains("gemini")
+        || text.contains("copilot")
+    {
+        "prompt".to_string()
+    } else {
+        normalized_polish_preset(fallback)
+    }
+}
+
+fn normalized_polish_preset(preset: &str) -> String {
+    match preset.trim() {
+        "slack" | "email" | "memo" | "prompt" | "technical" => preset.trim().to_string(),
+        _ => "memo".to_string(),
+    }
+}
+
 pub fn app_style_hint(context: Option<&FocusedAppContext>) -> String {
     let Some(context) = context else {
         return String::new();
@@ -245,5 +293,43 @@ mod tests {
             window_title: "ChatGPT".to_string(),
         };
         assert!(app_style_hint(Some(&edge)).contains("Browser style"));
+    }
+
+    #[test]
+    fn suggested_polish_preset_detects_supported_app_groups() {
+        let slack = FocusedAppContext {
+            process_name: "Slack.exe".to_string(),
+            window_title: "general".to_string(),
+        };
+        assert_eq!(suggested_polish_preset(Some(&slack), "memo"), "slack");
+
+        let gmail = FocusedAppContext {
+            process_name: "chrome.exe".to_string(),
+            window_title: "Gmail - Inbox".to_string(),
+        };
+        assert_eq!(suggested_polish_preset(Some(&gmail), "memo"), "email");
+
+        let code = FocusedAppContext {
+            process_name: "Code.exe".to_string(),
+            window_title: "AIVoice - Visual Studio Code".to_string(),
+        };
+        assert_eq!(suggested_polish_preset(Some(&code), "memo"), "technical");
+
+        let chatgpt = FocusedAppContext {
+            process_name: "msedge.exe".to_string(),
+            window_title: "ChatGPT".to_string(),
+        };
+        assert_eq!(suggested_polish_preset(Some(&chatgpt), "memo"), "prompt");
+    }
+
+    #[test]
+    fn suggested_polish_preset_uses_normalized_fallback() {
+        let notepad = FocusedAppContext {
+            process_name: "notepad.exe".to_string(),
+            window_title: "draft".to_string(),
+        };
+
+        assert_eq!(suggested_polish_preset(Some(&notepad), "email"), "email");
+        assert_eq!(suggested_polish_preset(None, "unknown"), "memo");
     }
 }

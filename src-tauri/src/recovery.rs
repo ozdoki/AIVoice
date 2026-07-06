@@ -207,7 +207,6 @@ pub fn mark_text_ready(
         meta.final_text = final_text;
         meta.error = None;
     })?;
-    let _ = fs::remove_file(audio_path(app, id)?);
     Ok(meta)
 }
 

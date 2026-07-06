@@ -95,21 +95,15 @@ function App() {
         listen("hotkey://push-to-talk-up", () => {
           invoke("push_to_talk_up").catch((error) => setLastError(String(error)));
         }),
-        listen("hotkey://hands-free-toggle", () => {
-          invoke("toggle_hands_free_recording").catch((error) =>
+        listen("hotkey://hands-free-raw-toggle", () => {
+          invoke("toggle_hands_free_recording_for_mode", { mode: "raw" }).catch((error) =>
             setLastError(String(error))
           );
         }),
-        listen("hotkey://toggle-mode", async () => {
-          const next: Mode = modeRef.current === "raw" ? "polish" : "raw";
-          try {
-            await invoke("set_mode", { mode: next });
-            modeRef.current = next;
-            setMode(next);
-            setSettings((current) => ({ ...current, mode: next }));
-          } catch (error) {
-            setLastError(String(error));
-          }
+        listen("hotkey://hands-free-polish-toggle", () => {
+          invoke("toggle_hands_free_recording_for_mode", { mode: "polish" }).catch((error) =>
+            setLastError(String(error))
+          );
         }),
       ]);
 
@@ -157,8 +151,8 @@ function App() {
           rawText={lastRawText}
           elapsedMs={recordingStartedAt ? now - recordingStartedAt : 0}
           pushToTalk={settings.push_to_talk_hotkey}
-          handsFree={settings.hands_free_hotkey}
-          toggleMode={settings.toggle_mode_hotkey}
+          handsFreeRaw={settings.hands_free_raw_hotkey}
+          handsFreePolish={settings.hands_free_polish_hotkey}
         />
 
         {lastError && (

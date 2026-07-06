@@ -7,29 +7,33 @@ use crate::settings::HotkeyBinding;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotkeySet {
     pub push_to_talk: HotkeyBinding,
-    pub hands_free: HotkeyBinding,
-    pub toggle_mode: HotkeyBinding,
+    pub hands_free_raw: HotkeyBinding,
+    pub hands_free_polish: HotkeyBinding,
 }
 
 impl HotkeySet {
     pub fn new(
         push_to_talk: HotkeyBinding,
-        hands_free: HotkeyBinding,
-        toggle_mode: HotkeyBinding,
+        hands_free_raw: HotkeyBinding,
+        hands_free_polish: HotkeyBinding,
     ) -> Self {
         Self {
             push_to_talk,
-            hands_free,
-            toggle_mode,
+            hands_free_raw,
+            hands_free_polish,
         }
     }
 
     pub fn validate_and_normalize(mut self) -> Result<Self, String> {
         self.push_to_talk = normalize_binding(&self.push_to_talk)?;
-        self.hands_free = normalize_binding(&self.hands_free)?;
-        self.toggle_mode = normalize_binding(&self.toggle_mode)?;
+        self.hands_free_raw = normalize_binding(&self.hands_free_raw)?;
+        self.hands_free_polish = normalize_binding(&self.hands_free_polish)?;
 
-        let bindings = [&self.push_to_talk, &self.hands_free, &self.toggle_mode];
+        let bindings = [
+            &self.push_to_talk,
+            &self.hands_free_raw,
+            &self.hands_free_polish,
+        ];
         let mut seen = HashSet::new();
         for binding in bindings {
             let signature = binding_signature(binding);
@@ -145,8 +149,8 @@ mod windows_impl {
     use super::{HotkeyBinding, HotkeySet};
 
     const HOTKEY_PUSH_TO_TALK: i32 = 1;
-    const HOTKEY_HANDS_FREE: i32 = 2;
-    const HOTKEY_TOGGLE_MODE: i32 = 3;
+    const HOTKEY_HANDS_FREE_RAW: i32 = 2;
+    const HOTKEY_HANDS_FREE_POLISH: i32 = 3;
 
     static MANAGER: OnceLock<HotkeyManager> = OnceLock::new();
     static PTT_POLLING: AtomicBool = AtomicBool::new(false);
@@ -217,8 +221,8 @@ mod windows_impl {
             tracing::info!(
                 "Global hotkeys registered: {}, {}, {}",
                 current.push_to_talk.display(),
-                current.hands_free.display(),
-                current.toggle_mode.display()
+                current.hands_free_raw.display(),
+                current.hands_free_polish.display()
             );
         }
 
@@ -262,11 +266,11 @@ mod windows_impl {
                             });
                         }
                     }
-                    HOTKEY_HANDS_FREE => {
-                        let _ = app.emit("hotkey://hands-free-toggle", ());
+                    HOTKEY_HANDS_FREE_RAW => {
+                        let _ = app.emit("hotkey://hands-free-raw-toggle", ());
                     }
-                    HOTKEY_TOGGLE_MODE => {
-                        let _ = app.emit("hotkey://toggle-mode", ());
+                    HOTKEY_HANDS_FREE_POLISH => {
+                        let _ = app.emit("hotkey://hands-free-polish-toggle", ());
                     }
                     _ => {}
                 }
@@ -295,8 +299,8 @@ mod windows_impl {
     fn register_set(bindings: &HotkeySet) -> Result<(), String> {
         let entries = [
             (HOTKEY_PUSH_TO_TALK, &bindings.push_to_talk),
-            (HOTKEY_HANDS_FREE, &bindings.hands_free),
-            (HOTKEY_TOGGLE_MODE, &bindings.toggle_mode),
+            (HOTKEY_HANDS_FREE_RAW, &bindings.hands_free_raw),
+            (HOTKEY_HANDS_FREE_POLISH, &bindings.hands_free_polish),
         ];
         let mut registered = Vec::new();
         for (id, binding) in entries {
@@ -318,7 +322,11 @@ mod windows_impl {
     }
 
     fn unregister_all() {
-        for id in [HOTKEY_PUSH_TO_TALK, HOTKEY_HANDS_FREE, HOTKEY_TOGGLE_MODE] {
+        for id in [
+            HOTKEY_PUSH_TO_TALK,
+            HOTKEY_HANDS_FREE_RAW,
+            HOTKEY_HANDS_FREE_POLISH,
+        ] {
             let _ = unsafe { UnregisterHotKey(None, id) };
         }
     }
@@ -417,7 +425,7 @@ mod tests {
         let duplicate = HotkeyBinding::push_to_talk_default();
         let set = HotkeySet::new(
             duplicate.clone(),
-            HotkeyBinding::hands_free_default(),
+            HotkeyBinding::hands_free_raw_default(),
             duplicate,
         );
         assert!(set.validate_and_normalize().is_err());

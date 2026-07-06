@@ -327,8 +327,8 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
   const updateHotkey = (
     key:
       | "push_to_talk_hotkey"
-      | "hands_free_hotkey"
-      | "toggle_mode_hotkey",
+      | "hands_free_raw_hotkey"
+      | "hands_free_polish_hotkey",
     binding: HotkeyBinding
   ) => {
     setSettings((current) => ({ ...current, [key]: binding }));
@@ -347,8 +347,8 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
   const validateHotkeys = (): string | null => {
     const bindings = [
       settings.push_to_talk_hotkey,
-      settings.hands_free_hotkey,
-      settings.toggle_mode_hotkey,
+      settings.hands_free_raw_hotkey,
+      settings.hands_free_polish_hotkey,
     ];
     if (bindings.some((binding) => !binding.key)) {
       return "すべてのショートカットを設定してください。";
@@ -1077,15 +1077,15 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
               onError={setHotkeyError}
             />
             <HotkeyField
-              label="ハンズフリー録音"
-              value={settings.hands_free_hotkey}
-              onChange={(binding) => updateHotkey("hands_free_hotkey", binding)}
+              label="Rawハンズフリー"
+              value={settings.hands_free_raw_hotkey}
+              onChange={(binding) => updateHotkey("hands_free_raw_hotkey", binding)}
               onError={setHotkeyError}
             />
             <HotkeyField
-              label="モード切替"
-              value={settings.toggle_mode_hotkey}
-              onChange={(binding) => updateHotkey("toggle_mode_hotkey", binding)}
+              label="Polishハンズフリー"
+              value={settings.hands_free_polish_hotkey}
+              onChange={(binding) => updateHotkey("hands_free_polish_hotkey", binding)}
               onError={setHotkeyError}
             />
             <p className="settings-note">
