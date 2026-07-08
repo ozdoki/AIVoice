@@ -7,7 +7,7 @@ use tauri::{
 /// トレイアイコンのツールチップを現在の録音状態とモードで更新する。
 pub fn update_status(app: &AppHandle, recording_state: &str, mode: &str) {
     if let Some(tray) = app.tray_by_id("main-tray") {
-        let _ = tray.set_tooltip(Some(&format!("AIVoice  {mode}  {recording_state}")));
+        let _ = tray.set_tooltip(Some(&format!("KoeType  {mode}  {recording_state}")));
     }
 }
 
@@ -17,13 +17,13 @@ const MENU_QUIT: &str = "quit";
 /// システムトレイアイコンを作成し登録する。
 pub fn create(app: &AppHandle) -> anyhow::Result<()> {
     let menu = MenuBuilder::new(app)
-        .text(MENU_SHOW, "AIVoice を表示")
+        .text(MENU_SHOW, "KoeType を表示")
         .separator()
         .text(MENU_QUIT, "終了")
         .build()?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
-        .tooltip("AIVoice")
+        .tooltip("KoeType")
         .menu(&menu)
         .show_menu_on_left_click(false);
 

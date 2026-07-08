@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/schema/acl/capability.json",
   "identifier": "default",
-  "description": "Default capability for AIVoice",
+  "description": "Default capability for KoeType",
   "windows": ["main", "floating-bar"],
   "permissions": [
     "core:default",

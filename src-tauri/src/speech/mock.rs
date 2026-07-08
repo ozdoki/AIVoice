@@ -10,7 +10,7 @@ pub struct MockSpeechProvider {
 impl Default for MockSpeechProvider {
     fn default() -> Self {
         Self {
-            fixed_text: "こんにちは、AIVoice のテスト入力です。".to_string(),
+            fixed_text: "こんにちは、KoeType のテスト入力です。".to_string(),
         }
     }
 }

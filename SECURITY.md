@@ -2,7 +2,7 @@
 
 ## Supported scope
 
-AIVoice is an early-stage Windows-first desktop app. Security review currently focuses on:
+KoeType is an early-stage Windows-first desktop app. Security review currently focuses on:
 
 - API key handling and local secret storage
 - Tauri command exposure and desktop permissions
@@ -26,7 +26,7 @@ Include:
 
 ## Local data and secrets
 
-AIVoice is designed for BYOK usage. OpenAI API keys should be stored through the app UI and saved in Windows Credential Manager. API keys must not be committed to the repository, written to logs, or included in screenshots or issue reports.
+KoeType is designed for BYOK usage. OpenAI API keys should be stored through the app UI and saved in Windows Credential Manager. API keys must not be committed to the repository, written to logs, or included in screenshots or issue reports.
 
 Local history, dictionary, snippets, usage summaries, and recovery data may contain private user content. Treat those files as sensitive user data.
 

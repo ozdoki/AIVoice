@@ -215,7 +215,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
   const loadLocalData = async () => {
     try {
       if (!isTauri) {
-        setDictionaryWords(["Obsidian", "AIVoice", "Antigravity"]);
+        setDictionaryWords(["Obsidian", "KoeType", "Antigravity"]);
         setDictionarySuggestions([
           { word: "Slack", count: 3 },
           { word: "Cursor", count: 2 },
@@ -772,7 +772,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
     try {
       const context = isTauri
         ? await invoke<FocusedAppContext | null>("get_focused_app_context")
-        : { process_name: "Code.exe", window_title: "AIVoice" };
+        : { process_name: "Code.exe", window_title: "KoeType" };
       setFocusedContext(context);
     } catch (contextError) {
       setError(`コンテキストを取得できませんでした: ${contextError}`);
@@ -1355,7 +1355,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                   }))
                 }
               />
-              <span>ログイン時にAIVoiceを起動する</span>
+              <span>ログイン時にKoeTypeを起動する</span>
             </label>
           </SettingsSection>
 

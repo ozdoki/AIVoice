@@ -284,7 +284,7 @@ mod tests {
 
         let code = FocusedAppContext {
             process_name: "Code.exe".to_string(),
-            window_title: "AIVoice - Visual Studio Code".to_string(),
+            window_title: "KoeType - Visual Studio Code".to_string(),
         };
         assert!(app_style_hint(Some(&code)).contains("IDE or terminal"));
 
@@ -311,7 +311,7 @@ mod tests {
 
         let code = FocusedAppContext {
             process_name: "Code.exe".to_string(),
-            window_title: "AIVoice - Visual Studio Code".to_string(),
+            window_title: "KoeType - Visual Studio Code".to_string(),
         };
         assert_eq!(suggested_polish_preset(Some(&code), "memo"), "technical");
 

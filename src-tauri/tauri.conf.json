@@ -1,5 +1,5 @@
 {
-  "productName": "AIVoice",
+  "productName": "KoeType",
   "version": "0.1.0",
   "identifier": "com.aivoice.app",
   "build": {
@@ -12,7 +12,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "AIVoice",
+        "title": "KoeType",
         "width": 400,
         "height": 600,
         "resizable": true,
@@ -20,7 +20,7 @@
       },
       {
         "label": "floating-bar",
-        "title": "AIVoice",
+        "title": "KoeType",
         "width": 380,
         "height": 190,
         "resizable": false,

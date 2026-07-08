@@ -130,7 +130,7 @@ function App() {
   return (
     <main className="app-shell">
       <header className="app-header">
-        <h1 className="app-title">AIVoice</h1>
+        <h1 className="app-title">KoeType</h1>
         <button
           className="icon-button settings-button"
           onClick={() => setShowSettings(true)}
