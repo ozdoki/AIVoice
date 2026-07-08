@@ -10,7 +10,7 @@ if (-not (Test-Path $exePath)) {
 
 Get-Process -Name "aivoice" -ErrorAction SilentlyContinue |
   ForEach-Object {
-    Write-Host "Stopping AIVoice process $($_.Id): $($_.Path)"
+    Write-Host "Stopping KoeType process $($_.Id): $($_.Path)"
     Stop-Process -Id $_.Id -Force
   }
 

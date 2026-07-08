@@ -155,7 +155,7 @@ mod tests {
             SYSTEM_PROMPT,
             "slack",
             "短く自然にする",
-            &["Obsidian".to_string(), "AIVoice".to_string()],
+            &["Obsidian".to_string(), "KoeType".to_string()],
             Some(&context),
         );
         assert!(prompt.contains("短く自然にする"));

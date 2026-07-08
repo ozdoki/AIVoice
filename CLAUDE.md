@@ -1,4 +1,4 @@
-# AIVoice
+# KoeType
 
 ## プロジェクト概要
 - Windows 先行の音声入力アプリ。

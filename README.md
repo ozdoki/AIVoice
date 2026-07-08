@@ -1,12 +1,12 @@
-# AIVoice
+# KoeType
 
-AIVoice は、個人利用を前提にした Windows 先行の音声入力アプリです。`Raw` モードでは発話をできるだけそのまま入力し、`Polish` モードでは発話を用途に合う文章へ整えてから入力します。
+KoeType は、個人利用を前提にした Windows 先行の音声入力アプリです。`Raw` モードでは発話をできるだけそのまま入力し、`Polish` モードでは発話を用途に合う文章へ整えてから入力します。
 
 BYOK（自分の OpenAI API キー）で使い、設定・辞書・履歴はローカルに保存します。
 
 ## OSS としての目的
 
-AIVoice は、個人が安全に BYOK で使える音声入力アプリの実装例として公開しています。Tauri / Rust / React による Windows デスクトップアプリで、OpenAI 互換 ASR、ローカル設定、Windows Credential Manager、履歴復元、テキスト注入を組み合わせた実用的な構成を検証します。
+KoeType は、個人が安全に BYOK で使える音声入力アプリの実装例として公開しています。Tauri / Rust / React による Windows デスクトップアプリで、OpenAI 互換 ASR、ローカル設定、Windows Credential Manager、履歴復元、テキスト注入を組み合わせた実用的な構成を検証します。
 
 特に以下を重視します。
 

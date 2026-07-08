@@ -1,10 +1,10 @@
-# Contributing to AIVoice
+# Contributing to KoeType
 
-Thanks for your interest in AIVoice. This project is early-stage and currently prioritizes a small, stable Windows-first voice input workflow.
+Thanks for your interest in KoeType. This project is early-stage and currently prioritizes a small, stable Windows-first voice input workflow.
 
 ## Project direction
 
-AIVoice focuses on:
+KoeType focuses on:
 
 - Local-first desktop usage
 - BYOK OpenAI-compatible speech recognition and text polishing

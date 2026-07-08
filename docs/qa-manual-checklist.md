@@ -1,4 +1,4 @@
-# AIVoice Manual QA Checklist
+# KoeType Manual QA Checklist
 
 ## Realtime fallback
 
@@ -34,7 +34,7 @@ corepack pnpm run app:restart
 ## Launch at login
 
 1. Open Settings.
-2. Turn on `ログイン時にAIVoiceを起動する` and save.
+2. Turn on `ログイン時にKoeTypeを起動する` and save.
 3. Confirm `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AIVoice` exists.
 4. Turn it off and save.
 5. Confirm the same Run value is removed.
@@ -49,9 +49,9 @@ Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Na
 
 1. Focus Notepad or another target app.
 2. Type or click in the target input area.
-3. Open AIVoice and click `再注入` from the latest text or history.
+3. Open KoeType and click `再注入` from the latest text or history.
 4. Confirm focus returns to the target app and text is pasted there.
-5. If no target was recorded, confirm AIVoice shows a clear message asking to click the input target first.
+5. If no target was recorded, confirm KoeType shows a clear message asking to click the input target first.
 
 ## Onboarding test recording
 

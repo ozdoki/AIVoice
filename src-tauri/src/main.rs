@@ -26,7 +26,7 @@ fn main() {
             if app.get_webview_window("main").is_none() {
                 startup_debug("setup: main missing, building");
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                    .title("AIVoice")
+                    .title("KoeType")
                     .inner_size(400.0, 600.0)
                     .resizable(true)
                     .visible(true)

@@ -588,8 +588,8 @@ mod tests {
         let history = vec![
             HistoryEntry {
                 id: "1".to_string(),
-                raw_text: "AIVoice と gpt-realtime-whisper をObsidianで使う".to_string(),
-                final_text: "AIVoice と gpt-realtime-whisper を Obsidian で使う".to_string(),
+                raw_text: "KoeType と gpt-realtime-whisper をObsidianで使う".to_string(),
+                final_text: "KoeType と gpt-realtime-whisper を Obsidian で使う".to_string(),
                 mode: Mode::Raw,
                 duration_ms: 1000,
                 created_at: 0,
@@ -599,8 +599,8 @@ mod tests {
             },
             HistoryEntry {
                 id: "2".to_string(),
-                raw_text: "Slack と AIVoice のテスト".to_string(),
-                final_text: "Slack と AIVoice のテスト".to_string(),
+                raw_text: "Slack と KoeType のテスト".to_string(),
+                final_text: "Slack と KoeType のテスト".to_string(),
                 mode: Mode::Polish,
                 duration_ms: 1000,
                 created_at: 0,
@@ -611,7 +611,7 @@ mod tests {
         ];
         let suggestions = dictionary_suggestions_from_history(&history, &["Slack".to_string()]);
         let words: Vec<&str> = suggestions.iter().map(|item| item.word.as_str()).collect();
-        assert!(words.contains(&"AIVoice"));
+        assert!(words.contains(&"KoeType"));
         assert!(words.contains(&"gpt-realtime-whisper"));
         assert!(words.contains(&"Obsidian"));
         assert!(!words.contains(&"Slack"));
