@@ -36,6 +36,7 @@ Raw モード（そのまま）と Polish モード（LLM で整形）を Ctrl+S
 | audio://level Rust emit（WASAPI RMS） | ✅ | キャプチャループ内で RMS 計算 → UnboundedSender 経由で転送タスクが emit |
 | フローティングバー（Phase 1） | ✅ | floating-bar ウィンドウ。ピル型・透明背景・音量連動波形バー・タスクバー上配置 |
 | MockTrigger 削除 | ✅ | 開発 UI から完全に除去 |
+| Quiet Fluent UI リデザイン | ✅ | Windows 11 Fluent 系ダークUI。メイン画面・設定モーダル・フローティングバーを統一 |
 
 ---
 
@@ -73,4 +74,4 @@ Raw モード（そのまま）と Polish モード（LLM で整形）を Ctrl+S
 
 ## 最終更新
 
-2026-03-26（Phase 0/1 完了: セッション状態 Rust emit・フローティングバー・api_key バグ修正）
+2026-06-12（Quiet Fluent UI リデザイン・Fluent System Icons 導入・デザインQA完了）

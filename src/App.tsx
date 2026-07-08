@@ -1,136 +1,203 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Dismiss20Regular, Settings24Regular } from "@fluentui/react-icons";
 import { ModeSwitch } from "./components/ModeSwitch";
+import { OnboardingPanel } from "./components/OnboardingPanel";
 import { SessionPanel } from "./components/SessionPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
+import {
+  type AppSettings,
+  type Mode,
+  type RecordingState,
+  type SessionPhase,
+  defaultSettings,
+} from "./types";
 
-type Mode = "raw" | "polish";
-type RecordingState = "idle" | "recording" | "processing";
+const isTauri = "__TAURI_INTERNALS__" in window;
 
 function App() {
+  const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [mode, setMode] = useState<Mode>("raw");
   const modeRef = useRef<Mode>("raw");
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
-  const [lastText, setLastText] = useState<string | null>(null);
+  const [lastText, setLastText] = useState<string | null>(
+    isTauri ? null : "今日の打ち合わせは午後2時からです。"
+  );
+  const [lastRawText, setLastRawText] = useState<string | null>(
+    isTauri ? null : "今日の打ち合わせは午後二時からです"
+  );
+  const [sessionPhase, setSessionPhase] = useState<SessionPhase>("idle");
+  const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
   const [lastError, setLastError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
 
-  // modeRef を常に最新に保つ
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
 
   useEffect(() => {
-    invoke<Mode>("get_mode").then((m) => {
-      setMode(m);
-      modeRef.current = m;
-    }).catch(console.error);
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
   }, []);
 
-  // ホットキーリスナーは1回だけ登録する（mode 変化で再登録しない）
   useEffect(() => {
+    if (!isTauri) return;
+    invoke<AppSettings>("get_settings")
+      .then((loaded) => {
+        setSettings(loaded);
+        setMode(loaded.mode);
+        modeRef.current = loaded.mode;
+        if (!loaded.onboarding_completed || !loaded.has_api_key) {
+          setShowOnboarding(true);
+        }
+      })
+      .catch((error) => setLastError(String(error)));
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) return;
     let disposed = false;
     let unlisteners: Array<() => void> = [];
 
     const setup = async () => {
       const offs = await Promise.all([
-        // Rust から全ウィンドウに配信されるセッション状態イベント
-        listen<{ state: RecordingState; mode: Mode; final_text: string | null; error: string | null }>(
-          "session://state-changed",
-          (event) => {
-            const { state, final_text, error } = event.payload;
-            setRecordingState(state);
-            if (state === "idle") {
-              setLastError(error ?? null);
-              if (final_text) setLastText(final_text);
-            }
+        listen<{
+          state: RecordingState;
+          mode: Mode;
+          phase?: SessionPhase;
+          raw_text: string | null;
+          final_text: string | null;
+          history_id: string | null;
+          error: string | null;
+        }>("session://state-changed", (event) => {
+          const { state, phase, raw_text, final_text, error } = event.payload;
+          setRecordingState(state);
+          setSessionPhase(phase ?? (state === "recording" ? "recording" : state === "processing" ? "transcribing" : "idle"));
+          if (state === "recording") {
+            setRecordingStartedAt(Date.now());
           }
-        ),
-        // ホットキーハンドラは invoke のみ。状態管理は session イベントに委譲。
-        listen("hotkey://start", async () => {
-          try {
-            await invoke("start_recording_session");
-          } catch (e) {
-            console.error(e);
-          }
-        }),
-        listen("hotkey://stop", async () => {
-          try {
-            await invoke<string>("stop_recording_session");
-          } catch (e) {
-            console.error(e);
+          if (state === "idle") {
+            setRecordingStartedAt(null);
+            setLastError(error ?? null);
+            if (raw_text) setLastRawText(raw_text);
+            if (final_text) setLastText(final_text);
           }
         }),
-        listen("hotkey://toggle-mode", async () => {
-          const next: Mode = modeRef.current === "raw" ? "polish" : "raw";
-          try {
-            await invoke("set_mode", { mode: next });
-            modeRef.current = next;
-            setMode(next);
-          } catch (e) {
-            console.error(e);
-          }
+        listen<{ phase: SessionPhase }>("session://phase-changed", (event) => {
+          setSessionPhase(event.payload.phase);
+        }),
+        listen("hotkey://push-to-talk-down", () => {
+          invoke("push_to_talk_down").catch((error) => setLastError(String(error)));
+        }),
+        listen("hotkey://push-to-talk-up", () => {
+          invoke("push_to_talk_up").catch((error) => setLastError(String(error)));
+        }),
+        listen("hotkey://hands-free-raw-toggle", () => {
+          invoke("toggle_hands_free_recording_for_mode", { mode: "raw" }).catch((error) =>
+            setLastError(String(error))
+          );
+        }),
+        listen("hotkey://hands-free-polish-toggle", () => {
+          invoke("toggle_hands_free_recording_for_mode", { mode: "polish" }).catch((error) =>
+            setLastError(String(error))
+          );
         }),
       ]);
 
       if (disposed) {
         offs.forEach((off) => off());
-        return;
+      } else {
+        unlisteners = offs;
       }
-      unlisteners = offs;
     };
 
-    setup().catch(console.error);
-
+    setup().catch((error) => setLastError(String(error)));
     return () => {
       disposed = true;
       unlisteners.forEach((off) => off());
     };
   }, []);
 
+  const handleModeChange = (next: Mode) => {
+    modeRef.current = next;
+    setMode(next);
+    setSettings((current) => ({ ...current, mode: next }));
+  };
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "1.5rem", paddingTop: "2rem" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
-        <h1 style={{ fontSize: "1.5rem", letterSpacing: "0.05em" }}>AIVoice</h1>
+    <main className="app-shell">
+      <header className="app-header">
+        <h1 className="app-title">AIVoice</h1>
         <button
+          className="icon-button settings-button"
           onClick={() => setShowSettings(true)}
           title="設定"
-          style={{
-            background: "transparent",
-            border: "none",
-            cursor: "pointer",
-            fontSize: "1.2rem",
-            color: "#888",
-            padding: "0.2rem",
-            lineHeight: 1,
-          }}
+          aria-label="設定を開く"
         >
-          ⚙
+          <Settings24Regular />
+          <span>設定</span>
         </button>
-      </div>
+      </header>
 
-      <ModeSwitch mode={mode} onModeChange={setMode} />
+      <section className="app-content">
+        <ModeSwitch mode={mode} onModeChange={handleModeChange} />
+        <SessionPanel
+          state={recordingState}
+          phase={sessionPhase}
+          lastText={lastText}
+          rawText={lastRawText}
+          elapsedMs={recordingStartedAt ? now - recordingStartedAt : 0}
+          pushToTalk={settings.push_to_talk_hotkey}
+          handsFreeRaw={settings.hands_free_raw_hotkey}
+          handsFreePolish={settings.hands_free_polish_hotkey}
+        />
 
-      <SessionPanel state={recordingState} lastText={lastText} />
+        {lastError && (
+          <div className="inline-error" role="alert">
+            <span>{lastError}</span>
+            <button
+              className="icon-button"
+              onClick={() => setLastError(null)}
+              aria-label="エラーを閉じる"
+            >
+              <Dismiss20Regular />
+            </button>
+          </div>
+        )}
+      </section>
 
-      {lastError && (
-        <div style={{
-          color: "#c00",
-          background: "#fff0f0",
-          border: "1px solid #fcc",
-          borderRadius: "6px",
-          padding: "0.5rem 1rem",
-          fontSize: "0.85rem",
-          maxWidth: "320px",
-          textAlign: "center",
-        }}>
-          {lastError}
-        </div>
+      {showSettings && (
+        <SettingsPanel
+          onClose={() => setShowSettings(false)}
+          onOpenOnboarding={() => {
+            setShowSettings(false);
+            setShowOnboarding(true);
+          }}
+          onSaved={(next) => {
+            setSettings(next);
+            setMode(next.mode);
+            modeRef.current = next.mode;
+          }}
+        />
       )}
 
-      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
-    </div>
+      {showOnboarding && (
+        <OnboardingPanel
+          settings={settings}
+          recordingState={recordingState}
+          onSettingsSaved={(next) => {
+            setSettings(next);
+            setMode(next.mode);
+            modeRef.current = next.mode;
+          }}
+          onComplete={() => setShowOnboarding(false)}
+          onClose={() => setShowOnboarding(false)}
+        />
+      )}
+    </main>
   );
 }
 

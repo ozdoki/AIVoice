@@ -1,5 +1,6 @@
 pub mod mock;
 pub mod openai_compatible;
+pub mod realtime;
 
 use crate::audio::CapturedAudio;
 

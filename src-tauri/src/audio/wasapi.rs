@@ -1,5 +1,5 @@
-use std::{ptr::null_mut, slice};
 use anyhow::bail;
+use std::{path::PathBuf, ptr::null_mut, slice};
 use tokio::sync::watch;
 use windows::{
     core::GUID,
@@ -20,7 +20,8 @@ use windows::{
     },
 };
 
-use super::types::{AudioDeviceInfo, AudioInput, CapturedAudio};
+use super::types::{AudioChunk, AudioDeviceInfo, AudioInput, CapturedAudio};
+use crate::recovery::WavRecorder;
 
 const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
@@ -45,13 +46,25 @@ const SUBTYPE_IEEE_FLOAT: GUID = GUID::from_values(
 pub struct WasapiInput {
     pub device_id: Option<String>,
     pub level_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
+    pub chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<AudioChunk>>,
+    pub wav_path: Option<PathBuf>,
 }
 
 impl AudioInput for WasapiInput {
     fn capture_blocking(&self, stop_rx: watch::Receiver<bool>) -> anyhow::Result<CapturedAudio> {
-        unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
-        let result = capture_inner(stop_rx, self.device_id.as_deref(), self.level_tx.clone());
-        unsafe { CoUninitialize(); }
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let result = capture_inner(
+            stop_rx,
+            self.device_id.as_deref(),
+            self.level_tx.clone(),
+            self.chunk_tx.clone(),
+            self.wav_path.clone(),
+        );
+        unsafe {
+            CoUninitialize();
+        }
         result
     }
 }
@@ -67,14 +80,15 @@ pub fn list_capture_devices() -> anyhow::Result<Vec<AudioDeviceInfo>> {
 }
 
 unsafe fn list_devices_inner() -> anyhow::Result<Vec<AudioDeviceInfo>> {
-    use windows::Win32::Media::Audio::DEVICE_STATE_ACTIVE;
-    use windows::Win32::System::Com::{CoTaskMemFree, STGM_READ};
-    use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
-    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
     use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+    use windows::Win32::Media::Audio::DEVICE_STATE_ACTIVE;
+    use windows::Win32::System::Com::StructuredStorage::{
+        PropVariantClear, PropVariantToStringAlloc,
+    };
+    use windows::Win32::System::Com::{CoTaskMemFree, STGM_READ};
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
-    let enumerator: IMMDeviceEnumerator =
-        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+    let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
     let collection = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
     let count = collection.GetCount()?;
 
@@ -111,7 +125,9 @@ struct CaptureFormat {
 }
 
 fn rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() { return 0.0; }
+    if samples.is_empty() {
+        return 0.0;
+    }
     (samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
@@ -119,6 +135,8 @@ fn capture_inner(
     stop_rx: watch::Receiver<bool>,
     device_id: Option<&str>,
     level_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
+    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<AudioChunk>>,
+    wav_path: Option<PathBuf>,
 ) -> anyhow::Result<CapturedAudio> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
@@ -164,6 +182,10 @@ fn capture_inner(
         client.Start()?;
 
         let mut samples: Vec<f32> = Vec::new();
+        let mut writer = match wav_path.as_ref() {
+            Some(path) => Some(WavRecorder::create(path, fmt.sample_rate, fmt.channels)?),
+            None => None,
+        };
 
         loop {
             if *stop_rx.borrow() {
@@ -184,17 +206,56 @@ fn capture_inner(
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
                 let sample_count = frames as usize * fmt.channels as usize;
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                    if let Some(tx) = &level_tx { let _ = tx.send(0.0); }
-                    samples.resize(samples.len() + sample_count, 0.0f32);
+                    if let Some(tx) = &level_tx {
+                        let _ = tx.send(0.0);
+                    }
+                    if let Some(tx) = &chunk_tx {
+                        let _ = tx.send(AudioChunk {
+                            samples: vec![0.0; sample_count],
+                            sample_rate: fmt.sample_rate,
+                            channels: fmt.channels,
+                        });
+                    }
+                    if let Some(writer) = &mut writer {
+                        writer.write_silence(sample_count)?;
+                    } else {
+                        samples.resize(samples.len() + sample_count, 0.0f32);
+                    }
                 } else if fmt.is_float {
                     let src = slice::from_raw_parts(data as *const f32, sample_count);
-                    if let Some(tx) = &level_tx { let _ = tx.send(rms(src)); }
-                    samples.extend_from_slice(src);
+                    if let Some(tx) = &level_tx {
+                        let _ = tx.send(rms(src));
+                    }
+                    if let Some(tx) = &chunk_tx {
+                        let _ = tx.send(AudioChunk {
+                            samples: src.to_vec(),
+                            sample_rate: fmt.sample_rate,
+                            channels: fmt.channels,
+                        });
+                    }
+                    if let Some(writer) = &mut writer {
+                        writer.write_f32_samples(src)?;
+                    } else {
+                        samples.extend_from_slice(src);
+                    }
                 } else {
                     let src = slice::from_raw_parts(data as *const i16, sample_count);
                     let normalized: Vec<f32> = src.iter().map(|&v| v as f32 / 32768.0).collect();
-                    if let Some(tx) = &level_tx { let _ = tx.send(rms(&normalized)); }
-                    samples.extend(normalized);
+                    if let Some(tx) = &level_tx {
+                        let _ = tx.send(rms(&normalized));
+                    }
+                    if let Some(tx) = &chunk_tx {
+                        let _ = tx.send(AudioChunk {
+                            samples: normalized.clone(),
+                            sample_rate: fmt.sample_rate,
+                            channels: fmt.channels,
+                        });
+                    }
+                    if let Some(writer) = &mut writer {
+                        writer.write_i16_samples(src)?;
+                    } else {
+                        samples.extend(normalized);
+                    }
                 }
                 capture.ReleaseBuffer(frames)?;
             }
@@ -202,11 +263,17 @@ fn capture_inner(
 
         client.Stop().ok();
         CloseHandle(event).ok();
+        let wav_info = match writer {
+            Some(writer) => Some(writer.finalize()?),
+            None => None,
+        };
 
         Ok(CapturedAudio {
             samples,
-            sample_rate: fmt.sample_rate,
-            channels: fmt.channels,
+            sample_rate: wav_info.map_or(fmt.sample_rate, |info| info.sample_rate),
+            channels: wav_info.map_or(fmt.channels, |info| info.channels),
+            wav_path,
+            frame_count: wav_info.map_or(0, |info| info.frame_count),
         })
     }
 }

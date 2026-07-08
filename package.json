@@ -2,12 +2,17 @@
   "name": "aivoice",
   "private": true,
   "version": "0.1.0",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "typecheck": "tsc --noEmit",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build": "tauri build --no-bundle",
+    "app:restart": "powershell -ExecutionPolicy Bypass -File scripts/restart-aivoice-release.ps1",
+    "app:restart:fallback-qa": "powershell -ExecutionPolicy Bypass -File scripts/restart-aivoice-fallback-qa.ps1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.10.1",
@@ -15,9 +20,10 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
     "typescript": "^6.0.2",
-    "vite": "^8.0.2"
+    "vite": "^8.0.16"
   },
   "dependencies": {
+    "@fluentui/react-icons": "^2.0.329",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-global-shortcut": "^2.3.1",
     "@tauri-apps/plugin-store": "^2.4.2",

@@ -1,16 +1,3 @@
-/// F4 キーの物理的な解放を待ってからテキストを注入する。
-///
-/// F4 キーアップイベントと SendInput の競合を防ぐためのバリア。
-/// タイムアウト（250ms）を超えた場合はそのまま注入を続行する。
-pub fn inject_text_after_f4(text: &str) -> anyhow::Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        const VK_F4: i32 = 0x73;
-        wait_until_key_up(VK_F4, 250);
-    }
-    inject_text(text)
-}
-
 /// テキストをフォーカス中のアプリのカーソル位置に注入する。
 ///
 /// クリップボード + Ctrl+V 経由で注入する（日本語 IME と干渉しない唯一の安全な経路）。
@@ -28,25 +15,13 @@ pub fn inject_text(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 指定した仮想キーが解放されるまで待つ。timeout_ms を超えたら打ち切る。
-#[cfg(target_os = "windows")]
-fn wait_until_key_up(vk: i32, timeout_ms: u64) {
-    use std::time::{Duration, Instant};
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    while Instant::now() < deadline {
-        // GetAsyncKeyState の最上位ビットが 1 → キー押下中
-        let is_down = unsafe { GetAsyncKeyState(vk) } < 0;
-        if !is_down {
-            // キーが離れた後、入力キューが安定するまで少し待つ
-            std::thread::sleep(Duration::from_millis(30));
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+pub fn inject_text_to_window(
+    text: &str,
+    target: &crate::context::FocusedWindowTarget,
+) -> anyhow::Result<()> {
+    crate::context::focus_window(target)?;
+    inject_text(text)
 }
-
 
 #[cfg(target_os = "windows")]
 fn clipboard_paste(text: &str) -> anyhow::Result<()> {

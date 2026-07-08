@@ -1,5 +1,5 @@
-use crate::audio::CapturedAudio;
 use super::SpeechProvider;
+use crate::audio::CapturedAudio;
 
 /// モック実装。マイクや API なしで固定文字列を返す。
 /// 「モック縦切り」検証用。

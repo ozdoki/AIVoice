@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 use tokio::sync::watch;
 
 /// 音声入力デバイスの情報。
@@ -14,10 +14,23 @@ pub struct CapturedAudio {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub channels: u16,
+    pub wav_path: Option<PathBuf>,
+    pub frame_count: usize,
+}
+
+/// 録音中にRealtime ASRへ送る音声チャンク。samples は interleaved PCM (-1.0..1.0)。
+#[derive(Debug, Clone)]
+pub struct AudioChunk {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub channels: u16,
 }
 
 impl CapturedAudio {
     pub fn frames(&self) -> usize {
+        if self.frame_count > 0 {
+            return self.frame_count;
+        }
         self.samples.len() / self.channels.max(1) as usize
     }
 

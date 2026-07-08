@@ -1,14 +1,24 @@
+use std::fs;
+
 use anyhow::Context;
+use futures_util::StreamExt;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
-use crate::audio::CapturedAudio;
 use super::SpeechProvider;
+use crate::{audio::CapturedAudio, context::FocusedAppContext};
+
+const TRANSCRIPTION_LANGUAGE: &str = "ja";
+const TRANSCRIPTION_TEMPERATURE: &str = "0";
 
 pub struct OpenAiCompatibleProvider {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub dictionary_words: Vec<String>,
+    pub focused_context: Option<FocusedAppContext>,
+    pub partial_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 #[derive(Deserialize)]
@@ -50,20 +60,106 @@ fn encode_wav(audio: &CapturedAudio) -> Vec<u8> {
     buf
 }
 
+fn build_transcription_prompt(
+    dictionary_words: &[String],
+    focused_context: Option<&FocusedAppContext>,
+) -> Option<String> {
+    let mut sections = Vec::new();
+    if !dictionary_words.is_empty() {
+        sections.push(format!(
+            "以下の専門用語・固有名詞を、音声と一致する場合は優先して認識してください: {}",
+            dictionary_words.join(", ")
+        ));
+    }
+    if let Some(context) = focused_context {
+        let mut lines = Vec::new();
+        if !context.process_name.trim().is_empty() {
+            lines.push(format!("入力先アプリ: {}", context.process_name.trim()));
+        }
+        if !context.window_title.trim().is_empty() {
+            lines.push(format!(
+                "入力先ウィンドウタイトル: {}",
+                context.window_title.trim()
+            ));
+        }
+        if !lines.is_empty() {
+            sections.push(lines.join("\n"));
+        }
+    }
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n"))
+    }
+}
+
+fn supports_file_streaming(model: &str) -> bool {
+    matches!(
+        model.trim(),
+        "gpt-4o-transcribe" | "gpt-4o-mini-transcribe" | "gpt-4o-transcribe-diarize"
+    )
+}
+
+fn batch_transcription_model(model: &str) -> String {
+    if crate::speech::realtime::supports_realtime_model(model) {
+        "gpt-4o-mini-transcribe".to_string()
+    } else {
+        model.to_string()
+    }
+}
+
+fn parse_transcript_event(line: &str) -> Option<(String, String)> {
+    let payload = line.strip_prefix("data:").unwrap_or(line).trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let event_type = json.get("type")?.as_str()?;
+    match event_type {
+        "transcript.text.delta" => json
+            .get("delta")
+            .and_then(|value| value.as_str())
+            .map(|delta| (event_type.to_string(), delta.to_string())),
+        "transcript.text.done" => json
+            .get("text")
+            .or_else(|| json.get("transcript"))
+            .and_then(|value| value.as_str())
+            .map(|text| (event_type.to_string(), text.to_string())),
+        _ => None,
+    }
+}
+
 #[async_trait::async_trait]
 impl SpeechProvider for OpenAiCompatibleProvider {
     async fn transcribe(&self, audio: &CapturedAudio) -> anyhow::Result<String> {
-        let wav = encode_wav(audio);
+        let wav = match &audio.wav_path {
+            Some(path) => fs::read(path).context("ASR audio file read failed")?,
+            None => encode_wav(audio),
+        };
         let client = reqwest::Client::new();
 
         let part = Part::bytes(wav)
             .file_name("audio.wav")
             .mime_str("audio/wav")?;
-        let form = Form::new()
+        let batch_model = batch_transcription_model(&self.model);
+        let mut form = Form::new()
             .part("file", part)
-            .text("model", self.model.clone());
+            .text("model", batch_model.clone())
+            .text("language", TRANSCRIPTION_LANGUAGE)
+            .text("temperature", TRANSCRIPTION_TEMPERATURE);
+        if let Some(prompt) =
+            build_transcription_prompt(&self.dictionary_words, self.focused_context.as_ref())
+        {
+            form = form.text("prompt", prompt);
+        }
+        if supports_file_streaming(&batch_model) && self.partial_tx.is_some() {
+            form = form.text("stream", "true").text("response_format", "text");
+        }
 
-        let url = format!("{}/audio/transcriptions", self.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/audio/transcriptions",
+            self.base_url.trim_end_matches('/')
+        );
 
         let resp = client
             .post(&url)
@@ -79,8 +175,95 @@ impl SpeechProvider for OpenAiCompatibleProvider {
             anyhow::bail!("ASR API error {}: {}", status, body);
         }
 
+        if supports_file_streaming(&batch_model) && self.partial_tx.is_some() {
+            let mut stream = resp.bytes_stream();
+            let mut buffer = String::new();
+            let mut final_text = String::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.context("ASR stream read failed")?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(index) = buffer.find('\n') {
+                    let line = buffer[..index].trim().to_string();
+                    buffer = buffer[index + 1..].to_string();
+                    let Some((event_type, text)) = parse_transcript_event(&line) else {
+                        continue;
+                    };
+                    if event_type == "transcript.text.delta" {
+                        if let Some(tx) = &self.partial_tx {
+                            let _ = tx.send(text.clone());
+                        }
+                        final_text.push_str(&text);
+                    } else if event_type == "transcript.text.done" {
+                        final_text = text;
+                    }
+                }
+            }
+            return Ok(final_text.trim().to_string());
+        }
+
         let result: TranscriptionResponse =
             resp.json().await.context("ASR response parse failed")?;
         Ok(result.text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcription_prompt_uses_dictionary_and_context() {
+        let context = FocusedAppContext {
+            process_name: "notepad.exe".to_string(),
+            window_title: "notes".to_string(),
+        };
+        let prompt = build_transcription_prompt(&["Obsidian".to_string()], Some(&context))
+            .expect("prompt should be generated");
+        assert!(prompt.contains("以下の専門用語・固有名詞"));
+        assert!(prompt.contains("Obsidian"));
+        assert!(prompt.contains("入力先アプリ"));
+        assert!(prompt.contains("notepad.exe"));
+        assert!(prompt.contains("入力先ウィンドウタイトル"));
+        assert!(prompt.contains("notes"));
+    }
+
+    #[test]
+    fn transcription_prompt_is_absent_when_empty() {
+        assert!(build_transcription_prompt(&[], None).is_none());
+    }
+
+    #[test]
+    fn detects_file_streaming_models() {
+        assert!(supports_file_streaming("gpt-4o-transcribe"));
+        assert!(supports_file_streaming("gpt-4o-mini-transcribe"));
+        assert!(!supports_file_streaming("whisper-1"));
+    }
+
+    #[test]
+    fn maps_realtime_model_to_batch_fallback_model() {
+        assert_eq!(
+            batch_transcription_model("gpt-realtime-whisper"),
+            "gpt-4o-mini-transcribe"
+        );
+        assert_eq!(
+            batch_transcription_model("gpt-4o-transcribe"),
+            "gpt-4o-transcribe"
+        );
+    }
+
+    #[test]
+    fn parses_transcript_stream_events() {
+        assert_eq!(
+            parse_transcript_event(r#"data: {"type":"transcript.text.delta","delta":"hello"}"#),
+            Some(("transcript.text.delta".to_string(), "hello".to_string()))
+        );
+        assert_eq!(
+            parse_transcript_event(r#"data: {"type":"transcript.text.done","text":"hello world"}"#),
+            Some((
+                "transcript.text.done".to_string(),
+                "hello world".to_string()
+            ))
+        );
+        assert_eq!(parse_transcript_event("data: [DONE]"), None);
     }
 }
