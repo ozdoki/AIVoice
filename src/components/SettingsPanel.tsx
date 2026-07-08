@@ -1647,11 +1647,20 @@ function HotkeyField({
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     event.preventDefault();
     event.stopPropagation();
-    if (event.metaKey) {
+    if (event.metaKey || event.key === "Meta") {
       onError("Windowsキーを含むショートカットには対応していません。");
       return;
     }
-    if (["Control", "Alt", "Shift", "Meta"].includes(event.key)) return;
+    if (["Control", "Alt", "Shift"].includes(event.key)) {
+      onChange({
+        ...value,
+        ctrl: event.key === "Control" ? !value.ctrl : value.ctrl,
+        alt: event.key === "Alt" ? !value.alt : value.alt,
+        shift: event.key === "Shift" ? !value.shift : value.shift,
+      });
+      onError(null);
+      return;
+    }
     const key = normalizeBrowserKey(event.key);
     if (!key) {
       onError(`未対応のキーです: ${event.key}`);

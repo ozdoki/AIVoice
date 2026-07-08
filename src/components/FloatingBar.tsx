@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
-import { LogicalPosition } from "@tauri-apps/api/dpi";
+import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { Stop16Filled } from "@fluentui/react-icons";
 import {
   type AppSettings,
@@ -44,6 +44,42 @@ const POLISH_PRESETS: Array<{ value: PolishPreset; label: string }> = [
   { value: "prompt", label: "Prompt" },
   { value: "technical", label: "Tech" },
 ];
+const FLOATING_BAR_WIDTH = 380;
+const FLOATING_BAR_BOTTOM_GAP = 30;
+const FLOATING_BAR_COMPACT_HEIGHT = 118;
+const FLOATING_BAR_POLISH_HEIGHT = 164;
+const FLOATING_BAR_LIVE_HEIGHT = 190;
+
+function getFloatingBarHeight(
+  isRecording: boolean,
+  nextMode: Mode,
+  showLiveTranscriptInFloatingBar: boolean
+) {
+  if (!isRecording) return FLOATING_BAR_COMPACT_HEIGHT;
+  if (showLiveTranscriptInFloatingBar) return FLOATING_BAR_LIVE_HEIGHT;
+  if (nextMode === "polish") return FLOATING_BAR_POLISH_HEIGHT;
+  return FLOATING_BAR_COMPACT_HEIGHT;
+}
+
+async function resizeAndPositionFloatingWindow(
+  win: ReturnType<typeof getCurrentWindow>,
+  height: number
+) {
+  await win.setSize(new LogicalSize(FLOATING_BAR_WIDTH, height));
+
+  const monitor = await currentMonitor();
+  if (!monitor) return;
+
+  const scale = monitor.scaleFactor;
+  const logW = monitor.size.width / scale;
+  const logH = monitor.size.height / scale;
+  await win.setPosition(
+    new LogicalPosition(
+      logW / 2 - FLOATING_BAR_WIDTH / 2,
+      logH - height - FLOATING_BAR_BOTTOM_GAP
+    )
+  );
+}
 
 export function FloatingBar() {
   const [recordingState, setRecordingState] = useState<RecordingState>(
@@ -123,14 +159,14 @@ export function FloatingBar() {
         setLiveTranscript("");
         setLiveTranscriptError("");
         try {
-          const monitor = await currentMonitor();
-          if (monitor) {
-            const scale = monitor.scaleFactor;
-            const logW = monitor.size.width / scale;
-            const logH = monitor.size.height / scale;
-            // タスクバー（約48px）のちょい上に配置
-            await win.setPosition(new LogicalPosition(logW / 2 - 190, logH - 220));
-          }
+          await resizeAndPositionFloatingWindow(
+            win,
+            getFloatingBarHeight(
+              true,
+              newMode,
+              settings.show_live_transcript_in_floating_bar
+            )
+          );
         } catch { /* モニター取得失敗時はデフォルト位置 */ }
         await win.show();
       } else if (state === "recording") {
@@ -143,6 +179,16 @@ export function FloatingBar() {
         setActivePolishPreset(settings.polish_preset);
         setRecordingStartedAt(null);
         if ((nextPhase === "completed" || nextPhase === "failed") && settings.show_floating_bar) {
+          try {
+            await resizeAndPositionFloatingWindow(
+              win,
+              getFloatingBarHeight(
+                false,
+                newMode,
+                settings.show_live_transcript_in_floating_bar
+              )
+            );
+          } catch { /* モニター取得失敗時はデフォルト位置 */ }
           await win.show();
           window.setTimeout(() => {
             win.hide().catch((error) => console.error(error));
@@ -154,7 +200,30 @@ export function FloatingBar() {
     }).then((off) => { unlistener = off; });
 
     return () => { unlistener?.(); };
-  }, [settings.show_floating_bar]);
+  }, [
+    settings.polish_preset,
+    settings.show_floating_bar,
+    settings.show_live_transcript_in_floating_bar,
+  ]);
+
+  useEffect(() => {
+    if (!isTauri || recordingState !== "recording" || !settings.show_floating_bar) return;
+
+    const win = getCurrentWindow();
+    resizeAndPositionFloatingWindow(
+      win,
+      getFloatingBarHeight(
+        true,
+        mode,
+        settings.show_live_transcript_in_floating_bar
+      )
+    ).catch((error) => console.error(error));
+  }, [
+    mode,
+    recordingState,
+    settings.show_floating_bar,
+    settings.show_live_transcript_in_floating_bar,
+  ]);
 
   useEffect(() => {
     if (!isTauri) return;

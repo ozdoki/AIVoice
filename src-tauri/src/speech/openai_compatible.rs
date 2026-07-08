@@ -7,7 +7,10 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use super::SpeechProvider;
-use crate::{audio::CapturedAudio, context, context::FocusedAppContext};
+use crate::{audio::CapturedAudio, context::FocusedAppContext};
+
+const TRANSCRIPTION_LANGUAGE: &str = "ja";
+const TRANSCRIPTION_TEMPERATURE: &str = "0";
 
 pub struct OpenAiCompatibleProvider {
     pub base_url: String,
@@ -64,13 +67,24 @@ fn build_transcription_prompt(
     let mut sections = Vec::new();
     if !dictionary_words.is_empty() {
         sections.push(format!(
-            "Prefer these custom words and proper nouns when they match the audio: {}",
+            "以下の専門用語・固有名詞を、音声と一致する場合は優先して認識してください: {}",
             dictionary_words.join(", ")
         ));
     }
-    let context_prompt = context::prompt_fragment(focused_context);
-    if !context_prompt.is_empty() {
-        sections.push(context_prompt);
+    if let Some(context) = focused_context {
+        let mut lines = Vec::new();
+        if !context.process_name.trim().is_empty() {
+            lines.push(format!("入力先アプリ: {}", context.process_name.trim()));
+        }
+        if !context.window_title.trim().is_empty() {
+            lines.push(format!(
+                "入力先ウィンドウタイトル: {}",
+                context.window_title.trim()
+            ));
+        }
+        if !lines.is_empty() {
+            sections.push(lines.join("\n"));
+        }
     }
     if sections.is_empty() {
         None
@@ -130,7 +144,9 @@ impl SpeechProvider for OpenAiCompatibleProvider {
         let batch_model = batch_transcription_model(&self.model);
         let mut form = Form::new()
             .part("file", part)
-            .text("model", batch_model.clone());
+            .text("model", batch_model.clone())
+            .text("language", TRANSCRIPTION_LANGUAGE)
+            .text("temperature", TRANSCRIPTION_TEMPERATURE);
         if let Some(prompt) =
             build_transcription_prompt(&self.dictionary_words, self.focused_context.as_ref())
         {
@@ -203,8 +219,12 @@ mod tests {
         };
         let prompt = build_transcription_prompt(&["Obsidian".to_string()], Some(&context))
             .expect("prompt should be generated");
+        assert!(prompt.contains("以下の専門用語・固有名詞"));
         assert!(prompt.contains("Obsidian"));
+        assert!(prompt.contains("入力先アプリ"));
         assert!(prompt.contains("notepad.exe"));
+        assert!(prompt.contains("入力先ウィンドウタイトル"));
+        assert!(prompt.contains("notes"));
     }
 
     #[test]
