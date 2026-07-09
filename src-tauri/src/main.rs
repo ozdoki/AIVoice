@@ -109,6 +109,7 @@ fn main() {
             commands::get_mode,
             commands::set_mode,
             commands::get_recording_state,
+            commands::resize_and_position_floating_bar,
             commands::start_recording_session,
             commands::stop_recording_session,
             commands::start_onboarding_test_recording,

@@ -14,6 +14,14 @@ pub struct FocusedWindowTarget {
     pub window_title: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhysicalRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 #[cfg(target_os = "windows")]
 pub fn focused_window_target() -> Option<FocusedWindowTarget> {
     use std::path::Path;
@@ -103,6 +111,73 @@ pub fn current_external_focused_window() -> Option<FocusedWindowTarget> {
         return None;
     }
     Some(target)
+}
+
+#[cfg(target_os = "windows")]
+fn monitor_work_area_from_hwnd(
+    hwnd: windows::Win32::Foundation::HWND,
+    flags: windows::Win32::Graphics::Gdi::MONITOR_FROM_FLAGS,
+) -> Option<PhysicalRect> {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO};
+
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, flags);
+        if monitor.0.is_null() {
+            return None;
+        }
+
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+
+        Some(PhysicalRect {
+            x: info.rcWork.left,
+            y: info.rcWork.top,
+            width: info.rcWork.right - info.rcWork.left,
+            height: info.rcWork.bottom - info.rcWork.top,
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn window_work_area(target: &FocusedWindowTarget) -> Option<PhysicalRect> {
+    use std::ffi::c_void;
+
+    use windows::Win32::{
+        Foundation::HWND, Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+        UI::WindowsAndMessaging::IsWindow,
+    };
+
+    unsafe {
+        let hwnd = HWND(target.hwnd as *mut c_void);
+        if !IsWindow(hwnd).as_bool() {
+            return None;
+        }
+        monitor_work_area_from_hwnd(hwnd, MONITOR_DEFAULTTONEAREST)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn window_work_area(_target: &FocusedWindowTarget) -> Option<PhysicalRect> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+pub fn primary_work_area() -> Option<PhysicalRect> {
+    use windows::Win32::{
+        Graphics::Gdi::MONITOR_DEFAULTTOPRIMARY, UI::WindowsAndMessaging::GetDesktopWindow,
+    };
+
+    unsafe { monitor_work_area_from_hwnd(GetDesktopWindow(), MONITOR_DEFAULTTOPRIMARY) }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn primary_work_area() -> Option<PhysicalRect> {
+    None
 }
 
 #[cfg(target_os = "windows")]
