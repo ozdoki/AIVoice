@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
-import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Stop16Filled } from "@fluentui/react-icons";
 import {
   type AppSettings,
@@ -44,41 +43,36 @@ const POLISH_PRESETS: Array<{ value: PolishPreset; label: string }> = [
   { value: "prompt", label: "Prompt" },
   { value: "technical", label: "Tech" },
 ];
-const FLOATING_BAR_WIDTH = 380;
-const FLOATING_BAR_BOTTOM_GAP = 30;
-const FLOATING_BAR_COMPACT_HEIGHT = 118;
-const FLOATING_BAR_POLISH_HEIGHT = 164;
-const FLOATING_BAR_LIVE_HEIGHT = 190;
+const FLOATING_BAR_COMPACT_HEIGHT = 104;
+const FLOATING_BAR_POLISH_HEIGHT = 150;
+const FLOATING_BAR_LIVE_HEIGHT = 170;
+const FLOATING_BAR_LIVE_POLISH_HEIGHT = 214;
 
 function getFloatingBarHeight(
   isRecording: boolean,
   nextMode: Mode,
-  showLiveTranscriptInFloatingBar: boolean
+  showLiveStrip: boolean
 ) {
   if (!isRecording) return FLOATING_BAR_COMPACT_HEIGHT;
-  if (showLiveTranscriptInFloatingBar) return FLOATING_BAR_LIVE_HEIGHT;
+  if (showLiveStrip && nextMode === "polish") return FLOATING_BAR_LIVE_POLISH_HEIGHT;
+  if (showLiveStrip) return FLOATING_BAR_LIVE_HEIGHT;
   if (nextMode === "polish") return FLOATING_BAR_POLISH_HEIGHT;
   return FLOATING_BAR_COMPACT_HEIGHT;
 }
 
-async function resizeAndPositionFloatingWindow(
-  win: ReturnType<typeof getCurrentWindow>,
-  height: number
+function hasVisibleLiveStrip(
+  showLiveTranscriptInFloatingBar: boolean,
+  transcript: string,
+  error: string
 ) {
-  await win.setSize(new LogicalSize(FLOATING_BAR_WIDTH, height));
-
-  const monitor = await currentMonitor();
-  if (!monitor) return;
-
-  const scale = monitor.scaleFactor;
-  const logW = monitor.size.width / scale;
-  const logH = monitor.size.height / scale;
-  await win.setPosition(
-    new LogicalPosition(
-      logW / 2 - FLOATING_BAR_WIDTH / 2,
-      logH - height - FLOATING_BAR_BOTTOM_GAP
-    )
+  return (
+    showLiveTranscriptInFloatingBar &&
+    (Boolean(transcript.trim()) || Boolean(error.trim()))
   );
+}
+
+async function resizeAndPositionFloatingWindow(height: number) {
+  await invoke("resize_and_position_floating_bar", { height });
 }
 
 export function FloatingBar() {
@@ -160,11 +154,10 @@ export function FloatingBar() {
         setLiveTranscriptError("");
         try {
           await resizeAndPositionFloatingWindow(
-            win,
             getFloatingBarHeight(
               true,
               newMode,
-              settings.show_live_transcript_in_floating_bar
+              false
             )
           );
         } catch { /* モニター取得失敗時はデフォルト位置 */ }
@@ -181,11 +174,10 @@ export function FloatingBar() {
         if ((nextPhase === "completed" || nextPhase === "failed") && settings.show_floating_bar) {
           try {
             await resizeAndPositionFloatingWindow(
-              win,
               getFloatingBarHeight(
                 false,
                 newMode,
-                settings.show_live_transcript_in_floating_bar
+                false
               )
             );
           } catch { /* モニター取得失敗時はデフォルト位置 */ }
@@ -209,16 +201,20 @@ export function FloatingBar() {
   useEffect(() => {
     if (!isTauri || recordingState !== "recording" || !settings.show_floating_bar) return;
 
-    const win = getCurrentWindow();
     resizeAndPositionFloatingWindow(
-      win,
       getFloatingBarHeight(
         true,
         mode,
-        settings.show_live_transcript_in_floating_bar
+        hasVisibleLiveStrip(
+          settings.show_live_transcript_in_floating_bar,
+          liveTranscript,
+          liveTranscriptError
+        )
       )
     ).catch((error) => console.error(error));
   }, [
+    liveTranscript,
+    liveTranscriptError,
     mode,
     recordingState,
     settings.show_floating_bar,

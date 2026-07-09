@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 use crate::{
     audio,
@@ -87,6 +87,8 @@ struct ModelItem {
 }
 
 const API_KEY_IMPORT_MAX_BYTES: u64 = 64 * 1024;
+const FLOATING_BAR_WIDTH: f64 = 380.0;
+const FLOATING_BAR_BOTTOM_GAP: f64 = 16.0;
 
 #[derive(Debug, PartialEq)]
 enum ShortcutAction {
@@ -329,6 +331,44 @@ pub async fn set_mode(
 #[tauri::command]
 pub async fn get_recording_state(state: State<'_, AppState>) -> Result<RecordingState, String> {
     Ok(state.recording_state.lock().await.clone())
+}
+
+#[tauri::command]
+pub async fn resize_and_position_floating_bar(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    height: f64,
+) -> Result<(), String> {
+    let window = app
+        .get_webview_window("floating-bar")
+        .ok_or_else(|| "floating-bar window not found".to_string())?;
+
+    window
+        .set_size(tauri::LogicalSize::new(FLOATING_BAR_WIDTH, height))
+        .map_err(|error| error.to_string())?;
+
+    let window_size = window.outer_size().map_err(|error| error.to_string())?;
+    let scale = if height > 0.0 {
+        f64::from(window_size.height) / height
+    } else {
+        window.scale_factor().map_err(|error| error.to_string())?
+    };
+    let bottom_gap = (FLOATING_BAR_BOTTOM_GAP * scale).round() as i32;
+    let target = state.last_target_window.lock().await.clone();
+    let work_area = target
+        .as_ref()
+        .and_then(context::window_work_area)
+        .or_else(context::primary_work_area)
+        .ok_or_else(|| "target monitor work area not found".to_string())?;
+
+    let window_width = window_size.width as i32;
+    let window_height = window_size.height as i32;
+    let x = work_area.x + (work_area.width - window_width).max(0) / 2;
+    let y = work_area.y + work_area.height - window_height - bottom_gap;
+
+    window
+        .set_position(tauri::PhysicalPosition::new(x, y))
+        .map_err(|error| error.to_string())
 }
 
 async fn start_recording_locked(
