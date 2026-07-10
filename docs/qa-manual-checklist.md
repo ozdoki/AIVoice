@@ -53,6 +53,28 @@ Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Na
 4. Confirm focus returns to the target app and text is pasted there.
 5. If no target was recorded, confirm KoeType shows a clear message asking to click the input target first.
 
+## Polish paragraph preservation and fallback status
+
+1. Set the Polish model to `gpt-5.4-mini`, select the Slack preset, and save multiline custom instructions that request paragraph breaks at semantic boundaries while prohibiting implicit bullets.
+2. Record explanatory speech with four roles: preface, current behavior, implication, and uncertainty/closing request.
+3. Confirm the latest-text view and history show four prose paragraphs separated by one blank line.
+4. Confirm the history metadata distinguishes `Polish適用`, `Polish・変更なし`, and `Rawフォールバック` from injection success/failure.
+5. Copy the final text into Notepad and confirm the same blank lines remain.
+6. Reinject the history item into Slack and confirm the same paragraph boundaries remain.
+7. Restart KoeType and confirm the history still shows the same paragraph boundaries and Polish result state.
+8. Run `Polish再実行` and repeat the history, copy, and reinjection checks.
+9. Record a short single-topic utterance and confirm it remains one paragraph.
+10. Confirm output contains only the rewritten body, with no explanation or confirmation message.
+
+## Polish preset evaluation harness
+
+1. From `src-tauri`, run `cargo run --example polish_preset_eval -- --list` and confirm every preset has at least two cases.
+2. Run `cargo run --example polish_preset_eval -- --dry-run --output polish-preset-eval-results-dry-run.json` and confirm no credential prompt or network request occurs.
+3. After explicit approval for API usage, run the 10-call baseline command documented in `docs/polish-preset-evaluation.md`.
+4. Confirm the report contains model outputs and machine checks, but no API key or authorization header.
+5. Fill the six `human` scores for every result and apply the documented case and preset gates.
+6. Re-run only failing cases while tuning, then run one full regression suite after all targeted cases pass.
+
 ## Onboarding test recording
 
 1. Open Settings.

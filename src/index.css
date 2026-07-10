@@ -266,6 +266,30 @@ select:focus-visible {
   font-size: 13px;
 }
 
+.section-label-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.polish-result-chip {
+  min-height: 22px;
+  padding: 3px 8px;
+  border: 1px solid rgba(68, 209, 122, 0.35);
+  border-radius: 999px;
+  background: rgba(68, 209, 122, 0.07);
+  color: #8ce2ad;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.polish-result-chip.is-fallback {
+  border-color: rgba(255, 204, 102, 0.4);
+  background: rgba(255, 204, 102, 0.08);
+  color: #ffd98a;
+}
+
 .latest-text-actions {
   display: inline-flex;
   align-items: center;
@@ -320,6 +344,8 @@ select:focus-visible {
   font-size: 16px;
   line-height: 1.6;
   word-break: break-word;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .latest-text.is-empty {
@@ -1083,6 +1109,8 @@ kbd {
   font-size: 13px;
   line-height: 1.5;
   word-break: break-word;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   margin-bottom: 10px;
 }
 

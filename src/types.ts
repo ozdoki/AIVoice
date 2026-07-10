@@ -9,6 +9,15 @@ export type SessionPhase =
   | "completed"
   | "failed";
 export type PolishPreset = "slack" | "email" | "memo" | "prompt" | "technical";
+export type PolishState =
+  | "unknown"
+  | "not_requested"
+  | "applied_changed"
+  | "applied_unchanged"
+  | "fallback_not_configured"
+  | "fallback_request_error"
+  | "fallback_invalid_response"
+  | "fallback_empty_response";
 
 export interface HotkeyBinding {
   ctrl: boolean;
@@ -46,7 +55,47 @@ export interface HistoryEntry {
   created_at: number;
   error: string | null;
   status: "success" | "error";
+  polish_state: PolishState;
   pinned: boolean;
+}
+
+export function polishStateLabel(state: PolishState | null | undefined): string | null {
+  switch (state) {
+    case "applied_changed":
+      return "Polish適用";
+    case "applied_unchanged":
+      return "Polish・変更なし";
+    case "fallback_not_configured":
+    case "fallback_request_error":
+    case "fallback_invalid_response":
+    case "fallback_empty_response":
+      return "Rawフォールバック";
+    default:
+      return null;
+  }
+}
+
+export function polishStateDetail(state: PolishState | null | undefined): string | undefined {
+  switch (state) {
+    case "applied_changed":
+      return "Polish APIが本文を整形しました。";
+    case "applied_unchanged":
+      return "Polish APIは成功しましたが、モデルは元の本文と同じ内容を返しました。";
+    case "fallback_not_configured":
+      return "Polish APIの設定が不足していたため、Raw本文を使用しました。";
+    case "fallback_request_error":
+      return "Polish APIへのリクエストに失敗したため、Raw本文を使用しました。";
+    case "fallback_invalid_response":
+      return "Polish APIの応答を読み取れなかったため、Raw本文を使用しました。";
+    case "fallback_empty_response":
+      return "Polish APIが空の本文を返したため、Raw本文を使用しました。";
+    default:
+      return undefined;
+  }
+}
+
+export function isPolishFallback(state: PolishState | null | undefined): boolean {
+  return Boolean(state?.startsWith("fallback_"));
 }
 
 export interface DictionarySuggestion {

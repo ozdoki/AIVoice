@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
-use crate::state::Mode;
+use crate::{polish::PolishState, state::Mode};
 
 const HISTORY_STORE: &str = "history.json";
 const DICTIONARY_STORE: &str = "dictionary.json";
@@ -33,6 +33,8 @@ pub struct HistoryEntry {
     pub created_at: u64,
     pub error: Option<String>,
     pub status: HistoryStatus,
+    #[serde(default)]
+    pub polish_state: PolishState,
     #[serde(default)]
     pub pinned: bool,
 }
@@ -168,6 +170,7 @@ pub fn make_history_entry(
     mode: Mode,
     duration_ms: u64,
     error: Option<String>,
+    polish_state: PolishState,
 ) -> HistoryEntry {
     let status = if error.is_some() {
         HistoryStatus::Error
@@ -183,6 +186,7 @@ pub fn make_history_entry(
         created_at: now_secs(),
         error,
         status,
+        polish_state,
         pinned: false,
     }
 }
@@ -569,6 +573,7 @@ mod tests {
             Mode::Raw,
             1000,
             Some("failed".to_string()),
+            PolishState::NotRequested,
         );
         assert_eq!(entry.status, HistoryStatus::Error);
     }
@@ -595,6 +600,7 @@ mod tests {
                 created_at: 0,
                 error: None,
                 status: HistoryStatus::Success,
+                polish_state: PolishState::NotRequested,
                 pinned: false,
             },
             HistoryEntry {
@@ -606,6 +612,7 @@ mod tests {
                 created_at: 0,
                 error: None,
                 status: HistoryStatus::Success,
+                polish_state: PolishState::AppliedUnchanged,
                 pinned: false,
             },
         ];
@@ -615,6 +622,36 @@ mod tests {
         assert!(words.contains(&"gpt-realtime-whisper"));
         assert!(words.contains(&"Obsidian"));
         assert!(!words.contains(&"Slack"));
+    }
+
+    #[test]
+    fn history_entry_serde_preserves_blank_lines_and_defaults_legacy_polish_state() {
+        let entry = make_history_entry(
+            "raw".to_string(),
+            "第一段落。\n\n第二段落。".to_string(),
+            Mode::Polish,
+            1000,
+            None,
+            PolishState::AppliedChanged,
+        );
+        let json = serde_json::to_value(&entry).unwrap();
+        let restored: HistoryEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.final_text, "第一段落。\n\n第二段落。");
+        assert_eq!(restored.polish_state, PolishState::AppliedChanged);
+
+        let legacy = serde_json::json!({
+            "id": "legacy",
+            "raw_text": "raw",
+            "final_text": "final",
+            "mode": "polish",
+            "duration_ms": 1000,
+            "created_at": 0,
+            "error": null,
+            "status": "success",
+            "pinned": false
+        });
+        let restored: HistoryEntry = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.polish_state, PolishState::Unknown);
     }
 
     #[test]

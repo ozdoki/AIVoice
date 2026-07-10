@@ -9,6 +9,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import {
   type AppSettings,
   type Mode,
+  type PolishState,
   type RecordingState,
   type SessionPhase,
   defaultSettings,
@@ -26,6 +27,9 @@ function App() {
   );
   const [lastRawText, setLastRawText] = useState<string | null>(
     isTauri ? null : "今日の打ち合わせは午後二時からです"
+  );
+  const [lastPolishState, setLastPolishState] = useState<PolishState | null>(
+    isTauri ? null : "applied_changed"
   );
   const [sessionPhase, setSessionPhase] = useState<SessionPhase>("idle");
   const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
@@ -71,19 +75,22 @@ function App() {
           raw_text: string | null;
           final_text: string | null;
           history_id: string | null;
+          polish_state: PolishState | null;
           error: string | null;
         }>("session://state-changed", (event) => {
-          const { state, phase, raw_text, final_text, error } = event.payload;
+          const { state, phase, raw_text, final_text, polish_state, error } = event.payload;
           setRecordingState(state);
           setSessionPhase(phase ?? (state === "recording" ? "recording" : state === "processing" ? "transcribing" : "idle"));
           if (state === "recording") {
             setRecordingStartedAt(Date.now());
+            setLastPolishState(null);
           }
           if (state === "idle") {
             setRecordingStartedAt(null);
             setLastError(error ?? null);
             if (raw_text) setLastRawText(raw_text);
             if (final_text) setLastText(final_text);
+            setLastPolishState(polish_state ?? null);
           }
         }),
         listen<{ phase: SessionPhase }>("session://phase-changed", (event) => {
@@ -149,6 +156,7 @@ function App() {
           phase={sessionPhase}
           lastText={lastText}
           rawText={lastRawText}
+          polishState={lastPolishState}
           elapsedMs={recordingStartedAt ? now - recordingStartedAt : 0}
           pushToTalk={settings.push_to_talk_hotkey}
           handsFreeRaw={settings.hands_free_raw_hotkey}
