@@ -7,10 +7,14 @@ import {
 } from "@fluentui/react-icons";
 import {
   type HotkeyBinding,
+  type PolishState,
   type RecordingState,
   type SessionPhase,
   formatHotkey,
   hotkeyParts,
+  isPolishFallback,
+  polishStateDetail,
+  polishStateLabel,
 } from "../types";
 
 interface Props {
@@ -18,6 +22,7 @@ interface Props {
   phase: SessionPhase;
   lastText: string | null;
   rawText: string | null;
+  polishState: PolishState | null;
   elapsedMs: number;
   pushToTalk: HotkeyBinding;
   handsFreeRaw: HotkeyBinding;
@@ -37,6 +42,7 @@ export function SessionPanel({
   phase,
   lastText,
   rawText,
+  polishState,
   elapsedMs,
   pushToTalk,
   handsFreeRaw,
@@ -58,6 +64,8 @@ export function SessionPanel({
   const stableText = showRaw && canCompareRaw ? rawText : lastText;
   const displayedText = stableText;
   const displayedLabel = showRaw && canCompareRaw ? "Raw テキスト" : "最後に入力したテキスト";
+  const visiblePolishState = showRaw ? null : polishState;
+  const polishLabel = polishStateLabel(visiblePolishState);
   const phaseLabel: Record<SessionPhase, string> = {
     idle: "待機中",
     recording: "録音中",
@@ -121,7 +129,19 @@ export function SessionPanel({
 
       <div className="latest-text-section">
         <div className="section-heading">
-          <p className="section-label">{displayedLabel}</p>
+          <div className="section-label-row">
+            <p className="section-label">{displayedLabel}</p>
+            {polishLabel && (
+              <span
+                className={`polish-result-chip ${
+                  isPolishFallback(visiblePolishState) ? "is-fallback" : ""
+                }`}
+                title={polishStateDetail(visiblePolishState)}
+              >
+                {polishLabel}
+              </span>
+            )}
+          </div>
           <div className="latest-text-actions">
             {canCompareRaw && (
               <button

@@ -318,6 +318,22 @@ mod tests {
     }
 
     #[test]
+    fn multiline_custom_polish_instructions_survive_serde_roundtrip() {
+        let settings = AppSettings {
+            custom_polish_instructions:
+                "# 整形の粒度\n- 句読点は自然な呼吸位置に。\n- 段落は意味の切れ目で入れる。"
+                    .to_string(),
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            restored.custom_polish_instructions,
+            settings.custom_polish_instructions
+        );
+    }
+
+    #[test]
     fn api_key_not_in_json() {
         let settings = AppSettings {
             api_key: "sk-secret".to_string(),

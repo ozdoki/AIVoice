@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "slack-multi-task",
+      "preset": "slack",
+      "input": "えっと明日の朝までにKoeTypeのfallbackを確認して、gpt-realtime-whisperが失敗したらbatchに入るか見て、終わったらGitHub issueに結果を書いてください。",
+      "required_terms": ["明日の朝", "KoeType", "fallback", "gpt-realtime-whisper", "batch", "GitHub", "issue"],
+      "forbidden_terms": ["完了しました", "検討します"],
+      "required_headings": [],
+      "min_bullets": 2,
+      "min_blank_lines": 0,
+      "notes": "複数タスクをSlackで走査しやすい形にする。"
+    },
+    {
+      "id": "slack-explanation",
+      "preset": "slack",
+      "input": "この件は共有だけで大丈夫です。今はiframeでGoogleスライドを表示して、4枚目で動画を自動再生しています。この仕組みならユーザーが近づいたときに最初から再生できるかもしれません。まだ検証は十分ではありません。",
+      "required_terms": ["iframe", "Googleスライド", "4枚目", "自動再生", "かもしれません", "検証"],
+      "forbidden_terms": ["実装しました", "確認済み"],
+      "required_headings": [],
+      "min_bullets": 0,
+      "min_blank_lines": 1,
+      "notes": "説明の現状・推測・留保を短い段落に分ける。"
+    },
+    {
+      "id": "email-request",
+      "preset": "email",
+      "input": "田中さん、来週火曜の15時までに見積書を確認して、問題があればコメントをください。問題がなければ承認をお願いします。",
+      "required_terms": ["田中さん", "来週火曜", "15時", "見積書", "コメント", "承認"],
+      "forbidden_terms": ["株式会社", "敬具", "完了しました"],
+      "required_headings": [],
+      "min_bullets": 0,
+      "min_blank_lines": 0,
+      "notes": "宛名と依頼条件を保ち、勝手な署名や会社名を足さない。"
+    },
+    {
+      "id": "email-uncertainty",
+      "preset": "email",
+      "input": "先ほど共有したAPI仕様なんですけど、認証方式が変わる可能性があるので、確定するまでは実装を止めておいてもらえると助かります。金曜にもう一度連絡します。",
+      "required_terms": ["API", "認証方式", "可能性", "実装", "金曜"],
+      "forbidden_terms": ["確定しました", "変更します", "敬具"],
+      "required_headings": [],
+      "min_bullets": 0,
+      "min_blank_lines": 1,
+      "notes": "不確実性と一時停止の依頼を丁寧なメール本文にする。"
+    },
+    {
+      "id": "memo-task-list",
+      "preset": "memo",
+      "input": "今日やること、PR 42のレビュー、releaseブランチのbuild確認、終わったらNotionに結果を残す。",
+      "required_terms": ["PR 42", "release", "build", "Notion"],
+      "forbidden_terms": ["完了", "対応済み"],
+      "required_headings": [],
+      "min_bullets": 3,
+      "min_blank_lines": 0,
+      "notes": "個人用タスクを簡潔な箇条書きにする。"
+    },
+    {
+      "id": "memo-decision",
+      "preset": "memo",
+      "input": "料金ページは今月は触らない。まず無料プランの利用状況を見る。数字が少なければ来月また考える。",
+      "required_terms": ["料金ページ", "今月", "無料プラン", "利用状況", "来月"],
+      "forbidden_terms": ["変更する", "廃止", "決定しました"],
+      "required_headings": [],
+      "min_bullets": 3,
+      "min_blank_lines": 0,
+      "notes": "決定・確認・条件付き次手を混同しない。"
+    },
+    {
+      "id": "prompt-pr-workflow",
+      "preset": "prompt",
+      "input": "この変更が使えるかテストして、改行できるか確認してください。問題なければGitHub issueにコメントして、PRを作ってください。マージはまだしないでください。結果と未確認事項を報告してください。",
+      "required_terms": ["改行", "GitHub", "issue", "PR", "マージ", "未確認事項"],
+      "forbidden_terms": ["マージする", "マージしてください", "完了しました"],
+      "required_headings": ["目的", "タスク", "条件", "報告"],
+      "min_bullets": 3,
+      "min_blank_lines": 3,
+      "notes": "禁止条件を反転せず、AI向けの明確な構造にする。"
+    },
+    {
+      "id": "prompt-file-edit",
+      "preset": "prompt",
+      "input": "src/config.tsのtimeoutを30から45に変えてください。他の設定は変更しないで、npm testを実行して、変更点とテスト結果を報告してください。",
+      "required_terms": ["src/config.ts", "timeout", "30", "45", "npm test", "変更点", "テスト結果"],
+      "forbidden_terms": ["他の設定も", "実行しました"],
+      "required_headings": ["目的", "タスク", "条件", "報告"],
+      "min_bullets": 2,
+      "min_blank_lines": 3,
+      "notes": "ファイル・数値・コマンドと変更範囲を厳密に保つ。"
+    },
+    {
+      "id": "technical-fallback",
+      "preset": "technical",
+      "input": "明日までにRealtime ASRを確認する。gpt-realtime-whisperがHTTP 429を返したときbatch ASRへfallbackするか見る。結果はissue 27に書く。",
+      "required_terms": ["明日", "Realtime ASR", "gpt-realtime-whisper", "HTTP 429", "batch ASR", "fallback", "issue 27"],
+      "forbidden_terms": ["バッチASR", "フォールバック", "完了"],
+      "required_headings": [],
+      "required_labels": ["Deadline", "Target", "Check", "Follow-up"],
+      "min_bullets": 3,
+      "min_blank_lines": 0,
+      "notes": "技術トークンを維持し、ラベル付き箇条書きにする。"
+    },
+    {
+      "id": "technical-ui-bug",
+      "preset": "technical",
+      "input": "SettingsPanel.tsxで保存ボタンを2回押すと同じtoastが2つ出る。Windows 11で再現した。原因を確認して、修正後にpnpm testを実行する。",
+      "required_terms": ["SettingsPanel.tsx", "toast", "Windows 11", "pnpm test"],
+      "forbidden_terms": ["修正済み", "macOS"],
+      "required_headings": [],
+      "required_labels": ["Target", "Check", "Follow-up"],
+      "min_bullets": 3,
+      "min_blank_lines": 0,
+      "notes": "再現条件・確認・テストを実装向けに整理する。"
+    }
+  ]
+}

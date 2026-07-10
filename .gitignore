@@ -9,6 +9,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Local Polish evaluation output
+polish-preset-eval-results*.json
+
 # Environment
 .env
 .env.*

@@ -1,6 +1,90 @@
 # Polish Preset Evaluation
 
-This fixture is for prompt quality review without calling the live API.
+## Reproducible preset evaluation (Issue #30)
+
+The current evaluation uses the anonymized fixed corpus in
+`src-tauri/eval/polish-preset-corpus.json` and the
+`polish_preset_eval` example. It exercises the same `polish::polish_text`
+request path as KoeType. The baseline contains two representative cases for
+each of `slack`, `email`, `memo`, `prompt`, and `technical` (10 API calls).
+Custom instructions and deep context are disabled so the preset itself is
+being evaluated.
+
+The completed Issue #30 runs and final outputs are recorded in
+[Polish Preset Evaluation Results](polish-preset-evaluation-results.md).
+
+### Six-axis rubric
+
+Score every axis as 0, 1, or 2. Enter the scores in the `human` object of each
+saved result. A score of 2 means ready for daily use, 1 means usable with a
+minor defect, and 0 means a material failure.
+
+| Axis | 0 | 1 | 2 |
+| --- | --- | --- | --- |
+| Meaning fidelity | Meaning or action is changed | Meaning is mostly retained, with minor drift | All intent, force, conditions, and uncertainty are retained |
+| No invention | Adds a material fact, action, status, or identity | Adds harmless but unnecessary wording | Adds no information |
+| Cleanup quality | Leaves disruptive filler/repetition or creates an error | Minor awkwardness remains | Cleans speech naturally without flattening it |
+| Preset fit | Wrong destination/shape | Recognizable preset with a minor format issue | Immediately usable in the selected destination |
+| Readability | Hard to scan or unnaturally fragmented | Understandable with a minor flow issue | Concise, natural, and easy to scan |
+| Token and structure preservation | Corrupts a protected token or critical structure | Minor non-critical formatting drift | Preserves protected tokens and required structure |
+
+A case passes only when:
+
+- all machine checks pass;
+- no human axis is 0; and
+- the human total is at least 10/12.
+
+A preset passes when both of its cases pass and its mean human score is at
+least 10/12. The full suite passes only when all five presets pass. Machine
+checks are deliberately strict tripwires for missing protected terms,
+forbidden claims, mandatory headings, bullets, and paragraph separation; they
+do not replace human review.
+
+### Commands
+
+Run these commands from `src-tauri`:
+
+```powershell
+# Validate and list the corpus without reading credentials or calling an API
+cargo run --example polish_preset_eval -- --list
+cargo run --example polish_preset_eval -- --dry-run --output polish-preset-eval-results-dry-run.json
+
+# Baseline: exactly 10 calls with the default gpt-5.4-mini model
+cargo run --example polish_preset_eval -- --output polish-preset-eval-results-baseline.json
+
+# Re-test only a failing preset or case after a prompt change
+cargo run --example polish_preset_eval -- --preset prompt --output polish-preset-eval-results-prompt-r2.json
+cargo run --example polish_preset_eval -- --case prompt-pr-workflow --output polish-preset-eval-results-prompt-pr-r3.json
+
+# Choose another model explicitly
+cargo run --example polish_preset_eval -- --model gpt-5.4-mini --output polish-preset-eval-results-baseline.json
+```
+
+Live execution reads the KoeType credential named `aivoice` / `api_key` from
+Windows Credential Manager into memory. The key is never printed or included
+in the report. Result filenames matching `polish-preset-eval-results*.json`
+are ignored by Git because they contain generated model output.
+
+### Low-usage improvement loop
+
+1. Run the 10-call baseline once and complete all human scores.
+2. Classify failures by shared guardrail versus one preset; change the narrowest
+   relevant prompt and add/update an offline assertion before another API call.
+3. Re-run only failed cases. Do not re-run passing cases while tuning an
+   unrelated preset.
+4. When all failed cases pass, run the full 10-case suite once as regression.
+5. Re-run only borderline or nondeterministic cases once. Stop when all preset
+   gates pass; do not spend calls seeking stylistic perfection beyond the rubric.
+
+ASR recognition accuracy is outside this evaluation. Inputs intentionally use
+the intended words, so errors such as `改行` becoming `開業` must be tracked
+separately. A single optional custom-instruction priority case may be added
+later, but preset-only quality remains the primary gate.
+
+## Historical shared fixture
+
+The material below is retained as historical prompt-review evidence. It is not
+the current Issue #30 scorecard.
 
 ## Shared input
 
@@ -103,3 +187,30 @@ Runs: 3 per preset, using the shared input above.
 | Memo | 3/3 | 3/3 | 3/3 | 3/3 |
 | AI Prompt | 3/3 | 3/3 | 3/3 | 3/3 |
 | Technical Note | 3/3 | 3/3 | 3/3 | 3/3 |
+
+## Regression fixture: semantic paragraphing (Issue #27)
+
+This fixture covers explanatory speech that changes semantic role several times without becoming a task list.
+
+### Input
+
+```text
+この件はスルーでもよいと思いますが、知見として共有します。今このスペースにはiframeでGoogleスライドを載せていて、4枚目へ進むと動画が自動再生されます。この方式なら、各ユーザーが近づいたときに最初から動画を再生する仕組みを作れるかもしれません。まだ十分に検証できていませんが、ひとまず認識してもらえると助かります。
+```
+
+### Expected semantic boundaries
+
+1. Preface and reason for sharing.
+2. Current iframe / Google Slides / autoplay behavior.
+3. Possible per-user mechanism inferred from that behavior.
+4. Uncertainty and closing request.
+
+For the Slack preset with custom instructions that prohibit implicit structure, these four units must be prose paragraphs separated by one blank line. Do not add headings or bullets. A short single-topic input must remain one paragraph.
+
+### Pass criteria
+
+- All four semantic roles remain recognizable and appear in four paragraphs.
+- Paragraph separators are exactly `\n\n`.
+- The output keeps the speaker's uncertainty and conversational temperature.
+- No facts, conclusions, greetings, headings, bullets, or meta commentary are added.
+- Copy, history reload, reinjection, and Polish rerun preserve the paragraph separators.

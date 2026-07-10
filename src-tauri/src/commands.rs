@@ -16,6 +16,7 @@ use crate::{
         MAX_DICTIONARY_WORDS, MAX_SNIPPETS,
     },
     mode,
+    polish::PolishState,
     recovery::{self, RecoverySessionSummary},
     session_service,
     settings::{self, AppSettings},
@@ -40,6 +41,7 @@ struct SessionUiEvent {
     raw_text: Option<String>,
     final_text: Option<String>,
     history_id: Option<String>,
+    polish_state: Option<PolishState>,
     error: Option<String>,
 }
 
@@ -506,6 +508,7 @@ async fn start_recording_locked(
             raw_text: None,
             final_text: None,
             history_id: None,
+            polish_state: None,
             error: None,
         },
     );
@@ -578,6 +581,7 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
             raw_text: None,
             final_text: None,
             history_id: None,
+            polish_state: None,
             error: None,
         },
     );
@@ -610,6 +614,7 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
                 outcome.mode.clone(),
                 outcome.duration_ms,
                 None,
+                outcome.polish_state.clone(),
             );
             let saved_id = local_data::append_history(app, entry)
                 .map(|entry| entry.id)
@@ -647,6 +652,7 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
                 mode.clone(),
                 0,
                 Some(error.clone()),
+                PolishState::Unknown,
             );
             local_data::append_history(app, entry)
                 .map(|entry| entry.id)
@@ -673,6 +679,10 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
                 .map(|outcome| outcome.final_text.clone())
                 .filter(|text| !text.is_empty()),
             history_id,
+            polish_state: result
+                .as_ref()
+                .ok()
+                .map(|outcome| outcome.polish_state.clone()),
             error: match &result {
                 Ok(outcome) => outcome.inject_error.clone(),
                 Err(error) => Some(error.clone()),
@@ -722,6 +732,7 @@ async fn stop_recording_preview_locked(
             raw_text: None,
             final_text: None,
             history_id: None,
+            polish_state: None,
             error: None,
         },
     );
@@ -768,6 +779,10 @@ async fn stop_recording_preview_locked(
                 .map(|outcome| outcome.final_text.clone())
                 .filter(|text| !text.is_empty()),
             history_id: None,
+            polish_state: result
+                .as_ref()
+                .ok()
+                .map(|outcome| outcome.polish_state.clone()),
             error: result.as_ref().err().cloned(),
         },
     );
@@ -1014,7 +1029,7 @@ pub async fn rerun_history_polish(
     } else {
         None
     };
-    let polished = mode::route(
+    let routed = mode::route(
         &Mode::Polish,
         &current_settings,
         &dictionary_words,
@@ -1023,10 +1038,11 @@ pub async fn rerun_history_polish(
     )
     .await;
     let snippets = local_data::load_snippets(&app).map_err(|error| error.to_string())?;
-    let final_text = local_data::expand_snippets(&polished, &snippets);
+    let final_text = local_data::expand_snippets(&routed.text, &snippets);
     history[index].raw_text = source_text;
     history[index].final_text = final_text;
     history[index].mode = Mode::Polish;
+    history[index].polish_state = routed.polish_state;
     history[index].status = local_data::HistoryStatus::Success;
     history[index].error = None;
     local_data::save_history(&app, &history).map_err(|error| error.to_string())?;
@@ -1166,7 +1182,7 @@ pub async fn retry_recovery_session(
             return Err(error);
         }
     };
-    let final_text = mode::route(
+    let routed = mode::route(
         &meta.mode,
         &current_settings,
         &dictionary_words,
@@ -1175,7 +1191,7 @@ pub async fn retry_recovery_session(
     )
     .await;
     let snippets = local_data::load_snippets(&app).map_err(|error| error.to_string())?;
-    let final_text = local_data::expand_snippets(&final_text, &snippets);
+    let final_text = local_data::expand_snippets(&routed.text, &snippets);
     recovery::mark_text_ready(&app, &id, raw_text, final_text)
         .map_err(|error| error.to_string())?;
     recovery::summarize(&app, &id).map_err(|error| error.to_string())
@@ -1225,6 +1241,11 @@ pub async fn save_recovery_session_to_history(
         meta.mode.clone(),
         meta.duration_ms,
         None,
+        if matches!(meta.mode, Mode::Polish) {
+            PolishState::Unknown
+        } else {
+            PolishState::NotRequested
+        },
     );
     let saved = local_data::append_history(&app, entry).map_err(|error| error.to_string())?;
     recovery::mark_completed(&app, &id, Some(saved.id.clone()))

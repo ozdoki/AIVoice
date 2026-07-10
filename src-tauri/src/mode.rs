@@ -1,4 +1,23 @@
-use crate::{context::FocusedAppContext, polish, settings::AppSettings, state::Mode};
+use crate::{
+    context::FocusedAppContext,
+    polish::{self, PolishState},
+    settings::AppSettings,
+    state::Mode,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeRouteOutcome {
+    pub text: String,
+    pub polish_state: PolishState,
+}
+
+fn applied_state(original: &str, polished: &str) -> PolishState {
+    if polished == original {
+        PolishState::AppliedUnchanged
+    } else {
+        PolishState::AppliedChanged
+    }
+}
 
 /// モードに応じてテキストを加工する。
 /// Raw: そのまま返す。Polish: LLM による文章整形。
@@ -8,16 +27,31 @@ pub async fn route(
     dictionary_words: &[String],
     focused_context: Option<&FocusedAppContext>,
     text: &str,
-) -> String {
+) -> ModeRouteOutcome {
     match mode {
-        Mode::Raw => text.to_string(),
+        Mode::Raw => ModeRouteOutcome {
+            text: text.to_string(),
+            polish_state: PolishState::NotRequested,
+        },
         Mode::Polish => {
             match polish::polish_text(settings, dictionary_words, focused_context, text).await {
-                Ok(polished) if !polished.trim().is_empty() => polished,
-                Ok(_) => text.to_string(),
-                Err(e) => {
-                    tracing::warn!("polish_text failed, falling back to raw: {e}");
-                    text.to_string()
+                Ok(polished) => {
+                    let polish_state = applied_state(text, &polished);
+                    ModeRouteOutcome {
+                        text: polished,
+                        polish_state,
+                    }
+                }
+                Err(error) => {
+                    let polish_state = error.state();
+                    tracing::warn!(
+                        polish_state = ?polish_state,
+                        "polish_text failed, falling back to raw: {error}"
+                    );
+                    ModeRouteOutcome {
+                        text: text.to_string(),
+                        polish_state,
+                    }
                 }
             }
         }
@@ -31,20 +65,34 @@ mod tests {
     #[tokio::test]
     async fn raw_mode_returns_text_unchanged() {
         let result = route(&Mode::Raw, &AppSettings::default(), &[], None, "テスト入力").await;
-        assert_eq!(result, "テスト入力");
+        assert_eq!(result.text, "テスト入力");
+        assert_eq!(result.polish_state, PolishState::NotRequested);
     }
 
     #[tokio::test]
     async fn raw_mode_empty_string() {
         let result = route(&Mode::Raw, &AppSettings::default(), &[], None, "").await;
-        assert_eq!(result, "");
+        assert_eq!(result.text, "");
     }
 
-    /// Polish モードで api_key が空の場合、polish_text が失敗して raw にフォールバックする。
+    /// Polish モードで api_key が空の場合、raw にフォールバックして理由を保持する。
     #[tokio::test]
     async fn polish_mode_falls_back_to_raw_on_api_error() {
         let settings = AppSettings::default(); // api_key 空 → API 呼び出し失敗
         let result = route(&Mode::Polish, &settings, &[], None, "元の文").await;
-        assert_eq!(result, "元の文");
+        assert_eq!(result.text, "元の文");
+        assert_eq!(result.polish_state, PolishState::FallbackNotConfigured);
+    }
+
+    #[test]
+    fn applied_state_distinguishes_changed_and_unchanged_output() {
+        assert_eq!(
+            applied_state("同じ本文", "同じ本文"),
+            PolishState::AppliedUnchanged
+        );
+        assert_eq!(
+            applied_state("第一段落。第二段落。", "第一段落。\n\n第二段落。"),
+            PolishState::AppliedChanged
+        );
     }
 }

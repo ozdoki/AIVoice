@@ -17,6 +17,9 @@ import {
   type UsageDaySummary,
   defaultSettings,
   formatHotkey,
+  isPolishFallback,
+  polishStateDetail,
+  polishStateLabel,
 } from "../types";
 
 interface AudioDevice {
@@ -239,6 +242,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
             created_at: Math.floor(Date.now() / 1000),
             error: null,
             status: "success",
+            polish_state: "applied_changed",
             pinned: false,
           },
         ]);
@@ -1453,6 +1457,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                   const showRawText = Boolean(historyRawVisible[item.id] && canShowRaw);
                   const text = showRawText ? item.raw_text : item.final_text;
                   const dictionaryCandidate = historyDictionaryCandidate(item, dictionaryWords);
+                  const polishLabel = showRawText ? null : polishStateLabel(item.polish_state);
                   return (
                     <article
                       className={`history-card ${item.pinned ? "is-pinned" : ""} ${
@@ -1464,6 +1469,16 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                         <span>{formatHistoryTime(item.created_at)}</span>
                         <span>{item.mode === "polish" ? "Polish" : "Raw"}</span>
                         <span>{item.status === "error" ? "失敗" : "成功"}</span>
+                        {polishLabel && (
+                          <span
+                            className={`polish-result-chip ${
+                              isPolishFallback(item.polish_state) ? "is-fallback" : ""
+                            }`}
+                            title={polishStateDetail(item.polish_state)}
+                          >
+                            {polishLabel}
+                          </span>
+                        )}
                         {item.pinned && <span>ピン留め</span>}
                         <span>{Math.round(item.duration_ms / 1000)}秒</span>
                       </div>

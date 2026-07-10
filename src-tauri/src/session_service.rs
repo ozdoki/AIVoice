@@ -4,7 +4,9 @@ use tauri::Emitter;
 use tokio::sync::watch;
 
 use crate::{
-    audio, context, inject, local_data, mode, recovery,
+    audio, context, inject, local_data, mode,
+    polish::PolishState,
+    recovery,
     speech::{openai_compatible::OpenAiCompatibleProvider, SpeechProvider},
     state::{AppState, Mode, RecordingState, SessionController},
 };
@@ -28,6 +30,7 @@ pub struct SessionOutcome {
     pub raw_text: String,
     pub final_text: String,
     pub mode: Mode,
+    pub polish_state: PolishState,
     pub duration_ms: u64,
     pub inject_error: Option<String>,
     pub recovery_id: Option<String>,
@@ -102,6 +105,7 @@ pub async fn stop_session_inner(
             raw_text: String::new(),
             final_text: String::new(),
             mode: state.mode.lock().await.clone(),
+            polish_state: PolishState::Unknown,
             duration_ms: 0,
             inject_error: None,
             recovery_id: None,
@@ -232,7 +236,7 @@ pub async fn stop_session_inner(
         if matches!(current_mode, Mode::Polish) {
             emit_phase(app.as_ref(), "polishing");
         }
-        let final_text = mode::route(
+        let routed = mode::route(
             &current_mode,
             &current_settings_for_mode,
             &current_dictionary_words,
@@ -240,11 +244,12 @@ pub async fn stop_session_inner(
             &raw_text,
         )
         .await;
+        let polish_state = routed.polish_state;
         let final_text = if let Some(app) = app.as_ref() {
             let snippets = local_data::load_snippets(app).map_err(|error| error.to_string())?;
-            local_data::expand_snippets(&final_text, &snippets)
+            local_data::expand_snippets(&routed.text, &snippets)
         } else {
-            final_text
+            routed.text
         };
 
         if let (Some(app), Some(id)) = (app.as_ref(), recovery_id.as_ref()) {
@@ -279,6 +284,7 @@ pub async fn stop_session_inner(
             raw_text,
             final_text,
             mode: current_mode,
+            polish_state,
             duration_ms,
             inject_error,
             recovery_id,
