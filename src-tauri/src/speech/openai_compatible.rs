@@ -7,15 +7,15 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use super::SpeechProvider;
-use crate::{audio::CapturedAudio, context::FocusedAppContext};
+use crate::{audio::CapturedAudio, context::FocusedAppContext, settings::LanguageMode};
 
-const TRANSCRIPTION_LANGUAGE: &str = "ja";
 const TRANSCRIPTION_TEMPERATURE: &str = "0";
 
 pub struct OpenAiCompatibleProvider {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub language_mode: LanguageMode,
     pub dictionary_words: Vec<String>,
     pub focused_context: Option<FocusedAppContext>,
     pub partial_tx: Option<mpsc::UnboundedSender<String>>,
@@ -63,24 +63,39 @@ fn encode_wav(audio: &CapturedAudio) -> Vec<u8> {
 fn build_transcription_prompt(
     dictionary_words: &[String],
     focused_context: Option<&FocusedAppContext>,
+    language_mode: LanguageMode,
 ) -> Option<String> {
     let mut sections = Vec::new();
     if !dictionary_words.is_empty() {
-        sections.push(format!(
-            "以下の専門用語・固有名詞を、音声と一致する場合は優先して認識してください: {}",
-            dictionary_words.join(", ")
-        ));
+        sections.push(match language_mode {
+            LanguageMode::Ja => format!(
+                "次の専門用語・固有名詞を、音声と一致する場合は優先して認識してください: {}",
+                dictionary_words.join(", ")
+            ),
+            LanguageMode::En => format!(
+                "Prefer these terms and proper nouns when they match the audio: {}",
+                dictionary_words.join(", ")
+            ),
+            LanguageMode::Auto => format!("terms={}", dictionary_words.join(", ")),
+        });
     }
     if let Some(context) = focused_context {
         let mut lines = Vec::new();
         if !context.process_name.trim().is_empty() {
-            lines.push(format!("入力先アプリ: {}", context.process_name.trim()));
+            let label = match language_mode {
+                LanguageMode::Ja => "入力先アプリ",
+                LanguageMode::En => "Target application",
+                LanguageMode::Auto => "app",
+            };
+            lines.push(format!("{label}={}", context.process_name.trim()));
         }
         if !context.window_title.trim().is_empty() {
-            lines.push(format!(
-                "入力先ウィンドウタイトル: {}",
-                context.window_title.trim()
-            ));
+            let label = match language_mode {
+                LanguageMode::Ja => "入力先ウィンドウタイトル",
+                LanguageMode::En => "Target window title",
+                LanguageMode::Auto => "window",
+            };
+            lines.push(format!("{label}={}", context.window_title.trim()));
         }
         if !lines.is_empty() {
             sections.push(lines.join("\n"));
@@ -100,12 +115,35 @@ fn supports_file_streaming(model: &str) -> bool {
     )
 }
 
-fn batch_transcription_model(model: &str) -> String {
+pub fn batch_transcription_model(model: &str) -> String {
     if crate::speech::realtime::supports_realtime_model(model) {
         "gpt-4o-mini-transcribe".to_string()
     } else {
         model.to_string()
     }
+}
+
+fn transcription_text_fields(
+    model: &str,
+    language_mode: LanguageMode,
+    prompt: Option<String>,
+    streaming: bool,
+) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("model", model.to_string()),
+        ("temperature", TRANSCRIPTION_TEMPERATURE.to_string()),
+    ];
+    if let Some(language) = language_mode.api_language() {
+        fields.push(("language", language.to_string()));
+    }
+    if let Some(prompt) = prompt {
+        fields.push(("prompt", prompt));
+    }
+    if streaming {
+        fields.push(("stream", "true".to_string()));
+        fields.push(("response_format", "text".to_string()));
+    }
+    fields
 }
 
 fn parse_transcript_event(line: &str) -> Option<(String, String)> {
@@ -142,18 +180,17 @@ impl SpeechProvider for OpenAiCompatibleProvider {
             .file_name("audio.wav")
             .mime_str("audio/wav")?;
         let batch_model = batch_transcription_model(&self.model);
-        let mut form = Form::new()
-            .part("file", part)
-            .text("model", batch_model.clone())
-            .text("language", TRANSCRIPTION_LANGUAGE)
-            .text("temperature", TRANSCRIPTION_TEMPERATURE);
-        if let Some(prompt) =
-            build_transcription_prompt(&self.dictionary_words, self.focused_context.as_ref())
+        let prompt = build_transcription_prompt(
+            &self.dictionary_words,
+            self.focused_context.as_ref(),
+            self.language_mode,
+        );
+        let streaming = supports_file_streaming(&batch_model) && self.partial_tx.is_some();
+        let mut form = Form::new().part("file", part);
+        for (name, value) in
+            transcription_text_fields(&batch_model, self.language_mode, prompt, streaming)
         {
-            form = form.text("prompt", prompt);
-        }
-        if supports_file_streaming(&batch_model) && self.partial_tx.is_some() {
-            form = form.text("stream", "true").text("response_format", "text");
+            form = form.text(name, value);
         }
 
         let url = format!(
@@ -217,9 +254,10 @@ mod tests {
             process_name: "notepad.exe".to_string(),
             window_title: "notes".to_string(),
         };
-        let prompt = build_transcription_prompt(&["Obsidian".to_string()], Some(&context))
-            .expect("prompt should be generated");
-        assert!(prompt.contains("以下の専門用語・固有名詞"));
+        let prompt =
+            build_transcription_prompt(&["Obsidian".to_string()], Some(&context), LanguageMode::Ja)
+                .expect("prompt should be generated");
+        assert!(prompt.contains("次の専門用語・固有名詞"));
         assert!(prompt.contains("Obsidian"));
         assert!(prompt.contains("入力先アプリ"));
         assert!(prompt.contains("notepad.exe"));
@@ -229,7 +267,51 @@ mod tests {
 
     #[test]
     fn transcription_prompt_is_absent_when_empty() {
-        assert!(build_transcription_prompt(&[], None).is_none());
+        assert!(build_transcription_prompt(&[], None, LanguageMode::Auto).is_none());
+    }
+
+    #[test]
+    fn language_mode_maps_to_optional_batch_field() {
+        assert_eq!(LanguageMode::Auto.api_language(), None);
+        assert_eq!(LanguageMode::Ja.api_language(), Some("ja"));
+        assert_eq!(LanguageMode::En.api_language(), Some("en"));
+    }
+
+    #[test]
+    fn batch_request_fields_omit_auto_and_map_explicit_languages() {
+        let auto =
+            transcription_text_fields("gpt-4o-mini-transcribe", LanguageMode::Auto, None, false);
+        assert!(!auto.iter().any(|(name, _)| *name == "language"));
+        let ja = transcription_text_fields("whisper-1", LanguageMode::Ja, None, false);
+        assert!(ja
+            .iter()
+            .any(|(name, value)| *name == "language" && value == "ja"));
+        let en = transcription_text_fields("whisper-1", LanguageMode::En, None, false);
+        assert!(en
+            .iter()
+            .any(|(name, value)| *name == "language" && value == "en"));
+    }
+
+    #[test]
+    fn auto_prompt_does_not_force_a_language() {
+        let prompt =
+            build_transcription_prompt(&["KoeType".to_string()], None, LanguageMode::Auto).unwrap();
+        assert!(!prompt.contains("日本語"));
+        assert!(!prompt.contains("Japanese"));
+    }
+
+    #[test]
+    fn english_prompt_has_no_japanese_labels() {
+        let context = FocusedAppContext {
+            process_name: "notepad.exe".to_string(),
+            window_title: "notes".to_string(),
+        };
+        let prompt =
+            build_transcription_prompt(&["KoeType".to_string()], Some(&context), LanguageMode::En)
+                .unwrap();
+        assert!(prompt.contains("Target application"));
+        assert!(!prompt.contains("入力先"));
+        assert!(!prompt.contains("日本語"));
     }
 
     #[test]

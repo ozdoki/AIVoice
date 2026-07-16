@@ -9,6 +9,8 @@ pub struct HotkeySet {
     pub push_to_talk: HotkeyBinding,
     pub hands_free_raw: HotkeyBinding,
     pub hands_free_polish: HotkeyBinding,
+    pub learn_selected: HotkeyBinding,
+    pub voice_edit_selected: HotkeyBinding,
 }
 
 impl HotkeySet {
@@ -16,11 +18,15 @@ impl HotkeySet {
         push_to_talk: HotkeyBinding,
         hands_free_raw: HotkeyBinding,
         hands_free_polish: HotkeyBinding,
+        learn_selected: HotkeyBinding,
+        voice_edit_selected: HotkeyBinding,
     ) -> Self {
         Self {
             push_to_talk,
             hands_free_raw,
             hands_free_polish,
+            learn_selected,
+            voice_edit_selected,
         }
     }
 
@@ -28,11 +34,15 @@ impl HotkeySet {
         self.push_to_talk = normalize_binding(&self.push_to_talk)?;
         self.hands_free_raw = normalize_binding(&self.hands_free_raw)?;
         self.hands_free_polish = normalize_binding(&self.hands_free_polish)?;
+        self.learn_selected = normalize_binding(&self.learn_selected)?;
+        self.voice_edit_selected = normalize_binding(&self.voice_edit_selected)?;
 
         let bindings = [
             &self.push_to_talk,
             &self.hands_free_raw,
             &self.hands_free_polish,
+            &self.learn_selected,
+            &self.voice_edit_selected,
         ];
         let mut seen = HashSet::new();
         for binding in bindings {
@@ -100,6 +110,32 @@ fn normalize_key_name(input: &str) -> Option<String> {
     Some(canonical.to_string())
 }
 
+fn replace_registered_set<U, R>(
+    current: &HotkeySet,
+    next: &HotkeySet,
+    unregister: &mut U,
+    register: &mut R,
+) -> Result<(), String>
+where
+    U: FnMut(),
+    R: FnMut(&HotkeySet) -> Result<(), String>,
+{
+    unregister();
+    match register(next) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            unregister();
+            if let Err(restore_error) = register(current) {
+                tracing::error!("failed to restore previous hotkeys: {restore_error}");
+                return Err(format!(
+                    "{error} 以前のショートカットの復元にも失敗しました: {restore_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
 pub fn register_hotkeys(app: &AppHandle, bindings: HotkeySet) -> anyhow::Result<()> {
     let bindings = bindings
         .validate_and_normalize()
@@ -126,6 +162,19 @@ pub fn reconfigure_hotkeys(bindings: HotkeySet) -> Result<HotkeySet, String> {
     Ok(normalized)
 }
 
+/// 録音中だけEscapeをグローバルに捕捉する。一時登録であり、検出時は即座に解除される。
+pub fn set_cancel_hotkey_enabled(enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::set_cancel_enabled(enabled)?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = enabled;
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use std::{
@@ -137,7 +186,7 @@ mod windows_impl {
         time::Duration,
     };
 
-    use tauri::{AppHandle, Emitter};
+    use tauri::{AppHandle, Emitter, Manager};
     use windows::Win32::UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT,
@@ -151,6 +200,9 @@ mod windows_impl {
     const HOTKEY_PUSH_TO_TALK: i32 = 1;
     const HOTKEY_HANDS_FREE_RAW: i32 = 2;
     const HOTKEY_HANDS_FREE_POLISH: i32 = 3;
+    const HOTKEY_LEARN_SELECTED: i32 = 4;
+    const HOTKEY_VOICE_EDIT_SELECTED: i32 = 5;
+    const HOTKEY_CANCEL_RECORDING: i32 = 6;
 
     static MANAGER: OnceLock<HotkeyManager> = OnceLock::new();
     static PTT_POLLING: AtomicBool = AtomicBool::new(false);
@@ -158,6 +210,10 @@ mod windows_impl {
     enum WorkerCommand {
         Reconfigure {
             bindings: HotkeySet,
+            reply: SyncSender<Result<(), String>>,
+        },
+        SetCancelEnabled {
+            enabled: bool,
             reply: SyncSender<Result<(), String>>,
         },
     }
@@ -203,6 +259,23 @@ mod windows_impl {
             .map_err(|_| "ホットキー再登録結果を取得できません。".to_string())?
     }
 
+    pub fn set_cancel_enabled(enabled: bool) -> Result<(), String> {
+        let manager = MANAGER
+            .get()
+            .ok_or_else(|| "ホットキー管理が初期化されていません。".to_string())?;
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        manager
+            .command_tx
+            .send(WorkerCommand::SetCancelEnabled {
+                enabled,
+                reply: reply_tx,
+            })
+            .map_err(|_| "ホットキー管理スレッドへ接続できません。".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "Escape監視の切替結果を取得できません。".to_string())?
+    }
+
     fn worker_loop(
         app: AppHandle,
         command_rx: Receiver<WorkerCommand>,
@@ -210,6 +283,7 @@ mod windows_impl {
         init_tx: SyncSender<Result<(), String>>,
     ) {
         let mut current = initial;
+        let mut cancel_registered = false;
         let initial_result = register_set(&current);
         let mut current_registered = initial_result.is_ok();
         let _ = init_tx.send(initial_result.clone());
@@ -219,10 +293,12 @@ mod windows_impl {
 
         if current_registered {
             tracing::info!(
-                "Global hotkeys registered: {}, {}, {}",
+                "Global hotkeys registered: {}, {}, {}, {}, {}",
                 current.push_to_talk.display(),
                 current.hands_free_raw.display(),
-                current.hands_free_polish.display()
+                current.hands_free_polish.display(),
+                current.learn_selected.display(),
+                current.voice_edit_selected.display()
             );
         }
 
@@ -240,6 +316,10 @@ mod windows_impl {
                             current = bindings;
                             current_registered = true;
                         }
+                        let _ = reply.send(result);
+                    }
+                    Ok(WorkerCommand::SetCancelEnabled { enabled, reply }) => {
+                        let result = set_cancel_registration(enabled, &mut cancel_registered);
                         let _ = reply.send(result);
                     }
                     Err(TryRecvError::Empty) => break,
@@ -272,6 +352,21 @@ mod windows_impl {
                     HOTKEY_HANDS_FREE_POLISH => {
                         let _ = app.emit("hotkey://hands-free-polish-toggle", ());
                     }
+                    HOTKEY_LEARN_SELECTED => {
+                        let _ = app.emit("hotkey://learn-selected", ());
+                    }
+                    HOTKEY_VOICE_EDIT_SELECTED => {
+                        let _ = app.emit("hotkey://voice-edit-selected", ());
+                    }
+                    HOTKEY_CANCEL_RECORDING if cancel_registered => {
+                        // 一回の押下で先に解除する。長押し・連打による重複イベントを防ぐ。
+                        let _ = unsafe { UnregisterHotKey(None, HOTKEY_CANCEL_RECORDING) };
+                        cancel_registered = false;
+                        // イベント配送より先にバックエンドから見える意図を立てる。
+                        // PTT-up等がsession_actionを先に取得しても通常停止を優先させない。
+                        app.state::<crate::state::AppState>().request_cancellation();
+                        let _ = app.emit("hotkey://cancel-recording", ());
+                    }
                     _ => {}
                 }
             }
@@ -279,21 +374,35 @@ mod windows_impl {
         }
     }
 
-    fn replace_set(current: &HotkeySet, next: &HotkeySet) -> Result<(), String> {
-        unregister_all();
-        match register_set(next) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                unregister_all();
-                if let Err(restore_error) = register_set(current) {
-                    tracing::error!("failed to restore previous hotkeys: {restore_error}");
-                    return Err(format!(
-                        "{error} 以前のショートカットの復元にも失敗しました: {restore_error}"
-                    ));
-                }
-                Err(error)
-            }
+    fn set_cancel_registration(enabled: bool, registered: &mut bool) -> Result<(), String> {
+        if enabled == *registered {
+            return Ok(());
         }
+        if enabled {
+            unsafe {
+                RegisterHotKey(
+                    None,
+                    HOTKEY_CANCEL_RECORDING,
+                    MOD_NOREPEAT,
+                    windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as u32,
+                )
+            }
+            .map_err(|error| {
+                format!(
+                    "録音キャンセル用のEscapeを登録できません。ほかのアプリで使用されている可能性があります: {error}"
+                )
+            })?;
+            *registered = true;
+        } else {
+            unsafe { UnregisterHotKey(None, HOTKEY_CANCEL_RECORDING) }
+                .map_err(|error| format!("録音キャンセル用のEscapeを解除できません: {error}"))?;
+            *registered = false;
+        }
+        Ok(())
+    }
+
+    fn replace_set(current: &HotkeySet, next: &HotkeySet) -> Result<(), String> {
+        super::replace_registered_set(current, next, &mut unregister_regular, &mut register_set)
     }
 
     fn register_set(bindings: &HotkeySet) -> Result<(), String> {
@@ -301,6 +410,8 @@ mod windows_impl {
             (HOTKEY_PUSH_TO_TALK, &bindings.push_to_talk),
             (HOTKEY_HANDS_FREE_RAW, &bindings.hands_free_raw),
             (HOTKEY_HANDS_FREE_POLISH, &bindings.hands_free_polish),
+            (HOTKEY_LEARN_SELECTED, &bindings.learn_selected),
+            (HOTKEY_VOICE_EDIT_SELECTED, &bindings.voice_edit_selected),
         ];
         let mut registered = Vec::new();
         for (id, binding) in entries {
@@ -322,10 +433,17 @@ mod windows_impl {
     }
 
     fn unregister_all() {
+        unregister_regular();
+        let _ = unsafe { UnregisterHotKey(None, HOTKEY_CANCEL_RECORDING) };
+    }
+
+    fn unregister_regular() {
         for id in [
             HOTKEY_PUSH_TO_TALK,
             HOTKEY_HANDS_FREE_RAW,
             HOTKEY_HANDS_FREE_POLISH,
+            HOTKEY_LEARN_SELECTED,
+            HOTKEY_VOICE_EDIT_SELECTED,
         ] {
             let _ = unsafe { UnregisterHotKey(None, id) };
         }
@@ -426,14 +544,90 @@ mod tests {
         let set = HotkeySet::new(
             duplicate.clone(),
             HotkeyBinding::hands_free_raw_default(),
+            HotkeyBinding::hands_free_polish_default(),
+            HotkeyBinding::learn_selected_default(),
             duplicate,
         );
         assert!(set.validate_and_normalize().is_err());
     }
 
     #[test]
+    fn rejects_duplicates_across_every_regular_binding_pair() {
+        for (left, right) in [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (2, 3),
+            (2, 4),
+            (3, 4),
+        ] {
+            let mut bindings = [
+                binding("F4"),
+                binding("F6"),
+                binding("F7"),
+                binding("F8"),
+                binding("F9"),
+            ];
+            bindings[right] = bindings[left].clone();
+            let [push_to_talk, hands_free_raw, hands_free_polish, learn_selected, voice_edit_selected] =
+                bindings;
+            assert!(HotkeySet::new(
+                push_to_talk,
+                hands_free_raw,
+                hands_free_polish,
+                learn_selected,
+                voice_edit_selected,
+            )
+            .validate_and_normalize()
+            .is_err());
+        }
+    }
+
+    #[test]
     fn accepts_single_key_binding() {
-        let set = HotkeySet::new(binding("F4"), binding("F6"), binding("M"));
+        let set = HotkeySet::new(
+            binding("F4"),
+            binding("F6"),
+            binding("F7"),
+            binding("F8"),
+            binding("M"),
+        );
         assert!(set.validate_and_normalize().is_ok());
+    }
+
+    #[test]
+    fn failed_reconfiguration_unregisters_partial_next_and_restores_previous_set() {
+        let current = HotkeySet::new(
+            binding("F4"),
+            binding("F6"),
+            binding("F7"),
+            binding("F8"),
+            binding("F9"),
+        );
+        let next = HotkeySet::new(
+            binding("F9"),
+            binding("F10"),
+            binding("F11"),
+            binding("F12"),
+            binding("F13"),
+        );
+        let mut unregister_calls = 0;
+        let mut registered_first_keys = Vec::new();
+        let result =
+            replace_registered_set(&current, &next, &mut || unregister_calls += 1, &mut |set| {
+                registered_first_keys.push(set.push_to_talk.key.clone());
+                if set == &next {
+                    Err("next failed".to_string())
+                } else {
+                    Ok(())
+                }
+            });
+        assert_eq!(result.unwrap_err(), "next failed");
+        assert_eq!(unregister_calls, 2);
+        assert_eq!(registered_first_keys, vec!["F9", "F4"]);
     }
 }

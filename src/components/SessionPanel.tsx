@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Checkmark20Regular,
@@ -6,7 +6,11 @@ import {
   Mic48Regular,
 } from "@fluentui/react-icons";
 import {
+  type CorrectionArtifact,
+  type CorrectionLearningMode,
+  type CorrectionPreview,
   type HotkeyBinding,
+  type Mode,
   type PolishState,
   type RecordingState,
   type SessionPhase,
@@ -16,6 +20,13 @@ import {
   polishStateDetail,
   polishStateLabel,
 } from "../types";
+import { validateCorrectionArtifacts } from "../correctionArtifactValidation";
+import {
+  commitCorrectionEdit,
+  correctionArtifactsForSubmission,
+  correctionPreviewArgs,
+  correctionSaveArgs,
+} from "../correctionLearningFlow";
 
 interface Props {
   state: RecordingState;
@@ -23,6 +34,10 @@ interface Props {
   lastText: string | null;
   rawText: string | null;
   polishState: PolishState | null;
+  historyId: string | null;
+  resultMode: Mode;
+  polishPreset: string;
+  correctionLearningMode: CorrectionLearningMode;
   elapsedMs: number;
   pushToTalk: HotkeyBinding;
   handsFreeRaw: HotkeyBinding;
@@ -43,6 +58,10 @@ export function SessionPanel({
   lastText,
   rawText,
   polishState,
+  historyId,
+  resultMode,
+  polishPreset,
+  correctionLearningMode,
   elapsedMs,
   pushToTalk,
   handsFreeRaw,
@@ -50,18 +69,46 @@ export function SessionPanel({
 }: Props) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
   const [copyError, setCopyError] = useState<string | null>(null);
+  const [injectError, setInjectError] = useState<string | null>(null);
   const [showRaw, setShowRaw] = useState(false);
   const [injectState, setInjectState] = useState<"idle" | "done" | "error">("idle");
+  const [confirmedText, setConfirmedText] = useState<string | null>(lastText);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editDraft, setEditDraft] = useState("");
+  const [correctionPreview, setCorrectionPreview] = useState<CorrectionPreview | null>(null);
+  const [learningArtifacts, setLearningArtifacts] = useState<CorrectionArtifact[]>([]);
+  const [learningBusy, setLearningBusy] = useState(false);
+  const [learningNotice, setLearningNotice] = useState<string | null>(null);
+  const confirmationRef = useRef<HTMLDivElement>(null);
+  const confirmationReturnFocusRef = useRef<HTMLElement | null>(null);
+  const resultIdentity =
+    historyId ?? `${lastText ?? ""}\u0000${rawText ?? ""}\u0000${resultMode}\u0000${polishPreset}`;
+  const submittedLearningArtifacts = correctionArtifactsForSubmission(learningArtifacts);
+  const learningArtifactError = correctionPreview
+    ? validateCorrectionArtifacts(submittedLearningArtifacts, { appProcess: correctionPreview.app_process, mode: resultMode })
+    : null;
 
   useEffect(() => {
     setCopyState("idle");
     setCopyError(null);
+    setInjectError(null);
     setShowRaw(false);
     setInjectState("idle");
-  }, [lastText]);
+    setConfirmedText(lastText);
+    setIsEditing(false);
+    setEditDraft(lastText ?? "");
+    setCorrectionPreview(null);
+    setLearningArtifacts([]);
+    setLearningNotice(null);
+  }, [resultIdentity]);
+
+  useEffect(() => {
+    if (!correctionPreview) return;
+    confirmationRef.current?.focus();
+  }, [correctionPreview]);
 
   const canCompareRaw = Boolean(rawText && lastText && rawText !== lastText);
-  const stableText = showRaw && canCompareRaw ? rawText : lastText;
+  const stableText = showRaw && canCompareRaw ? rawText : confirmedText;
   const displayedText = stableText;
   const displayedLabel = showRaw && canCompareRaw ? "Raw テキスト" : "最後に入力したテキスト";
   const visiblePolishState = showRaw ? null : polishState;
@@ -73,6 +120,7 @@ export function SessionPanel({
     polishing: "整形中",
     injecting: "注入中",
     completed: "完了",
+    cancelled: "録音をキャンセルしました",
     failed: "失敗",
   };
   const elapsedSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
@@ -96,7 +144,7 @@ export function SessionPanel({
       setCopyState("copied");
       window.setTimeout(() => setCopyState("idle"), 1600);
     } catch (error) {
-      setCopyError(String(error));
+      setCopyError(`コピーに失敗しました: ${error}`);
       setCopyState("error");
     }
   };
@@ -104,12 +152,82 @@ export function SessionPanel({
   const handleInject = async () => {
     if (!displayedText || !isTauri) return;
     try {
-      await invoke("inject_text", { text: displayedText });
+      const warning = await invoke<string | null>("inject_text", { text: displayedText });
+      setInjectError(warning);
       setInjectState("done");
       window.setTimeout(() => setInjectState("idle"), 1600);
     } catch (error) {
-      setCopyError(`再注入に失敗しました: ${error}`);
+      setInjectError(`再注入に失敗しました: ${error}`);
       setInjectState("error");
+    }
+  };
+
+  const handleSaveEdit = () => {
+    const transition = commitCorrectionEdit(editDraft);
+    if (!transition.ok) {
+      setLearningNotice(transition.notice);
+      return;
+    }
+    setConfirmedText(transition.confirmedText);
+    setIsEditing(false);
+    setCorrectionPreview(null);
+    setLearningArtifacts([]);
+    setLearningNotice(transition.notice);
+  };
+
+  const handlePreviewLearning = async () => {
+    const args = correctionPreviewArgs(historyId, confirmedText, lastText);
+    if (!args || !isTauri) return;
+    setLearningBusy(true);
+    setLearningNotice(null);
+    try {
+      confirmationReturnFocusRef.current = document.activeElement as HTMLElement | null;
+      const preview = await invoke<CorrectionPreview>("preview_correction", args);
+      setCorrectionPreview(preview);
+      setLearningArtifacts(preview.default_artifacts);
+    } catch (error) {
+      setLearningNotice(String(error));
+    } finally {
+      setLearningBusy(false);
+    }
+  };
+
+  const closeCorrectionPreview = () => {
+    setCorrectionPreview(null);
+    window.setTimeout(() => confirmationReturnFocusRef.current?.focus(), 0);
+  };
+
+  const toggleCandidate = (candidate: CorrectionArtifact) => {
+    setLearningArtifacts((current) => {
+      const key = JSON.stringify(candidate);
+      const exists = current.some((item) => JSON.stringify(item) === key);
+      if (exists) {
+        const next = current.filter((item) => JSON.stringify(item) !== key);
+        return next.length > 0 ? next : [{ type: "none" }];
+      }
+      return [...current.filter((item) => item.type !== "none"), candidate];
+    });
+  };
+
+  const updateLearningArtifact = (index: number, artifact: CorrectionArtifact) => {
+    setLearningArtifacts((current) =>
+      current.map((item, itemIndex) => (itemIndex === index ? artifact : item))
+    );
+  };
+
+  const handleSaveLearning = async () => {
+    const args = correctionSaveArgs(historyId, confirmedText, learningArtifacts);
+    if (!args || !isTauri || learningArtifactError) return;
+    setLearningBusy(true);
+    setLearningNotice(null);
+    try {
+      await invoke("create_correction", args);
+      closeCorrectionPreview();
+      setLearningNotice("確認した修正内容をローカルに保存しました。");
+    } catch (error) {
+      setLearningNotice(String(error));
+    } finally {
+      setLearningBusy(false);
     }
   };
 
@@ -152,6 +270,19 @@ export function SessionPanel({
                 {showRaw ? "Final" : "Raw"}
               </button>
             )}
+            {!showRaw && confirmedText && !isEditing && (
+              <button
+                className="copy-button"
+                onClick={() => {
+                  setEditDraft(confirmedText);
+                  setIsEditing(true);
+                  setLearningNotice(null);
+                }}
+                disabled={state !== "idle"}
+              >
+                編集
+              </button>
+            )}
             <button
               className={`copy-button ${injectState === "done" ? "is-copied" : ""}`}
               onClick={handleInject}
@@ -169,12 +300,274 @@ export function SessionPanel({
             </button>
           </div>
         </div>
-        <div className={`latest-text ${displayedText ? "" : "is-empty"}`}>
-          {displayedText ?? "音声入力が完了すると、ここにテキストが表示されます。"}
-        </div>
+        {isEditing && !showRaw ? (
+          <div className="correction-editor">
+            <textarea
+              value={editDraft}
+              onChange={(event) => setEditDraft(event.target.value)}
+              maxLength={20000}
+              rows={7}
+              aria-label="修正後テキスト"
+            />
+            <div className="latest-text-actions">
+              <button className="copy-button" onClick={handleSaveEdit}>編集を確定</button>
+              <button
+                className="copy-button"
+                onClick={() => {
+                  setIsEditing(false);
+                  setEditDraft(confirmedText ?? "");
+                }}
+              >
+                キャンセル
+              </button>
+            </div>
+            <small>編集を確定しただけでは学習データへ保存されません。</small>
+          </div>
+        ) : (
+          <div className={`latest-text ${displayedText ? "" : "is-empty"}`}>
+            {displayedText ?? "音声入力が完了すると、ここにテキストが表示されます。"}
+          </div>
+        )}
+        {!showRaw && confirmedText && confirmedText !== lastText && !isEditing && (
+          <div className="correction-learning-actions">
+            <button
+              className="copy-button"
+              onClick={handlePreviewLearning}
+              disabled={
+                learningBusy ||
+                correctionLearningMode === "off" ||
+                !historyId ||
+                state !== "idle"
+              }
+              title={
+                correctionLearningMode === "off"
+                  ? "設定で「保存前に確認」を有効にしてください"
+                  : !historyId
+                    ? "元の履歴がないため学習できません"
+                    : undefined
+              }
+            >
+              修正を学習
+            </button>
+            {correctionLearningMode === "off" && <small>修正学習は設定でオフです。</small>}
+          </div>
+        )}
+        {correctionPreview && (
+          <div
+            className="correction-confirmation"
+            role="dialog"
+            aria-label="修正学習の確認"
+            tabIndex={-1}
+            ref={confirmationRef}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") closeCorrectionPreview();
+            }}
+          >
+            <h3>保存前に確認</h3>
+            <p><strong>元の出力</strong></p>
+            <div className="latest-text">{correctionPreview.original_text}</div>
+            <p><strong>修正後</strong></p>
+            <div className="latest-text">{correctionPreview.corrected_text}</div>
+            <small>
+              分類: {correctionPreview.classification} / モード: {resultMode} / プリセット: {polishPreset}
+            </small>
+            <p>適用する候補（複数選択可）</p>
+            {correctionPreview.candidates.length === 0 ? (
+              <small>安全に適用できる候補を判定できないため、既定は「適用なし」です。</small>
+            ) : (
+              correctionPreview.candidates.map((candidate, index) => (
+                <label key={`${candidate.type}-${index}`} className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={learningArtifacts.some(
+                      (item) => JSON.stringify(item) === JSON.stringify(candidate)
+                    )}
+                    onChange={() => toggleCandidate(candidate)}
+                  />
+                  <span>
+                    {candidate.type === "replacement"
+                      ? `置換: ${candidate.from} → ${candidate.to} (${candidate.scope})`
+                      : candidate.type === "vocabulary"
+                        ? `語彙: ${candidate.value} (${candidate.scope})`
+                        : candidate.type === "style_example"
+                          ? "Polish文体例"
+                          : "適用なし"}
+                  </span>
+                </label>
+              ))
+            )}
+            <label className="checkbox-row">
+              <input
+                type="radio"
+                checked={learningArtifacts.length === 1 && learningArtifacts[0].type === "none"}
+                onChange={() => setLearningArtifacts([{ type: "none" }])}
+              />
+              <span>適用なし（修正例だけ保存）</span>
+            </label>
+            <div className="latest-text-actions">
+              <button
+                className="copy-button"
+                onClick={() =>
+                  setLearningArtifacts((current) => [
+                    ...current.filter((item) => item.type !== "none"),
+                    { type: "vocabulary", value: "", scope: "global" },
+                  ])
+                }
+              >
+                語彙を追加
+              </button>
+              <button
+                className="copy-button"
+                onClick={() =>
+                  setLearningArtifacts((current) => [
+                    ...current.filter((item) => item.type !== "none"),
+                    {
+                      type: "replacement",
+                      from: correctionPreview.original_text,
+                      to: correctionPreview.corrected_text,
+                      scope: "global",
+                    },
+                  ])
+                }
+              >
+                置換を追加
+              </button>
+              {resultMode === "polish" && (
+                <button
+                  className="copy-button"
+                  onClick={() =>
+                    setLearningArtifacts((current) => [
+                      ...current.filter((item) => item.type !== "none"),
+                      {
+                        type: "style_example",
+                        input: correctionPreview.original_text,
+                        output: correctionPreview.corrected_text,
+                      },
+                    ])
+                  }
+                >
+                  文体例を追加
+                </button>
+              )}
+            </div>
+            {learningArtifacts.map((artifact, index) => {
+              if (artifact.type === "none") return null;
+              return (
+                <div className="correction-artifact-editor" key={`selected-${index}`}>
+                  {artifact.type === "vocabulary" && (
+                    <>
+                      <input
+                        value={artifact.value}
+                        maxLength={128}
+                        placeholder="学習する語彙"
+                        onChange={(event) =>
+                          updateLearningArtifact(index, { ...artifact, value: event.target.value })
+                        }
+                      />
+                      <select
+                        value={artifact.scope}
+                        onChange={(event) =>
+                          updateLearningArtifact(index, {
+                            ...artifact,
+                            scope: event.target.value as "global" | "app",
+                          })
+                        }
+                      >
+                        <option value="global">全アプリ</option>
+                        <option value="app">このアプリ</option>
+                      </select>
+                    </>
+                  )}
+                  {artifact.type === "replacement" && (
+                    <>
+                      <input
+                        value={artifact.from}
+                        maxLength={128}
+                        aria-label="置換元"
+                        onChange={(event) =>
+                          updateLearningArtifact(index, { ...artifact, from: event.target.value })
+                        }
+                      />
+                      <span>→</span>
+                      <input
+                        value={artifact.to}
+                        maxLength={2000}
+                        aria-label="置換先"
+                        onChange={(event) =>
+                          updateLearningArtifact(index, { ...artifact, to: event.target.value })
+                        }
+                      />
+                      <select
+                        value={artifact.scope}
+                        onChange={(event) =>
+                          updateLearningArtifact(index, {
+                            ...artifact,
+                            scope: event.target.value as "global" | "app",
+                          })
+                        }
+                      >
+                        <option value="global">全アプリ</option>
+                        <option value="app">このアプリ</option>
+                      </select>
+                    </>
+                  )}
+                  {artifact.type === "style_example" && (
+                    <>
+                      <textarea
+                        value={artifact.input}
+                        maxLength={8000}
+                        aria-label="文体例の入力"
+                        onChange={(event) =>
+                          updateLearningArtifact(index, { ...artifact, input: event.target.value })
+                        }
+                      />
+                      <textarea
+                        value={artifact.output}
+                        maxLength={8000}
+                        aria-label="文体例の出力"
+                        onChange={(event) =>
+                          updateLearningArtifact(index, { ...artifact, output: event.target.value })
+                        }
+                      />
+                    </>
+                  )}
+                  <button
+                    className="copy-button"
+                    onClick={() =>
+                      setLearningArtifacts((current) => {
+                        const next = current.filter((_, itemIndex) => itemIndex !== index);
+                        return next.length > 0 ? next : [{ type: "none" }];
+                      })
+                    }
+                  >
+                    候補を削除
+                  </button>
+                </div>
+              );
+            })}
+            <small>
+              Raw・元の出力・修正後はローカルへ平文保存されます。語彙と文体例は外部APIへ送信され得ます。置換は端末内だけで適用します。
+            </small>
+            {learningArtifactError && <p className="field-error" role="alert">{learningArtifactError}</p>}
+            <div className="latest-text-actions">
+              <button className="copy-button" onClick={handleSaveLearning} disabled={learningBusy || Boolean(learningArtifactError)}>
+                確認して保存
+              </button>
+              <button className="copy-button" onClick={closeCorrectionPreview}>
+                保存しない
+              </button>
+            </div>
+          </div>
+        )}
+        {learningNotice && <p className="field-help" role="status">{learningNotice}</p>}
         {copyError && (
           <p className="field-error" role="alert">
-            コピーに失敗しました: {copyError}
+            {copyError}
+          </p>
+        )}
+        {injectError && (
+          <p className="field-error" role="alert">
+            {injectError}
           </p>
         )}
       </div>

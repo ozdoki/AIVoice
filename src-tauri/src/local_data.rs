@@ -23,6 +23,14 @@ pub enum HistoryStatus {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    #[default]
+    Dictation,
+    SelectedVoiceEdit,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub id: String,
@@ -37,6 +45,13 @@ pub struct HistoryEntry {
     pub polish_state: PolishState,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub polish_preset: String,
+    /// 録音開始時の実行ファイル名だけを保持する。ウィンドウタイトルは保存しない。
+    #[serde(default)]
+    pub app_process: String,
+    #[serde(default)]
+    pub operation_kind: OperationKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -172,6 +187,28 @@ pub fn make_history_entry(
     error: Option<String>,
     polish_state: PolishState,
 ) -> HistoryEntry {
+    make_history_entry_with_context(
+        raw_text,
+        final_text,
+        mode,
+        duration_ms,
+        error,
+        polish_state,
+        String::new(),
+        String::new(),
+    )
+}
+
+pub fn make_history_entry_with_context(
+    raw_text: String,
+    final_text: String,
+    mode: Mode,
+    duration_ms: u64,
+    error: Option<String>,
+    polish_state: PolishState,
+    polish_preset: String,
+    app_process: String,
+) -> HistoryEntry {
     let status = if error.is_some() {
         HistoryStatus::Error
     } else {
@@ -188,7 +225,31 @@ pub fn make_history_entry(
         status,
         polish_state,
         pinned: false,
+        polish_preset,
+        app_process,
+        operation_kind: OperationKind::Dictation,
     }
+}
+
+pub fn make_selected_voice_edit_history_entry(
+    instruction: String,
+    proposal: String,
+    duration_ms: u64,
+    error: Option<String>,
+    app_process: String,
+) -> HistoryEntry {
+    let mut entry = make_history_entry_with_context(
+        instruction,
+        proposal,
+        Mode::Polish,
+        duration_ms,
+        error,
+        PolishState::AppliedChanged,
+        "selected_voice_edit".to_string(),
+        app_process,
+    );
+    entry.operation_kind = OperationKind::SelectedVoiceEdit;
+    entry
 }
 
 pub fn load_history(app: &AppHandle) -> anyhow::Result<Vec<HistoryEntry>> {
@@ -449,6 +510,7 @@ pub fn dictionary_suggestions_from_history(
     for entry in history
         .iter()
         .filter(|entry| entry.status == HistoryStatus::Success)
+        .filter(|entry| entry.operation_kind == OperationKind::Dictation)
     {
         for text in [&entry.raw_text, &entry.final_text] {
             for token in collect_candidate_tokens(text) {
@@ -602,6 +664,9 @@ mod tests {
                 status: HistoryStatus::Success,
                 polish_state: PolishState::NotRequested,
                 pinned: false,
+                polish_preset: String::new(),
+                app_process: String::new(),
+                operation_kind: OperationKind::Dictation,
             },
             HistoryEntry {
                 id: "2".to_string(),
@@ -614,6 +679,9 @@ mod tests {
                 status: HistoryStatus::Success,
                 polish_state: PolishState::AppliedUnchanged,
                 pinned: false,
+                polish_preset: String::new(),
+                app_process: String::new(),
+                operation_kind: OperationKind::Dictation,
             },
         ];
         let suggestions = dictionary_suggestions_from_history(&history, &["Slack".to_string()]);
@@ -652,6 +720,7 @@ mod tests {
         });
         let restored: HistoryEntry = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.polish_state, PolishState::Unknown);
+        assert_eq!(restored.operation_kind, OperationKind::Dictation);
     }
 
     #[test]

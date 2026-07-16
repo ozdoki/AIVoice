@@ -10,6 +10,7 @@ KoeType focuses on:
 - BYOK OpenAI-compatible speech recognition and text polishing
 - Safe API key handling through Windows Credential Manager
 - Reliable hotkeys, recording, recovery, and text injection
+- Explicit F9 selected-text voice editing with mandatory preview and safe replacement
 - Clear boundaries between Windows-specific native code and the React UI
 
 Out of scope for now:
@@ -17,7 +18,7 @@ Out of scope for now:
 - Team accounts or shared dictionaries
 - SSO, admin consoles, or billing
 - Cloud sync
-- Selection-based text editing
+- Passive selection monitoring, whole-document editing, or editing without an explicit user hotkey
 - macOS support
 
 ## Development setup

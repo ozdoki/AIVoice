@@ -9,6 +9,8 @@ default-run = "aivoice"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+embed-resource = "3"
+cc = "1"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
@@ -34,6 +36,9 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 arboard = "3"
 keyring = { version = "3", features = ["windows-native"] }
 
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
   "Win32_Foundation",
@@ -44,8 +49,11 @@ windows = { version = "0.58", features = [
   "Win32_Media_Audio",
   "Win32_Media_KernelStreaming",
   "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Accessibility",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
   "Win32_System_Com_StructuredStorage",
   "Win32_UI_Shell_PropertiesSystem",
   "Win32_Devices_FunctionDiscovery",

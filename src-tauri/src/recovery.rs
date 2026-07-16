@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
-use crate::state::Mode;
+use crate::{local_data::OperationKind, state::Mode};
 
 const RECOVERY_DIR: &str = "recovery";
 const META_FILE: &str = "meta.json";
@@ -32,6 +32,11 @@ pub struct RecoverySessionMeta {
     pub created_at: u64,
     pub updated_at: u64,
     pub mode: Mode,
+    #[serde(default)]
+    pub polish_preset: String,
+    /// 録音開始時の実行ファイル名。ウィンドウタイトルは保存しない。
+    #[serde(default)]
+    pub app_process: String,
     pub trigger: String,
     pub status: RecoveryStatus,
     pub sample_rate: Option<u32>,
@@ -42,6 +47,8 @@ pub struct RecoverySessionMeta {
     pub final_text: String,
     pub error: Option<String>,
     pub history_id: Option<String>,
+    #[serde(default)]
+    pub operation_kind: OperationKind,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +64,8 @@ pub struct RecoverySessionSummary {
     pub error: Option<String>,
     pub has_audio: bool,
     pub can_retry: bool,
+    pub operation_kind: OperationKind,
+    pub injection_warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,8 +107,35 @@ pub fn recovery_root(app: &AppHandle) -> anyhow::Result<PathBuf> {
     Ok(app.path().app_data_dir()?.join(RECOVERY_DIR))
 }
 
+fn validate_recovery_id(id: &str) -> anyhow::Result<()> {
+    let mut parts = id.split('-');
+    let valid = parts.next() == Some("rec")
+        && parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && parts.next().is_none();
+    if !valid
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains("..")
+        || Path::new(id).is_absolute()
+    {
+        anyhow::bail!("invalid recovery session id");
+    }
+    Ok(())
+}
+
 fn session_dir(app: &AppHandle, id: &str) -> anyhow::Result<PathBuf> {
-    Ok(recovery_root(app)?.join(id))
+    validate_recovery_id(id)?;
+    let root = recovery_root(app)?;
+    let dir = root.join(id);
+    if dir.parent() != Some(root.as_path()) {
+        anyhow::bail!("recovery session path escaped its root");
+    }
+    Ok(dir)
 }
 
 pub fn audio_path(app: &AppHandle, id: &str) -> anyhow::Result<PathBuf> {
@@ -141,6 +177,26 @@ pub fn create_session(
     app: &AppHandle,
     mode: Mode,
     trigger: String,
+    polish_preset: String,
+    app_process: String,
+) -> anyhow::Result<RecoverySessionRuntime> {
+    create_session_with_operation(
+        app,
+        mode,
+        trigger,
+        polish_preset,
+        app_process,
+        OperationKind::Dictation,
+    )
+}
+
+pub fn create_session_with_operation(
+    app: &AppHandle,
+    mode: Mode,
+    trigger: String,
+    polish_preset: String,
+    app_process: String,
+    operation_kind: OperationKind,
 ) -> anyhow::Result<RecoverySessionRuntime> {
     let root = recovery_root(app)?;
     fs::create_dir_all(&root)?;
@@ -152,6 +208,8 @@ pub fn create_session(
         created_at: now_secs(),
         updated_at: now_secs(),
         mode,
+        polish_preset,
+        app_process,
         trigger,
         status: RecoveryStatus::Recording,
         sample_rate: None,
@@ -162,6 +220,7 @@ pub fn create_session(
         final_text: String::new(),
         error: None,
         history_id: None,
+        operation_kind,
     };
     save_meta_path(&dir.join(META_FILE), &meta)?;
     Ok(RecoverySessionRuntime {
@@ -242,8 +301,16 @@ pub fn delete_session(app: &AppHandle, id: &str) -> anyhow::Result<()> {
 }
 
 pub fn cleanup_completed_session(app: &AppHandle, id: &str) -> anyhow::Result<()> {
-    let _ = mark_completed(app, id, None);
-    delete_session(app, id)
+    let mark_error = mark_completed(app, id, None).err();
+    match delete_session(app, id) {
+        Ok(()) => Ok(()),
+        Err(delete_error) => match mark_error {
+            Some(mark_error) => anyhow::bail!(
+                "recovery metadata could not be hidden ({mark_error}) and its directory could not be deleted ({delete_error})"
+            ),
+            None => Err(delete_error),
+        },
+    }
 }
 
 pub fn summarize(app: &AppHandle, id: &str) -> anyhow::Result<RecoverySessionSummary> {
@@ -264,12 +331,21 @@ pub fn list_sessions(app: &AppHandle) -> anyhow::Result<Vec<RecoverySessionSumma
         if !entry.file_type()?.is_dir() {
             continue;
         }
+        let Some(id) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if validate_recovery_id(&id).is_err() {
+            continue;
+        }
         let meta_file = entry.path().join(META_FILE);
         if !meta_file.exists() {
             continue;
         }
 
         let mut meta: RecoverySessionMeta = serde_json::from_str(&fs::read_to_string(&meta_file)?)?;
+        if meta.id != id {
+            continue;
+        }
         let wav = entry.path().join(AUDIO_FILE);
         if wav.exists() {
             if let Ok(info) = repair_wav_header(&wav) {
@@ -312,7 +388,12 @@ fn summary_from_meta(meta: &RecoverySessionMeta, has_audio: bool) -> RecoverySes
         final_text: meta.final_text.clone(),
         error: meta.error.clone(),
         has_audio,
-        can_retry: has_audio && meta.sample_rate.is_some() && meta.channels.is_some(),
+        can_retry: meta.operation_kind == OperationKind::Dictation
+            && has_audio
+            && meta.sample_rate.is_some()
+            && meta.channels.is_some(),
+        operation_kind: meta.operation_kind,
+        injection_warning: None,
     }
 }
 
@@ -445,6 +526,23 @@ pub fn repair_wav_header(path: &Path) -> anyhow::Result<WavInfo> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recovery_id_validator_rejects_every_path_shape() {
+        assert!(validate_recovery_id("rec-123-456").is_ok());
+        for id in [
+            "../outside",
+            "rec-1/../outside",
+            "rec-1\\outside",
+            "C:\\outside",
+            "/tmp/outside",
+            "rec-x-1",
+            "rec-1-2-extra",
+            "",
+        ] {
+            assert!(validate_recovery_id(id).is_err(), "accepted {id:?}");
+        }
+    }
+
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::current_dir()
             .unwrap()
@@ -483,5 +581,37 @@ mod tests {
         assert_eq!(before.frame_count, 2);
         let after = repair_wav_header(&path).unwrap();
         assert_eq!(after.frame_count, 2);
+    }
+
+    #[test]
+    fn recovery_meta_legacy_defaults_and_current_context_roundtrip() {
+        let legacy = serde_json::json!({
+            "id": "rec-legacy",
+            "created_at": 1,
+            "updated_at": 1,
+            "mode": "raw",
+            "trigger": "manual",
+            "status": "captured",
+            "sample_rate": 16000,
+            "channels": 1,
+            "frame_count": 10,
+            "duration_ms": 1,
+            "raw_text": "",
+            "final_text": "",
+            "error": null,
+            "history_id": null
+        });
+        let restored: RecoverySessionMeta = serde_json::from_value(legacy).unwrap();
+        assert!(restored.polish_preset.is_empty());
+        assert!(restored.app_process.is_empty());
+        assert_eq!(restored.operation_kind, OperationKind::Dictation);
+
+        let mut current = restored;
+        current.polish_preset = "slack".to_string();
+        current.app_process = "slack.exe".to_string();
+        let roundtrip: RecoverySessionMeta =
+            serde_json::from_value(serde_json::to_value(current).unwrap()).unwrap();
+        assert_eq!(roundtrip.polish_preset, "slack");
+        assert_eq!(roundtrip.app_process, "slack.exe");
     }
 }

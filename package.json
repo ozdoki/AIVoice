@@ -8,6 +8,7 @@
     "dev": "vite",
     "typecheck": "tsc --noEmit",
     "build": "tsc && vite build",
+    "test": "node --experimental-strip-types --test \"tests/*.test.ts\"",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:build": "tauri build --no-bundle",

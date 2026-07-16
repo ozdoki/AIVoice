@@ -8,7 +8,12 @@ import {
   Play20Regular,
   Stop20Regular,
 } from "@fluentui/react-icons";
-import { type AppSettings, type RecordingState, formatHotkey } from "../types";
+import {
+  type AppSettings,
+  type RecordingState,
+  type SessionPhase,
+  formatHotkey,
+} from "../types";
 
 interface AudioDevice {
   id: string;
@@ -18,6 +23,7 @@ interface AudioDevice {
 interface Props {
   settings: AppSettings;
   recordingState: RecordingState;
+  sessionPhase: SessionPhase;
   onSettingsSaved: (settings: AppSettings) => void;
   onComplete: () => void;
   onClose: () => void;
@@ -28,6 +34,7 @@ const isTauri = "__TAURI_INTERNALS__" in window;
 export function OnboardingPanel({
   settings,
   recordingState,
+  sessionPhase,
   onSettingsSaved,
   onComplete,
   onClose,
@@ -324,6 +331,8 @@ export function OnboardingPanel({
               <div className={`onboarding-test-result ${testSucceeded ? "is-success" : ""}`}>
                 {testSucceeded
                   ? testPreviewText
+                  : sessionPhase === "cancelled"
+                    ? "録音をキャンセルしました。"
                   : "停止後、成功するとここに文字起こし結果が出ます。"}
               </div>
               <button

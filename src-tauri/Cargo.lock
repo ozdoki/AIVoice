@@ -36,6 +36,8 @@ dependencies = [
  "arboard",
  "async-trait",
  "base64 0.22.1",
+ "cc",
+ "embed-resource",
  "futures-util",
  "keyring",
  "reqwest 0.12.28",

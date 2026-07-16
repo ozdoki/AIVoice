@@ -12,6 +12,8 @@ import {
   defaultSettings,
   formatHotkey,
 } from "../types";
+import { shouldClearFloatingBarTerminalTimer } from "../floatingBarTimerPolicy";
+import { runFloatingBarTerminalPresentation } from "../floatingBarTerminalController";
 
 interface SessionUiEvent {
   state: RecordingState;
@@ -91,6 +93,8 @@ export function FloatingBar() {
   const [liveTranscriptError, setLiveTranscriptError] = useState("");
   const levelRef = useRef(isTauri ? 0 : 0.32);
   const liveStripRef = useRef<HTMLDivElement>(null);
+  const terminalHideTimerRef = useRef<number | null>(null);
+  const sessionEventEpochRef = useRef(0);
   const [displayLevel, setDisplayLevel] = useState(isTauri ? 0 : 0.32);
 
   // 透明背景（ピル以外が透ける）
@@ -104,9 +108,20 @@ export function FloatingBar() {
     return () => window.clearInterval(timer);
   }, []);
 
+  useEffect(() => () => {
+    if (
+      shouldClearFloatingBarTerminalTimer("component_unmount") &&
+      terminalHideTimerRef.current !== null
+    ) {
+      window.clearTimeout(terminalHideTimerRef.current);
+      terminalHideTimerRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     if (!isTauri) return;
     let unlistener: (() => void) | undefined;
+    let disposed = false;
     const win = getCurrentWindow();
 
     invoke<AppSettings>("get_settings")
@@ -124,10 +139,11 @@ export function FloatingBar() {
         win.hide().catch((error) => console.error(error));
       }
     }).then((off) => {
-      unlistener = off;
+      if (disposed) off(); else unlistener = off;
     });
 
     return () => {
+      disposed = true;
       unlistener?.();
     };
   }, []);
@@ -138,9 +154,18 @@ export function FloatingBar() {
 
     const win = getCurrentWindow();
     let unlistener: (() => void) | undefined;
+    let disposed = false;
 
     listen<SessionUiEvent>("session://state-changed", async (event) => {
+      const eventEpoch = ++sessionEventEpochRef.current;
       const { state, mode: newMode, phase: nextPhase, polish_preset } = event.payload;
+      if (
+        shouldClearFloatingBarTerminalTimer("new_session_event") &&
+        terminalHideTimerRef.current !== null
+      ) {
+        window.clearTimeout(terminalHideTimerRef.current);
+        terminalHideTimerRef.current = null;
+      }
       setRecordingState(state);
       setMode(newMode);
       if (polish_preset) {
@@ -161,6 +186,7 @@ export function FloatingBar() {
             )
           );
         } catch { /* モニター取得失敗時はデフォルト位置 */ }
+        if (disposed || sessionEventEpochRef.current !== eventEpoch) return;
         await win.show();
       } else if (state === "recording") {
         await win.hide();
@@ -171,27 +197,37 @@ export function FloatingBar() {
         setLiveTranscriptError("");
         setActivePolishPreset(settings.polish_preset);
         setRecordingStartedAt(null);
-        if ((nextPhase === "completed" || nextPhase === "failed") && settings.show_floating_bar) {
-          try {
-            await resizeAndPositionFloatingWindow(
-              getFloatingBarHeight(
-                false,
-                newMode,
-                false
-              )
-            );
-          } catch { /* モニター取得失敗時はデフォルト位置 */ }
-          await win.show();
-          window.setTimeout(() => {
-            win.hide().catch((error) => console.error(error));
-          }, 1200);
+        if (
+          (nextPhase === "completed" || nextPhase === "cancelled" || nextPhase === "failed") &&
+          settings.show_floating_bar
+        ) {
+          await runFloatingBarTerminalPresentation({
+            epoch: eventEpoch,
+            isCurrent: (captured) => !disposed && sessionEventEpochRef.current === captured,
+            resize: async () => {
+              try {
+                await resizeAndPositionFloatingWindow(getFloatingBarHeight(false, newMode, false));
+              } catch { /* モニター取得失敗時はデフォルト位置 */ }
+            },
+            show: () => win.show(),
+            scheduleHide: () => {
+              terminalHideTimerRef.current = window.setTimeout(() => {
+                win.hide().catch((error) => console.error(error));
+                terminalHideTimerRef.current = null;
+              }, 1200);
+            },
+          });
         } else {
           await win.hide();
         }
       }
-    }).then((off) => { unlistener = off; });
+    }).then((off) => { if (disposed) off(); else unlistener = off; });
 
-    return () => { unlistener?.(); };
+    return () => {
+      disposed = true;
+      unlistener?.();
+      // 設定変更によるlistener再登録ではterminal hide timerを維持する。
+    };
   }, [
     settings.polish_preset,
     settings.show_floating_bar,
@@ -225,21 +261,23 @@ export function FloatingBar() {
     if (!isTauri) return;
     let partialOff: (() => void) | undefined;
     let statusOff: (() => void) | undefined;
+    let disposed = false;
 
     listen<{ text: string }>("session://partial-text", (event) => {
       setLiveTranscript(event.payload.text);
       if (event.payload.text.trim()) {
         setLiveTranscriptError("");
       }
-    }).then((off) => { partialOff = off; });
+    }).then((off) => { if (disposed) off(); else partialOff = off; });
 
     listen<LiveTranscriptStatusEvent>("session://live-transcript-status", (event) => {
       if (event.payload.state === "error") {
         setLiveTranscriptError(event.payload.detail ?? "録音中の文字表示を開始できませんでした。");
       }
-    }).then((off) => { statusOff = off; });
+    }).then((off) => { if (disposed) off(); else statusOff = off; });
 
     return () => {
+      disposed = true;
       partialOff?.();
       statusOff?.();
     };
@@ -248,12 +286,14 @@ export function FloatingBar() {
   useEffect(() => {
     if (!isTauri) return;
     let phaseOff: (() => void) | undefined;
+    let disposed = false;
 
     listen<{ phase: SessionPhase }>("session://phase-changed", (event) => {
       setPhase(event.payload.phase);
-    }).then((off) => { phaseOff = off; });
+    }).then((off) => { if (disposed) off(); else phaseOff = off; });
 
     return () => {
+      disposed = true;
       phaseOff?.();
     };
   }, []);
@@ -263,11 +303,12 @@ export function FloatingBar() {
     if (!isTauri) return;
 
     let unlistener: (() => void) | undefined;
+    let disposed = false;
     let rafId: number;
 
     listen<number>("audio://level", (event) => {
       levelRef.current = event.payload;
-    }).then((off) => { unlistener = off; });
+    }).then((off) => { if (disposed) off(); else unlistener = off; });
 
     const tick = () => {
       setDisplayLevel((prev) => prev * 0.25 + levelRef.current * 0.75);
@@ -276,6 +317,7 @@ export function FloatingBar() {
     rafId = requestAnimationFrame(tick);
 
     return () => {
+      disposed = true;
       unlistener?.();
       cancelAnimationFrame(rafId);
     };
@@ -287,17 +329,6 @@ export function FloatingBar() {
       return;
     }
     try { await invoke("stop_recording_session"); } catch (e) { console.error(e); }
-  };
-
-  const handlePolishPresetChange = async (preset: PolishPreset) => {
-    setActivePolishPreset(preset);
-    if (!isTauri) return;
-    try {
-      const next = await invoke<PolishPreset>("set_active_polish_preset", { preset });
-      setActivePolishPreset(next);
-    } catch (error) {
-      console.error(error);
-    }
   };
 
   const isRecording = recordingState === "recording";
@@ -312,6 +343,7 @@ export function FloatingBar() {
     polishing: "整形中",
     injecting: "注入中",
     completed: "完了",
+    cancelled: "録音をキャンセルしました",
     failed: "失敗",
   };
   const showLiveTranscript =
@@ -400,12 +432,12 @@ export function FloatingBar() {
         </div>
       )}
       {showPolishPresetControl && (
-        <div className="floating-preset-strip" aria-label="Polishプリセット">
+        <div className="floating-preset-strip" aria-label="録音開始時に固定されたPolishプリセット" title="録音開始時に固定されます。次回の録音前に設定してください。">
           {POLISH_PRESETS.map((preset) => (
             <button
               key={preset.value}
               className={activePolishPreset === preset.value ? "is-active" : ""}
-              onClick={() => handlePolishPresetChange(preset.value)}
+              disabled
               type="button"
             >
               {preset.label}

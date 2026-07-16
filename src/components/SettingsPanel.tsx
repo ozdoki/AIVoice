@@ -7,12 +7,20 @@ import {
   Settings24Regular,
 } from "@fluentui/react-icons";
 import {
+  type AppProfile,
+  type AppProfileInput,
   type AppSettings,
+  type CorrectionArtifact,
+  type CorrectionRecord,
   type DictionarySuggestion,
+  type DataProcessingSummary,
+  type EffectiveAppProfile,
+  type EffectiveSource,
   type FocusedAppContext,
   type HistoryEntry,
   type HotkeyBinding,
   type RecoverySessionSummary,
+  type ProfileMutationResult,
   type SnippetEntry,
   type UsageDaySummary,
   defaultSettings,
@@ -21,6 +29,7 @@ import {
   polishStateDetail,
   polishStateLabel,
 } from "../types";
+import { validateCorrectionArtifacts } from "../correctionArtifactValidation";
 
 interface AudioDevice {
   id: string;
@@ -35,6 +44,28 @@ interface Props {
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 const LIVE_TRANSCRIPT_MODEL = "gpt-realtime-whisper";
+
+function emptyAppProfileDraft(processName = ""): AppProfileInput {
+  return {
+    enabled: true,
+    name: "",
+    process_name: processName,
+    title_condition: null,
+    priority: 0,
+    overrides: {
+      mode: null,
+      polish_preset: null,
+      language_mode: null,
+    },
+  };
+}
+
+function effectiveSourceLabel(source: EffectiveSource): string {
+  if (source.kind === "profile") return `プロファイル: ${source.profile_name ?? source.profile_id}`;
+  if (source.kind === "suggestion") return "既存のアプリ推奨";
+  if (source.kind === "hotkey_override") return "今回のショートカット指定";
+  return "全体設定";
+}
 
 function supportsLiveTranscriptModel(model: string): boolean {
   return model.trim() === LIVE_TRANSCRIPT_MODEL;
@@ -57,6 +88,7 @@ const settingsNavGroups = [
       ["settings-api", "API"],
       ["settings-models", "モデル"],
       ["settings-custom", "カスタム指示"],
+      ["settings-corrections", "修正学習"],
     ],
   },
   {
@@ -78,7 +110,11 @@ const settingsNavGroups = [
   {
     id: "settings-details",
     label: "詳細",
-    items: [["settings-context", "コンテキスト"]],
+    items: [
+      ["settings-context", "コンテキスト"],
+      ["settings-app-profiles", "アプリ別プロファイル"],
+      ["settings-data-flow", "データ処理経路"],
+    ],
   },
 ] as const;
 
@@ -119,6 +155,7 @@ function historyDictionaryCandidate(
   item: HistoryEntry,
   dictionaryWords: string[]
 ): string | null {
+  if (item.operation_kind === "selected_voice_edit") return null;
   const text = `${item.final_text} ${item.raw_text}`;
   const matches = text.match(/[A-Za-z][A-Za-z0-9._/+@#-]{1,63}|[\u30A0-\u30FF]{3,}/g) ?? [];
   return (
@@ -154,14 +191,33 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [historySearch, setHistorySearch] = useState("");
   const [historyRawVisible, setHistoryRawVisible] = useState<Record<string, boolean>>({});
+  const [corrections, setCorrections] = useState<CorrectionRecord[]>([]);
+  const [correctionLoadError, setCorrectionLoadError] = useState<string | null>(null);
+  const [correctionTypeFilter, setCorrectionTypeFilter] = useState("all");
+  const [correctionScopeFilter, setCorrectionScopeFilter] = useState("all");
+  const [correctionStatusFilter, setCorrectionStatusFilter] = useState("all");
+  const [correctionSourceFilter, setCorrectionSourceFilter] = useState("");
+  const [editingCorrectionId, setEditingCorrectionId] = useState<string | null>(null);
+  const [editingCorrectionText, setEditingCorrectionText] = useState("");
+  const [editingCorrectionArtifacts, setEditingCorrectionArtifacts] = useState<CorrectionArtifact[]>([]);
   const [recoverySessions, setRecoverySessions] = useState<RecoverySessionSummary[]>([]);
   const [usage, setUsage] = useState<UsageDaySummary[]>([]);
   const [focusedContext, setFocusedContext] = useState<FocusedAppContext | null>(null);
+  const [appProfiles, setAppProfiles] = useState<AppProfile[]>([]);
+  const [appProfileDraft, setAppProfileDraft] = useState<AppProfileInput>(emptyAppProfileDraft());
+  const [editingAppProfileId, setEditingAppProfileId] = useState<string | null>(null);
+  const [profileCurrentTitle, setProfileCurrentTitle] = useState("");
+  const [profileLoadError, setProfileLoadError] = useState<string | null>(null);
+  const [profileWarnings, setProfileWarnings] = useState<string[]>([]);
+  const [effectiveAppProfile, setEffectiveAppProfile] = useState<EffectiveAppProfile | null>(null);
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [dataFlow, setDataFlow] = useState<DataProcessingSummary | null>(null);
   const [dataBusy, setDataBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   const loadDevices = async () => {
     setDevicesLoading(true);
@@ -244,6 +300,9 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
             status: "success",
             polish_state: "applied_changed",
             pinned: false,
+            polish_preset: "memo",
+            app_process: "notepad.exe",
+            operation_kind: "dictation",
           },
         ]);
         setRecoverySessions([]);
@@ -293,19 +352,58 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
     }
   };
 
+  const loadDataFlow = async () => {
+    if (!isTauri) return;
+    try {
+      setDataFlow(await invoke<DataProcessingSummary>("get_data_processing_summary"));
+    } catch (loadError) {
+      setError(`データ処理経路を取得できませんでした: ${loadError}`);
+    }
+  };
+
+  const loadCorrections = async () => {
+    if (!isTauri) return;
+    try {
+      setCorrections(await invoke<CorrectionRecord[]>("get_corrections"));
+      setCorrectionLoadError(null);
+    } catch (loadError) {
+      setCorrectionLoadError(String(loadError));
+    }
+  };
+
+  const loadAppProfiles = async () => {
+    if (!isTauri) return;
+    try {
+      setAppProfiles(await invoke<AppProfile[]>("get_app_profiles"));
+      setProfileLoadError(null);
+    } catch (loadError) {
+      setProfileLoadError(String(loadError));
+    }
+  };
+
   useEffect(() => {
     const initialize = async () => {
       if (!isTauri) {
         setSettings(defaultSettings);
         await Promise.all([loadDevices(), loadModels(defaultSettings), loadLocalData()]);
+        setInitialLoading(false);
         return;
       }
       try {
         const loaded = await invoke<AppSettings>("get_settings");
         setSettings(loaded);
-        await Promise.all([loadDevices(), loadModels(loaded), loadLocalData()]);
+        await Promise.all([
+          loadDevices(),
+          loadModels(loaded),
+          loadLocalData(),
+          loadDataFlow(),
+          loadCorrections(),
+          loadAppProfiles(),
+        ]);
       } catch (loadError) {
         setError(String(loadError));
+      } finally {
+        setInitialLoading(false);
       }
     };
     initialize();
@@ -332,7 +430,9 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
     key:
       | "push_to_talk_hotkey"
       | "hands_free_raw_hotkey"
-      | "hands_free_polish_hotkey",
+      | "hands_free_polish_hotkey"
+      | "learn_selected_hotkey"
+      | "voice_edit_selected_hotkey",
     binding: HotkeyBinding
   ) => {
     setSettings((current) => ({ ...current, [key]: binding }));
@@ -353,6 +453,8 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
       settings.push_to_talk_hotkey,
       settings.hands_free_raw_hotkey,
       settings.hands_free_polish_hotkey,
+      settings.learn_selected_hotkey,
+      settings.voice_edit_selected_hotkey,
     ];
     if (bindings.some((binding) => !binding.key)) {
       return "すべてのショートカットを設定してください。";
@@ -684,6 +786,109 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
     }
   };
 
+  const handleCorrectionStatus = async (id: string, status: "active" | "undone") => {
+    setDataBusy(true);
+    setError(null);
+    try {
+      const command = status === "active" ? "reactivate_correction" : "undo_correction";
+      setCorrections(await invoke<CorrectionRecord[]>(command, { id }));
+      await loadDataFlow();
+    } catch (actionError) {
+      setError(`修正学習の状態を変更できませんでした: ${actionError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
+  const handleUpdateCorrection = async (item: CorrectionRecord) => {
+    const artifactError = validateCorrectionArtifacts(editingCorrectionArtifacts, {
+      appProcess: item.app_process,
+      mode: item.mode,
+    });
+    if (artifactError) {
+      setError(artifactError);
+      return;
+    }
+    setDataBusy(true);
+    setError(null);
+    try {
+      const updated = await invoke<CorrectionRecord>("update_correction", {
+        id: item.id,
+        correctedText: editingCorrectionText,
+        artifacts: editingCorrectionArtifacts,
+      });
+      setCorrections((current) =>
+        current.map((candidate) => (candidate.id === updated.id ? updated : candidate))
+      );
+      await loadDataFlow();
+      setEditingCorrectionId(null);
+      setEditingCorrectionArtifacts([]);
+    } catch (updateError) {
+      setError(`修正学習を更新できませんでした: ${updateError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
+  const updateEditingArtifact = (index: number, artifact: CorrectionArtifact) => {
+    setEditingCorrectionArtifacts((current) =>
+      current.map((item, itemIndex) => (itemIndex === index ? artifact : item))
+    );
+  };
+
+  const changeEditingArtifactType = (
+    index: number,
+    type: CorrectionArtifact["type"],
+    item: CorrectionRecord
+  ) => {
+    const artifact: CorrectionArtifact =
+      type === "vocabulary"
+        ? { type, value: "", scope: "global" }
+        : type === "replacement"
+          ? { type, from: item.original_text, to: editingCorrectionText, scope: "global" }
+          : type === "style_example"
+            ? { type, input: item.original_text, output: editingCorrectionText }
+            : { type: "none" };
+    setEditingCorrectionArtifacts((current) => {
+      if (type === "none") return [artifact];
+      return current
+        .map((candidate, itemIndex) => (itemIndex === index ? artifact : candidate))
+        .filter((candidate) => candidate.type !== "none");
+    });
+  };
+
+  const handleDeleteCorrection = async (id: string) => {
+    if (!window.confirm("この修正学習を完全に削除します。元に戻せません。")) return;
+    setDataBusy(true);
+    setError(null);
+    try {
+      setCorrections(await invoke<CorrectionRecord[]>("delete_correction", { id }));
+      await loadDataFlow();
+    } catch (deleteError) {
+      setError(`修正学習を削除できませんでした: ${deleteError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
+  const handleClearCorrections = async () => {
+    if (!window.confirm("修正学習をすべて削除します。破損データも空のストアへ置き換わり、元に戻せません。")) {
+      return;
+    }
+    setDataBusy(true);
+    setError(null);
+    try {
+      await invoke("clear_corrections");
+      setCorrections([]);
+      setCorrectionLoadError(null);
+      await loadDataFlow();
+    } catch (clearError) {
+      setError(`修正学習を全消去できませんでした: ${clearError}`);
+    } finally {
+      setDataBusy(false);
+    }
+  };
+
   const handleCopyHistory = async (text: string) => {
     if (!text) return;
     try {
@@ -701,7 +906,8 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
     if (!text) return;
     try {
       if (isTauri) {
-        await invoke("inject_text", { text });
+        const warning = await invoke<string | null>("inject_text", { text });
+        if (warning) setError(warning);
       }
     } catch (injectError) {
       setError(`履歴を再注入できませんでした: ${injectError}`);
@@ -730,6 +936,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
     try {
       if (!isTauri) return;
       const updated = await invoke<RecoverySessionSummary>("inject_recovery_session", { id });
+      if (updated.injection_warning) setError(updated.injection_warning);
       setRecoverySessions((current) =>
         current.map((item) => (item.id === id ? updated : item))
       );
@@ -785,6 +992,151 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
     }
   };
 
+  const handleUseCurrentTarget = async () => {
+    setProfileBusy(true);
+    setError(null);
+    try {
+      const current = isTauri
+        ? await invoke<FocusedAppContext | null>("get_focused_app_context")
+        : { process_name: "Code.exe", window_title: "README.md - KoeType" };
+      if (!current?.process_name) throw new Error("入力先アプリを取得できませんでした。");
+      setProfileCurrentTitle(current.window_title);
+      setEditingAppProfileId(null);
+      setAppProfileDraft({
+        ...emptyAppProfileDraft(current.process_name),
+        name: current.process_name.replace(/\.exe$/i, ""),
+      });
+      setProfileWarnings([]);
+    } catch (targetError) {
+      setError(`現在の対象から作成できませんでした: ${targetError}`);
+    } finally {
+      setProfileBusy(false);
+    }
+  };
+
+  const handleEditAppProfile = (profile: AppProfile) => {
+    setEditingAppProfileId(profile.id);
+    setProfileCurrentTitle("");
+    setProfileWarnings([]);
+    setAppProfileDraft({
+      enabled: profile.enabled,
+      name: profile.name,
+      process_name: profile.process_name,
+      title_condition: profile.title_condition,
+      priority: profile.priority,
+      overrides: { ...profile.overrides },
+    });
+  };
+
+  const handleSaveAppProfile = async () => {
+    setProfileBusy(true);
+    setError(null);
+    setProfileWarnings([]);
+    try {
+      if (!isTauri) return;
+      const warnings = await invoke<string[]>("get_app_profile_conflict_warnings", {
+        input: appProfileDraft,
+        excludeId: editingAppProfileId,
+      });
+      setProfileWarnings(warnings);
+      if (warnings.length > 0 && !window.confirm(`${warnings.join("\n")}\n\nこの優先規則で保存しますか？`)) {
+        return;
+      }
+      const result = editingAppProfileId
+        ? await invoke<ProfileMutationResult>("update_app_profile", {
+            id: editingAppProfileId,
+            input: appProfileDraft,
+          })
+        : await invoke<ProfileMutationResult>("create_app_profile", { input: appProfileDraft });
+      setProfileWarnings(result.warnings);
+      await Promise.all([loadAppProfiles(), loadDataFlow()]);
+      setEffectiveAppProfile(null);
+      setEditingAppProfileId(null);
+      setProfileCurrentTitle("");
+      setAppProfileDraft(emptyAppProfileDraft());
+      setStatusMessage("アプリ別プロファイルを保存しました。");
+    } catch (saveError) {
+      setError(`アプリ別プロファイルを保存できませんでした: ${saveError}`);
+    } finally {
+      setProfileBusy(false);
+    }
+  };
+
+  const handleToggleAppProfile = async (profile: AppProfile) => {
+    setProfileBusy(true);
+    setError(null);
+    try {
+      if (!isTauri) return;
+      const updated = await invoke<AppProfile>("set_app_profile_enabled", {
+        id: profile.id,
+        enabled: !profile.enabled,
+      });
+      setAppProfiles((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      setEffectiveAppProfile(null);
+      await loadDataFlow();
+    } catch (toggleError) {
+      setError(`プロファイルを切り替えられませんでした: ${toggleError}`);
+    } finally {
+      setProfileBusy(false);
+    }
+  };
+
+  const handleDeleteAppProfile = async (id: string) => {
+    if (!window.confirm("このアプリ別プロファイルを削除しますか？")) return;
+    setProfileBusy(true);
+    setError(null);
+    try {
+      const next = isTauri
+        ? await invoke<AppProfile[]>("delete_app_profile", { id })
+        : appProfiles.filter((item) => item.id !== id);
+      setAppProfiles(next);
+      setEffectiveAppProfile(null);
+      await loadDataFlow();
+      if (editingAppProfileId === id) {
+        setEditingAppProfileId(null);
+        setAppProfileDraft(emptyAppProfileDraft());
+      }
+    } catch (deleteError) {
+      setError(`プロファイルを削除できませんでした: ${deleteError}`);
+    } finally {
+      setProfileBusy(false);
+    }
+  };
+
+  const handleClearAppProfiles = async () => {
+    if (!window.confirm("破損データを含むすべてのアプリ別プロファイルを消去しますか？元に戻せません。")) return;
+    setProfileBusy(true);
+    try {
+      if (isTauri) await invoke("clear_app_profiles");
+      setAppProfiles([]);
+      setProfileLoadError(null);
+      setEffectiveAppProfile(null);
+      setEditingAppProfileId(null);
+      setProfileCurrentTitle("");
+      setAppProfileDraft(emptyAppProfileDraft());
+      setProfileWarnings([]);
+      await loadDataFlow();
+      setStatusMessage("アプリ別プロファイルを全消去しました。");
+    } catch (clearError) {
+      setError(`プロファイルを全消去できませんでした: ${clearError}`);
+    } finally {
+      setProfileBusy(false);
+    }
+  };
+
+  const handlePreviewEffectiveAppProfile = async () => {
+    setProfileBusy(true);
+    setError(null);
+    try {
+      if (!isTauri) return;
+      setEffectiveAppProfile(await invoke<EffectiveAppProfile>("preview_current_app_profile"));
+    } catch (previewError) {
+      setError(`有効設定を確認できませんでした: ${previewError}`);
+    } finally {
+      setProfileBusy(false);
+    }
+  };
+
   const formatHistoryTime = (seconds: number) =>
     new Date(seconds * 1000).toLocaleString();
 
@@ -823,6 +1175,23 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
       if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
       return b.created_at - a.created_at;
     });
+  const correctionSourceQuery = correctionSourceFilter.trim().toLowerCase();
+  const visibleCorrections = corrections.filter((item) => {
+    const types = item.artifacts.map((artifact) => artifact.type);
+    const scopes = item.artifacts.flatMap((artifact) =>
+      artifact.type === "vocabulary" || artifact.type === "replacement" ? [artifact.scope] : []
+    );
+    return (
+      (correctionTypeFilter === "all" || types.includes(correctionTypeFilter as CorrectionArtifact["type"])) &&
+      (correctionScopeFilter === "all" || scopes.includes(correctionScopeFilter as "global" | "app")) &&
+      (correctionStatusFilter === "all" || item.status === correctionStatusFilter) &&
+      (!correctionSourceQuery ||
+        [item.source_history_id, item.app_process, item.mode, item.polish_preset]
+          .join(" ")
+          .toLowerCase()
+          .includes(correctionSourceQuery))
+    );
+  });
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
@@ -858,7 +1227,9 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
         {statusMessage && (
           <p className="field-success settings-status">{statusMessage}</p>
         )}
+        {initialLoading && <p className="settings-note" role="status">保存済み設定を読み込んでいます…</p>}
 
+        <fieldset className="settings-loading-fieldset" disabled={initialLoading}>
         <div className="dialog-body settings-body-with-nav">
           <nav className="settings-side-nav" aria-label="設定カテゴリ">
             {settingsNavGroups.map((group) => (
@@ -990,6 +1361,24 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                 {modelOptions(settings.api_model)}
               </select>
             </FormField>
+            <FormField label="音声認識の言語">
+              <select
+                value={settings.language_mode}
+                onChange={(event) =>
+                  setSettings((current) => ({
+                    ...current,
+                    language_mode: event.target.value as AppSettings["language_mode"],
+                  }))
+                }
+              >
+                <option value="auto">Auto（日本語・英語・混在を自動判定）</option>
+                <option value="ja">日本語</option>
+                <option value="en">英語</option>
+              </select>
+            </FormField>
+            <p className="settings-note">
+              Autoでは言語ヒントをAPIへ送りません。日本語・英語は認識のヒントであり、翻訳や出力言語の強制ではありません。OpenAI互換APIではプロバイダ側の対応状況に依存します。
+            </p>
             {settings.show_live_transcript_in_floating_bar &&
               !supportsLiveTranscriptModel(settings.api_model) && (
                 <p className="field-warning">
@@ -1020,6 +1409,303 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                 モデル一覧を取得できませんでした: {modelError}
               </p>
             )}
+          </SettingsSection>
+
+          <SettingsSection id="settings-corrections" title="修正学習">
+            <FormField label="動作">
+              <select
+                value={settings.correction_learning_mode}
+                onChange={(event) =>
+                  setSettings((current) => ({
+                    ...current,
+                    correction_learning_mode: event.target.value as "off" | "ask",
+                  }))
+                }
+              >
+                <option value="off">オフ</option>
+                <option value="ask">保存前に確認</option>
+              </select>
+            </FormField>
+            <p className="settings-note">
+              オフでは保存済み学習もASR・置換・Polishへ一切適用しません。自動学習はなく、確認画面で選んだ内容だけを保存します。
+            </p>
+            <p className="settings-note">
+              Raw・元の出力・修正後はローカルへ平文保存され、暗号化は保証されません。語彙とPolish文体例は外部APIへ送信され得ます。決定的置換は端末内だけで適用します。
+            </p>
+            <div className="section-toolbar">
+              <span>{visibleCorrections.length}/{corrections.length} 件を表示</span>
+              <button className="button danger compact" onClick={handleClearCorrections} disabled={dataBusy}>
+                全消去・破損を復旧
+              </button>
+            </div>
+            {correctionLoadError && (
+              <div className="inline-error" role="alert">
+                <span>{correctionLoadError}</span>
+                <small>通常操作では上書きしていません。「全消去・破損を復旧」だけが明示的な復旧経路です。</small>
+              </div>
+            )}
+            <div className="history-tools correction-filters">
+              <select aria-label="修正学習のタイプ" value={correctionTypeFilter} onChange={(event) => setCorrectionTypeFilter(event.target.value)}>
+                <option value="all">全タイプ</option>
+                <option value="vocabulary">語彙</option>
+                <option value="replacement">置換</option>
+                <option value="style_example">文体例</option>
+                <option value="none">適用なし</option>
+              </select>
+              <select aria-label="修正学習の適用範囲" value={correctionScopeFilter} onChange={(event) => setCorrectionScopeFilter(event.target.value)}>
+                <option value="all">全スコープ</option>
+                <option value="global">全アプリ</option>
+                <option value="app">アプリ別</option>
+              </select>
+              <select aria-label="修正学習の状態" value={correctionStatusFilter} onChange={(event) => setCorrectionStatusFilter(event.target.value)}>
+                <option value="all">全状態</option>
+                <option value="active">有効</option>
+                <option value="undone">取り消し済み</option>
+              </select>
+              <input
+                aria-label="修正学習の履歴ID・アプリ・モード検索"
+                value={correctionSourceFilter}
+                placeholder="履歴ID・アプリ・モード"
+                onChange={(event) => setCorrectionSourceFilter(event.target.value)}
+              />
+            </div>
+            <div className="history-list correction-list">
+              {visibleCorrections.length === 0 ? (
+                <p className="settings-note">条件に一致する修正学習はありません。</p>
+              ) : (
+                visibleCorrections.map((item) => (
+                  <article className={`history-card ${item.status === "undone" ? "is-error" : ""}`} key={item.id}>
+                    <div className="history-meta">
+                      <span>{formatHistoryTime(item.created_at)}</span>
+                      <span>{item.mode === "polish" ? `Polish/${item.polish_preset}` : "Raw"}</span>
+                      <span>{item.app_process || "全アプリ/不明"}</span>
+                      <span>{item.status === "active" ? "有効" : "取り消し済み"}</span>
+                      <span>{item.classification}</span>
+                    </div>
+                    <small>元の出力</small>
+                    <p>{item.original_text}</p>
+                    <small>修正後</small>
+                    {editingCorrectionId === item.id ? (
+                      <textarea
+                        className="settings-textarea"
+                        value={editingCorrectionText}
+                        maxLength={20000}
+                        onChange={(event) => setEditingCorrectionText(event.target.value)}
+                      />
+                    ) : (
+                      <p>{item.corrected_text}</p>
+                    )}
+                    {editingCorrectionId === item.id ? (
+                      <div className="correction-artifact-management">
+                        {editingCorrectionArtifacts.map((artifact, index) => (
+                          <div className="correction-artifact-editor" key={`manage-${index}`}>
+                            <select
+                              aria-label="学習タイプ"
+                              value={artifact.type}
+                              onChange={(event) =>
+                                changeEditingArtifactType(
+                                  index,
+                                  event.target.value as CorrectionArtifact["type"],
+                                  item
+                                )
+                              }
+                            >
+                              <option value="vocabulary">語彙</option>
+                              <option value="replacement">置換</option>
+                              {item.mode === "polish" && <option value="style_example">文体例</option>}
+                              <option value="none">適用なし</option>
+                            </select>
+                            {artifact.type === "vocabulary" && (
+                              <>
+                                <input
+                                  aria-label="語彙"
+                                  value={artifact.value}
+                                  maxLength={128}
+                                  onChange={(event) =>
+                                    updateEditingArtifact(index, {
+                                      ...artifact,
+                                      value: event.target.value,
+                                    })
+                                  }
+                                />
+                                <select
+                                  aria-label="語彙の適用範囲"
+                                  value={artifact.scope}
+                                  onChange={(event) =>
+                                    updateEditingArtifact(index, {
+                                      ...artifact,
+                                      scope: event.target.value as "global" | "app",
+                                    })
+                                  }
+                                >
+                                  <option value="global">全アプリ</option>
+                                  <option value="app">アプリ別</option>
+                                </select>
+                              </>
+                            )}
+                            {artifact.type === "replacement" && (
+                              <>
+                                <input
+                                  aria-label="置換元"
+                                  value={artifact.from}
+                                  maxLength={128}
+                                  onChange={(event) =>
+                                    updateEditingArtifact(index, {
+                                      ...artifact,
+                                      from: event.target.value,
+                                    })
+                                  }
+                                />
+                                <input
+                                  aria-label="置換先"
+                                  value={artifact.to}
+                                  maxLength={2000}
+                                  onChange={(event) =>
+                                    updateEditingArtifact(index, {
+                                      ...artifact,
+                                      to: event.target.value,
+                                    })
+                                  }
+                                />
+                                <select
+                                  aria-label="置換の適用範囲"
+                                  value={artifact.scope}
+                                  onChange={(event) =>
+                                    updateEditingArtifact(index, {
+                                      ...artifact,
+                                      scope: event.target.value as "global" | "app",
+                                    })
+                                  }
+                                >
+                                  <option value="global">全アプリ</option>
+                                  <option value="app">アプリ別</option>
+                                </select>
+                              </>
+                            )}
+                            {artifact.type === "style_example" && (
+                              <>
+                                <textarea
+                                  aria-label="文体例の入力"
+                                  value={artifact.input}
+                                  maxLength={8000}
+                                  onChange={(event) =>
+                                    updateEditingArtifact(index, {
+                                      ...artifact,
+                                      input: event.target.value,
+                                    })
+                                  }
+                                />
+                                <textarea
+                                  aria-label="文体例の出力"
+                                  value={artifact.output}
+                                  maxLength={8000}
+                                  onChange={(event) =>
+                                    updateEditingArtifact(index, {
+                                      ...artifact,
+                                      output: event.target.value,
+                                    })
+                                  }
+                                />
+                              </>
+                            )}
+                            {editingCorrectionArtifacts.length > 1 && (
+                              <button
+                                className="button secondary compact"
+                                onClick={() =>
+                                  setEditingCorrectionArtifacts((current) =>
+                                    current.filter((_, itemIndex) => itemIndex !== index)
+                                  )
+                                }
+                              >
+                                候補を削除
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                        {editingCorrectionArtifacts.length < 16 &&
+                          !editingCorrectionArtifacts.some((artifact) => artifact.type === "none") && (
+                            <button
+                              className="button secondary compact"
+                              onClick={() =>
+                                setEditingCorrectionArtifacts((current) => [
+                                  ...current,
+                                  { type: "vocabulary", value: "", scope: "global" },
+                                ])
+                              }
+                            >
+                              学習候補を追加
+                            </button>
+                          )}
+                      </div>
+                    ) : (
+                      <div className="suggestion-chips">
+                        {item.artifacts.map((artifact, index) => (
+                          <span className="suggestion-chip" key={`${artifact.type}-${index}`}>
+                            {artifact.type === "vocabulary"
+                              ? `語彙/${artifact.scope}: ${artifact.value}`
+                              : artifact.type === "replacement"
+                                ? `置換/${artifact.scope}: ${artifact.from} → ${artifact.to}`
+                                : artifact.type === "style_example"
+                                  ? "Polish文体例/API送信あり"
+                                  : "適用なし"}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {editingCorrectionId === item.id && (() => {
+                      const artifactError = validateCorrectionArtifacts(editingCorrectionArtifacts, {
+                        appProcess: item.app_process,
+                        mode: item.mode,
+                      });
+                      return artifactError ? <p className="field-error" role="alert">{artifactError}</p> : null;
+                    })()}
+                    <div className="history-actions">
+                      {editingCorrectionId === item.id ? (
+                        <>
+                          <button
+                            className="button secondary compact"
+                            onClick={() => handleUpdateCorrection(item)}
+                            disabled={dataBusy || Boolean(validateCorrectionArtifacts(editingCorrectionArtifacts, { appProcess: item.app_process, mode: item.mode }))}
+                          >
+                            保存
+                          </button>
+                          <button
+                            className="button secondary compact"
+                            onClick={() => {
+                              setEditingCorrectionId(null);
+                              setEditingCorrectionArtifacts([]);
+                            }}
+                          >
+                            キャンセル
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          className="button secondary compact"
+                          onClick={() => {
+                            setEditingCorrectionId(item.id);
+                            setEditingCorrectionText(item.corrected_text);
+                            setEditingCorrectionArtifacts(item.artifacts.map((artifact) => ({ ...artifact })));
+                          }}
+                        >
+                          編集
+                        </button>
+                      )}
+                      <button
+                        className="button secondary compact"
+                        onClick={() => handleCorrectionStatus(item.id, item.status === "active" ? "undone" : "active")}
+                        disabled={dataBusy}
+                      >
+                        {item.status === "active" ? "取り消す" : "再有効化"}
+                      </button>
+                      <button className="button danger compact" onClick={() => handleDeleteCorrection(item.id)} disabled={dataBusy}>
+                        削除
+                      </button>
+                    </div>
+                  </article>
+                ))
+              )}
+            </div>
           </SettingsSection>
 
           <SettingsCategory
@@ -1090,6 +1776,18 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
               label="Polishハンズフリー"
               value={settings.hands_free_polish_hotkey}
               onChange={(binding) => updateHotkey("hands_free_polish_hotkey", binding)}
+              onError={setHotkeyError}
+            />
+            <HotkeyField
+              label="選択テキストから修正を学習"
+              value={settings.learn_selected_hotkey}
+              onChange={(binding) => updateHotkey("learn_selected_hotkey", binding)}
+              onError={setHotkeyError}
+            />
+            <HotkeyField
+              label="選択テキストを音声指示で編集"
+              value={settings.voice_edit_selected_hotkey}
+              onChange={(binding) => updateHotkey("voice_edit_selected_hotkey", binding)}
               onError={setHotkeyError}
             />
             <p className="settings-note">
@@ -1314,6 +2012,169 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
             )}
           </SettingsSection>
 
+          <SettingsSection id="settings-app-profiles" title="アプリ別プロファイル">
+            <p className="settings-note">
+              プロセス名が完全一致する入力先だけに設定を上書きします。プロセス名だけの条件を推奨します。タイトルには文書名などが含まれる場合があるため、条件として採用した文字だけを保存し、入力欄本文は取得・表示・保存しません。
+            </p>
+            <div className="api-key-actions">
+              <button className="button secondary compact" onClick={handleUseCurrentTarget} disabled={profileBusy}>
+                直前の外部入力先から作成
+              </button>
+              <button className="button secondary compact" onClick={handlePreviewEffectiveAppProfile} disabled={profileBusy || Boolean(profileLoadError)}>
+                現在の有効設定を確認
+              </button>
+              <button className="button danger compact" onClick={handleClearAppProfiles} disabled={profileBusy}>
+                全消去・破損から復旧
+              </button>
+            </div>
+            <p className="settings-note">KoeTypeを開く直前にフォーカスしていた外部アプリを入力先候補として使います。取得できる場合は現在の外部アプリを優先します。</p>
+            {profileLoadError && (
+              <p className="field-error" role="alert">
+                読み込みに失敗しました。データは上書きしていません: {profileLoadError}
+              </p>
+            )}
+            {effectiveAppProfile && (
+              <div className="context-preview">
+                <strong>{effectiveAppProfile.process_name || "対象プロセスを取得できませんでした"}</strong>
+                <small>モード: {effectiveAppProfile.mode}（{effectiveSourceLabel(effectiveAppProfile.mode_source)}）</small>
+                <small>Polish: {effectiveAppProfile.polish_preset}（{effectiveSourceLabel(effectiveAppProfile.polish_preset_source)}）</small>
+                <small>言語: {effectiveAppProfile.language_mode}（{effectiveSourceLabel(effectiveAppProfile.language_mode_source)}）</small>
+              </div>
+            )}
+
+            <div className="settings-list">
+              {appProfiles.map((profile) => (
+                <article className="context-preview" key={profile.id}>
+                  <strong>{profile.name} {!profile.enabled && "（無効）"}</strong>
+                  <small>{profile.process_name}{profile.title_condition ? ` / タイトルに「${profile.title_condition.pattern}」を含む` : " / タイトル条件なし"}</small>
+                  <small>優先度: {profile.priority}</small>
+                  <div className="api-key-actions">
+                    <button className="button secondary compact" onClick={() => handleToggleAppProfile(profile)} disabled={profileBusy}>
+                      {profile.enabled ? "無効にする" : "有効にする"}
+                    </button>
+                    <button className="button secondary compact" onClick={() => handleEditAppProfile(profile)} disabled={profileBusy}>編集</button>
+                    <button className="button danger compact" onClick={() => handleDeleteAppProfile(profile.id)} disabled={profileBusy}>削除</button>
+                  </div>
+                </article>
+              ))}
+              {!profileLoadError && appProfiles.length === 0 && <p className="settings-note">登録済みプロファイルはありません。</p>}
+            </div>
+
+            <h4>{editingAppProfileId ? "プロファイルを編集" : "プロファイルを追加"}</h4>
+            <FormField label="名前">
+              <input maxLength={80} value={appProfileDraft.name} onChange={(event) => setAppProfileDraft((current) => ({ ...current, name: event.target.value }))} />
+            </FormField>
+            <FormField label="プロセス名（パスを貼っても保存時にファイル名へ正規化）">
+              <input maxLength={260} value={appProfileDraft.process_name} onChange={(event) => setAppProfileDraft((current) => ({ ...current, process_name: event.target.value }))} />
+            </FormField>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={Boolean(appProfileDraft.title_condition)}
+                onChange={(event) => setAppProfileDraft((current) => ({
+                  ...current,
+                  title_condition: event.target.checked ? { match_kind: "contains", pattern: "" } : null,
+                }))}
+              />
+              <span>タイトルの部分一致条件を使う（大文字小文字を区別しない）</span>
+            </label>
+            {appProfileDraft.title_condition && (
+              <>
+                <FormField label="タイトルに含む文字">
+                  <input
+                    maxLength={200}
+                    value={appProfileDraft.title_condition.pattern}
+                    onChange={(event) => setAppProfileDraft((current) => ({ ...current, title_condition: { match_kind: "contains", pattern: event.target.value } }))}
+                  />
+                </FormField>
+                {profileCurrentTitle && (
+                  <button
+                    className="button secondary compact"
+                    onClick={() => setAppProfileDraft((current) => ({ ...current, title_condition: { match_kind: "contains", pattern: profileCurrentTitle.slice(0, 200) } }))}
+                    disabled={profileBusy}
+                  >
+                    現在のタイトルを明示的に採用
+                  </button>
+                )}
+                <p className="settings-note">現在のタイトルは一時プレビューです。このボタンで採用するか手入力して保存するまで永続化しません。文書名を含む可能性を確認してください。</p>
+              </>
+            )}
+            <FormField label="優先度（同じ種類の条件では大きい値を優先）">
+              <input type="number" min={-10000} max={10000} value={appProfileDraft.priority} onChange={(event) => setAppProfileDraft((current) => ({ ...current, priority: Number(event.target.value) || 0 }))} />
+            </FormField>
+            <FormField label="モード">
+              <select value={appProfileDraft.overrides.mode ?? "inherit"} onChange={(event) => setAppProfileDraft((current) => ({ ...current, overrides: { ...current.overrides, mode: event.target.value === "inherit" ? null : event.target.value as "raw" | "polish" } }))}>
+                <option value="inherit">継承</option><option value="raw">Raw</option><option value="polish">Polish</option>
+              </select>
+            </FormField>
+            <FormField label="Polishプリセット">
+              <select value={appProfileDraft.overrides.polish_preset ?? "inherit"} onChange={(event) => setAppProfileDraft((current) => ({ ...current, overrides: { ...current.overrides, polish_preset: event.target.value === "inherit" ? null : event.target.value as AppProfileInput["overrides"]["polish_preset"] } }))}>
+                <option value="inherit">継承</option><option value="slack">Slack</option><option value="email">メール</option><option value="memo">メモ</option><option value="prompt">プロンプト</option><option value="technical">技術文書</option>
+              </select>
+            </FormField>
+            <FormField label="言語">
+              <select value={appProfileDraft.overrides.language_mode ?? "inherit"} onChange={(event) => setAppProfileDraft((current) => ({ ...current, overrides: { ...current.overrides, language_mode: event.target.value === "inherit" ? null : event.target.value as "auto" | "ja" | "en" } }))}>
+                <option value="inherit">継承</option><option value="auto">自動</option><option value="ja">日本語</option><option value="en">英語</option>
+              </select>
+            </FormField>
+            <label className="toggle-row">
+              <input type="checkbox" checked={appProfileDraft.enabled} onChange={(event) => setAppProfileDraft((current) => ({ ...current, enabled: event.target.checked }))} />
+              <span>保存後すぐ有効にする</span>
+            </label>
+            {profileWarnings.map((warning) => <p className="field-warning" key={warning}>{warning}</p>)}
+            <div className="api-key-actions">
+              <button className="button primary compact" onClick={handleSaveAppProfile} disabled={profileBusy || Boolean(profileLoadError)}>保存</button>
+              <button className="button secondary compact" onClick={() => { setEditingAppProfileId(null); setProfileCurrentTitle(""); setProfileWarnings([]); setAppProfileDraft(emptyAppProfileDraft()); }} disabled={profileBusy}>下書きをリセット</button>
+            </div>
+            <p className="settings-note">録音開始時に一度だけ解決し、録音中にフォーカスや設定が変わってもそのセッションの値は変わりません。Raw/Polish専用ショートカットのモード指定はプロファイルより優先されます。</p>
+          </SettingsSection>
+
+          <SettingsSection id="settings-data-flow" title="データ処理経路（現在の有効設定）">
+            {dataFlow ? (
+              <div className="settings-list">
+                <div className="context-preview">
+                  <strong>端末内</strong>
+                  <small>{dataFlow.capture}</small>
+                </div>
+                <div className="context-preview">
+                  <strong>音声認識API: {dataFlow.asr.destination_host}</strong>
+                  <small>
+                    {dataFlow.asr.processing} / {dataFlow.asr.model}
+                    {dataFlow.asr.fallback_model
+                      ? ` → Batch ${dataFlow.asr.fallback_model}`
+                      : ""}
+                  </small>
+                  <small>言語: {dataFlow.language}</small>
+                  <small>送信され得る内容: {dataFlow.asr.sent_data.join("、")}</small>
+                  <small>{dataFlow.external_retention}</small>
+                </div>
+                {dataFlow.polish && (
+                  <div className="context-preview">
+                    <strong>Polish API: {dataFlow.polish.destination_host}</strong>
+                    <small>{dataFlow.polish.processing} / {dataFlow.polish.model}</small>
+                    <small>送信され得る内容: {dataFlow.polish.sent_data.join("、")}</small>
+                  </div>
+                )}
+                <div className="context-preview">
+                  <strong>F9 選択音声編集API: {dataFlow.selected_voice_edit.destination_host}</strong>
+                  <small>{dataFlow.selected_voice_edit.processing} / {dataFlow.selected_voice_edit.model}</small>
+                  <small>送信される内容: {dataFlow.selected_voice_edit.sent_data.join("、")}</small>
+                  <small>音声指示と編集案はpreview表示前にローカル平文履歴へ自動保存します。原選択文は履歴・Recoveryへ別保存しません。</small>
+                </div>
+                <div className="context-preview">
+                  <strong>ローカル保存</strong>
+                  <small>{dataFlow.local_storage.join("、")}</small>
+                  <small>修正学習: {dataFlow.correction_learning_status}</small>
+                </div>
+              </div>
+            ) : (
+              <p className="settings-note">保存済み設定から処理経路を読み込んでいます。</p>
+            )}
+            <p className="settings-note">
+              アプリ別プロファイルは、現在の外部アプリまたはKoeTypeを開く直前の外部入力先を基準に反映します。送信先は設定URLのホスト名だけを表示し、パス・クエリ・認証情報は表示しません。「端末内／クラウド」を切り替える機能ではありません。
+            </p>
+          </SettingsSection>
+
           <SettingsSection id="settings-general" title="一般設定">
             <div className="section-toolbar">
               <span>初回設定を後から確認し直せます。</span>
@@ -1348,6 +2209,9 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                 この設定をONにすると、ASR Modelは {LIVE_TRANSCRIPT_MODEL} に切り替わります。
               </p>
             )}
+            <p className="settings-note">
+              変換結果は互換性の高い貼り付け方式で入力し、入力後もクリップボードに残ります。画像など既存の形式は復元しません。
+            </p>
             <label className="toggle-row">
               <input
                 type="checkbox"
@@ -1400,6 +2264,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                       <div className="history-meta">
                         <span>{formatHistoryTime(item.created_at)}</span>
                         <span>{item.mode === "polish" ? "Polish" : "Raw"}</span>
+                        {item.operation_kind === "selected_voice_edit" && <span>選択音声編集</span>}
                         <span>{recoveryStatusLabel(item.status)}</span>
                         <span>{Math.round(item.duration_ms / 1000)}秒</span>
                       </div>
@@ -1422,7 +2287,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                         <button
                           className="button secondary compact"
                           onClick={() => handleInjectRecovery(item.id)}
-                          disabled={dataBusy || !item.final_text}
+                          disabled={dataBusy || !item.final_text || item.operation_kind === "selected_voice_edit"}
                         >
                           再注入
                         </button>
@@ -1457,7 +2322,9 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                   const showRawText = Boolean(historyRawVisible[item.id] && canShowRaw);
                   const text = showRawText ? item.raw_text : item.final_text;
                   const dictionaryCandidate = historyDictionaryCandidate(item, dictionaryWords);
-                  const polishLabel = showRawText ? null : polishStateLabel(item.polish_state);
+                  const polishLabel = showRawText || item.operation_kind === "selected_voice_edit"
+                    ? null
+                    : polishStateLabel(item.polish_state);
                   return (
                     <article
                       className={`history-card ${item.pinned ? "is-pinned" : ""} ${
@@ -1468,6 +2335,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                       <div className="history-meta">
                         <span>{formatHistoryTime(item.created_at)}</span>
                         <span>{item.mode === "polish" ? "Polish" : "Raw"}</span>
+                        {item.operation_kind === "selected_voice_edit" && <span>選択音声編集</span>}
                         <span>{item.status === "error" ? "失敗" : "成功"}</span>
                         {polishLabel && (
                           <span
@@ -1501,7 +2369,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                               }))
                             }
                           >
-                            {showRawText ? "Final" : "Raw"}
+                            {showRawText ? "編集案" : item.operation_kind === "selected_voice_edit" ? "音声指示" : "Raw"}
                           </button>
                         )}
                         <button
@@ -1529,7 +2397,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                         <button
                           className="button secondary compact"
                           onClick={() => handleRerunHistoryPolish(item.id)}
-                          disabled={dataBusy || !(item.raw_text || item.final_text)}
+                          disabled={dataBusy || item.operation_kind === "selected_voice_edit" || !(item.raw_text || item.final_text)}
                         >
                           Polish再実行
                         </button>
@@ -1575,6 +2443,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
           </SettingsSection>
           </div>
         </div>
+        </fieldset>
 
         <footer className="dialog-footer">
           <button className="button secondary" onClick={onClose}>
@@ -1583,7 +2452,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
           <button
             className={`button primary ${saved ? "is-saved" : ""}`}
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || initialLoading}
           >
             {saved && <Checkmark20Regular />}
             {saved ? "保存済み" : saving ? "保存中..." : "保存"}
@@ -1641,10 +2510,10 @@ function FormField({
   children: React.ReactNode;
 }) {
   return (
-    <div className="form-field">
-      <label>{label}</label>
+    <label className="form-field">
+      <span>{label}</span>
       {children}
-    </div>
+    </label>
   );
 }
 
