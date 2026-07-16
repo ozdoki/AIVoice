@@ -1,5 +1,6 @@
 use crate::{
     context::FocusedAppContext,
+    corrections::StyleExample,
     polish::{self, PolishState},
     settings::AppSettings,
     state::Mode,
@@ -28,13 +29,32 @@ pub async fn route(
     focused_context: Option<&FocusedAppContext>,
     text: &str,
 ) -> ModeRouteOutcome {
+    route_with_style_examples(mode, settings, dictionary_words, focused_context, &[], text).await
+}
+
+pub async fn route_with_style_examples(
+    mode: &Mode,
+    settings: &AppSettings,
+    dictionary_words: &[String],
+    focused_context: Option<&FocusedAppContext>,
+    style_examples: &[StyleExample],
+    text: &str,
+) -> ModeRouteOutcome {
     match mode {
         Mode::Raw => ModeRouteOutcome {
             text: text.to_string(),
             polish_state: PolishState::NotRequested,
         },
         Mode::Polish => {
-            match polish::polish_text(settings, dictionary_words, focused_context, text).await {
+            match polish::polish_text_with_examples(
+                settings,
+                dictionary_words,
+                focused_context,
+                style_examples,
+                text,
+            )
+            .await
+            {
                 Ok(polished) => {
                     let polish_state = applied_state(text, &polished);
                     ModeRouteOutcome {
@@ -82,6 +102,19 @@ mod tests {
         let result = route(&Mode::Polish, &settings, &[], None, "元の文").await;
         assert_eq!(result.text, "元の文");
         assert_eq!(result.polish_state, PolishState::FallbackNotConfigured);
+    }
+
+    #[tokio::test]
+    async fn raw_mode_language_corpus_is_never_rewritten_or_translated() {
+        for text in [
+            "今日はKoeTypeを使う。",
+            "Use KoeType for this note.",
+            "KoeTypeでAPI fallbackを確認する。",
+        ] {
+            let result = route(&Mode::Raw, &AppSettings::default(), &[], None, text).await;
+            assert_eq!(result.text, text);
+            assert_eq!(result.polish_state, PolishState::NotRequested);
+        }
     }
 
     #[test]

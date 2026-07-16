@@ -7,8 +7,12 @@ export type SessionPhase =
   | "polishing"
   | "injecting"
   | "completed"
+  | "cancelled"
   | "failed";
 export type PolishPreset = "slack" | "email" | "memo" | "prompt" | "technical";
+export type LanguageMode = "auto" | "ja" | "en";
+export type CorrectionLearningMode = "off" | "ask";
+export type OperationKind = "dictation" | "selected_voice_edit";
 export type PolishState =
   | "unknown"
   | "not_requested"
@@ -31,6 +35,7 @@ export interface AppSettings {
   api_key: string;
   has_api_key?: boolean;
   api_model: string;
+  language_mode: LanguageMode;
   polish_model: string;
   mode: Mode;
   device_id: string | null;
@@ -39,11 +44,14 @@ export interface AppSettings {
   deep_context_enabled: boolean;
   show_floating_bar: boolean;
   show_live_transcript_in_floating_bar: boolean;
+  correction_learning_mode: CorrectionLearningMode;
   launch_at_login: boolean;
   onboarding_completed: boolean;
   push_to_talk_hotkey: HotkeyBinding;
   hands_free_raw_hotkey: HotkeyBinding;
   hands_free_polish_hotkey: HotkeyBinding;
+  learn_selected_hotkey: HotkeyBinding;
+  voice_edit_selected_hotkey: HotkeyBinding;
 }
 
 export interface HistoryEntry {
@@ -57,6 +65,104 @@ export interface HistoryEntry {
   status: "success" | "error";
   polish_state: PolishState;
   pinned: boolean;
+  polish_preset: string;
+  app_process: string;
+  operation_kind: OperationKind;
+}
+
+export interface AppProfileOverrides {
+  mode: Mode | null;
+  polish_preset: PolishPreset | null;
+  language_mode: LanguageMode | null;
+}
+
+export interface AppProfileInput {
+  enabled: boolean;
+  name: string;
+  process_name: string;
+  title_condition: { match_kind: "contains"; pattern: string } | null;
+  priority: number;
+  overrides: AppProfileOverrides;
+}
+
+export interface AppProfile extends AppProfileInput {
+  id: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface EffectiveSource {
+  kind: "profile" | "suggestion" | "global" | "hotkey_override";
+  profile_id: string | null;
+  profile_name: string | null;
+}
+
+export interface EffectiveAppProfile {
+  process_name: string;
+  mode: Mode;
+  mode_source: EffectiveSource;
+  polish_preset: PolishPreset;
+  polish_preset_source: EffectiveSource;
+  language_mode: LanguageMode;
+  language_mode_source: EffectiveSource;
+  matched_profile_ids: string[];
+}
+
+export interface ProfileMutationResult {
+  profile: AppProfile;
+  warnings: string[];
+}
+
+export type CorrectionStatus = "active" | "undone";
+export type CorrectionClassification = "minor" | "substantial" | "meaning_change_suspected";
+export type LearningScope = "global" | "app";
+export type CorrectionArtifact =
+  | { type: "vocabulary"; value: string; scope: LearningScope }
+  | { type: "replacement"; from: string; to: string; scope: LearningScope }
+  | { type: "style_example"; input: string; output: string }
+  | { type: "none" };
+
+export interface CorrectionRecord {
+  id: string;
+  source_history_id: string;
+  raw_text: string;
+  original_text: string;
+  corrected_text: string;
+  mode: Mode;
+  polish_preset: string;
+  app_process: string;
+  classification: CorrectionClassification;
+  status: CorrectionStatus;
+  artifacts: CorrectionArtifact[];
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CorrectionPreview {
+  source_history_id: string;
+  original_text: string;
+  corrected_text: string;
+  app_process: string;
+  classification: CorrectionClassification;
+  candidates: CorrectionArtifact[];
+  default_artifacts: CorrectionArtifact[];
+}
+
+export interface SelectedCorrectionCandidate {
+  id: string;
+  final_text: string;
+  mode: Mode;
+  polish_preset: string;
+  app_process: string;
+  created_at: number;
+  same_app: boolean;
+}
+
+export interface PrepareSelectedCorrectionResult {
+  selected_text: string;
+  candidates: SelectedCorrectionCandidate[];
+  token: string;
+  warning: "external_clipboard_change_preserved" | null;
 }
 
 export function polishStateLabel(state: PolishState | null | undefined): string | null {
@@ -131,6 +237,8 @@ export interface RecoverySessionSummary {
   error: string | null;
   has_audio: boolean;
   can_retry: boolean;
+  operation_kind: OperationKind;
+  injection_warning: string | null;
 }
 
 export interface UsageDaySummary {
@@ -149,10 +257,54 @@ export interface FocusedAppContext {
   window_title: string;
 }
 
+export interface ExternalApiFlow {
+  sendable: boolean;
+  destination_host: string;
+  model: string;
+  fallback_model: string | null;
+  processing: string;
+  sent_data: string[];
+}
+
+export interface DataProcessingSummary {
+  capture: string;
+  asr: ExternalApiFlow;
+  polish: ExternalApiFlow | null;
+  selected_voice_edit: ExternalApiFlow;
+  language: string;
+  local_storage: string[];
+  external_retention: string;
+  correction_learning_enabled: boolean;
+  correction_learning_status: string;
+}
+
+export interface SelectedVoiceEditPreview {
+  token: string;
+  original_text: string;
+  instruction: string;
+  proposal: string;
+  app_process: string;
+  replace_available: boolean;
+  selection_warning: "external_clipboard_change_preserved" | null;
+  history_id: string | null;
+}
+
+export type SelectedVoiceEditToggleResult =
+  | { status: "recording"; warning: string | null }
+  | { status: "preview"; preview: SelectedVoiceEditPreview };
+
+export interface SelectedVoiceEditReplaceResult {
+  replaced: boolean;
+  code: string;
+  message: string;
+  partial: boolean;
+}
+
 export const defaultSettings: AppSettings = {
   api_base_url: "https://api.openai.com/v1",
   api_key: "",
   api_model: "gpt-realtime-whisper",
+  language_mode: "auto",
   polish_model: "gpt-4o-mini",
   mode: "raw",
   device_id: null,
@@ -161,11 +313,14 @@ export const defaultSettings: AppSettings = {
   deep_context_enabled: false,
   show_floating_bar: true,
   show_live_transcript_in_floating_bar: false,
+  correction_learning_mode: "off",
   launch_at_login: false,
   onboarding_completed: false,
   push_to_talk_hotkey: { ctrl: true, alt: false, shift: true, key: "F4" },
   hands_free_raw_hotkey: { ctrl: true, alt: false, shift: true, key: "F6" },
   hands_free_polish_hotkey: { ctrl: true, alt: false, shift: true, key: "F7" },
+  learn_selected_hotkey: { ctrl: true, alt: false, shift: true, key: "F8" },
+  voice_edit_selected_hotkey: { ctrl: true, alt: false, shift: true, key: "F9" },
 };
 
 export function hotkeyParts(binding: HotkeyBinding): string[] {

@@ -8,27 +8,34 @@ use serde::Deserialize;
 use tauri::{Emitter, Manager, State};
 
 use crate::{
+    app_profiles::{self, AppProfile, AppProfileInput, EffectiveAppProfile, ProfileMutationResult},
     audio,
     context::{self, FocusedAppContext, FocusedWindowTarget},
+    corrections::{
+        self, CorrectionArtifact, CorrectionPreview, CorrectionRecord, CorrectionStatus,
+        NewCorrection, UpdateCorrection,
+    },
+    data_flow,
     hotkey::{self, HotkeySet},
     local_data::{
-        self, DictionarySuggestion, HistoryEntry, SessionMetrics, SnippetEntry, UsageDaySummary,
-        MAX_DICTIONARY_WORDS, MAX_SNIPPETS,
+        self, DictionarySuggestion, HistoryEntry, OperationKind, SessionMetrics, SnippetEntry,
+        UsageDaySummary, MAX_DICTIONARY_WORDS, MAX_SNIPPETS,
     },
     mode,
     polish::PolishState,
     recovery::{self, RecoverySessionSummary},
+    selected_learning::{self, PrepareSelectedCorrectionResult, ResolvedPendingSelection},
+    selected_voice_edit::{
+        self, ActiveSelectedVoiceEdit, ReplaceDecision, SelectedVoiceEditPreview,
+    },
     session_service,
-    settings::{self, AppSettings},
+    settings::{self, AppSettings, CorrectionLearningMode},
     speech::{
         openai_compatible::OpenAiCompatibleProvider,
-        realtime::{
-            supports_realtime_model, transcribe_realtime, RealtimeStatus,
-            REALTIME_TRANSCRIPTION_MODEL,
-        },
+        realtime::{realtime_vocabulary_prompt, transcribe_realtime, RealtimeStatus},
         SpeechProvider,
     },
-    state::{AppState, Mode, RecordingState, RecordingTrigger},
+    state::{AppState, Mode, ProcessingGateOutcome, RecordingState, RecordingTrigger, SessionKind},
     tray,
 };
 
@@ -56,25 +63,84 @@ struct LiveTranscriptStatusEvent {
     detail: Option<String>,
 }
 
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SelectedVoiceEditToggleResult {
+    Recording { warning: Option<String> },
+    Preview { preview: SelectedVoiceEditPreview },
+}
+
+#[derive(serde::Serialize)]
+pub struct SelectedVoiceEditReplaceResult {
+    pub replaced: bool,
+    pub code: String,
+    pub message: String,
+    pub partial: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct CreateSelectedCorrectionResult {
+    pub record: CorrectionRecord,
+    pub focus_warning: Option<String>,
+}
+
+fn selected_focus_warning(result: anyhow::Result<()>) -> Option<String> {
+    result
+        .err()
+        .map(|_| "修正内容は保存しましたが、元の入力先へフォーカスを戻せませんでした。".to_string())
+}
+
+trait UserInjectionBackend {
+    fn inject_current(&self, text: &str) -> anyhow::Result<crate::inject::InjectionSuccess>;
+    fn inject_target(
+        &self,
+        text: &str,
+        target: &FocusedWindowTarget,
+    ) -> anyhow::Result<crate::inject::InjectionSuccess>;
+}
+
+struct SystemUserInjectionBackend;
+
+impl UserInjectionBackend for SystemUserInjectionBackend {
+    fn inject_current(&self, text: &str) -> anyhow::Result<crate::inject::InjectionSuccess> {
+        crate::inject::inject_text(text)
+    }
+
+    fn inject_target(
+        &self,
+        text: &str,
+        target: &FocusedWindowTarget,
+    ) -> anyhow::Result<crate::inject::InjectionSuccess> {
+        crate::inject::inject_text_to_window(text, target)
+    }
+}
+
+fn dispatch_user_injection(
+    backend: &impl UserInjectionBackend,
+    text: &str,
+    target: Option<&FocusedWindowTarget>,
+) -> anyhow::Result<crate::inject::InjectionSuccess> {
+    match target {
+        Some(target) => backend.inject_target(text, target),
+        None => backend.inject_current(text),
+    }
+}
+
 struct TargetWindowInjector {
     target: Option<FocusedWindowTarget>,
 }
 
 impl session_service::TextInjector for TargetWindowInjector {
-    fn inject(&self, text: &str) -> anyhow::Result<()> {
-        if let Some(target) = &self.target {
-            crate::inject::inject_text_to_window(text, target)
-        } else {
-            crate::inject::inject_text(text)
-        }
+    fn inject(&self, text: &str) -> anyhow::Result<crate::inject::InjectionSuccess> {
+        dispatch_user_injection(&SystemUserInjectionBackend, text, self.target.as_ref())
     }
 }
 
 struct PreviewInjector;
 
 impl session_service::TextInjector for PreviewInjector {
-    fn inject(&self, _text: &str) -> anyhow::Result<()> {
-        Ok(())
+    fn inject(&self, _text: &str) -> anyhow::Result<crate::inject::InjectionSuccess> {
+        Ok(crate::inject::InjectionSuccess { warning: None })
     }
 }
 
@@ -157,12 +223,51 @@ fn hotkey_set(settings: &AppSettings) -> HotkeySet {
         settings.push_to_talk_hotkey.clone(),
         settings.hands_free_raw_hotkey.clone(),
         settings.hands_free_polish_hotkey.clone(),
+        settings.learn_selected_hotkey.clone(),
+        settings.voice_edit_selected_hotkey.clone(),
     )
 }
 
+async fn append_history_locked(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    entry: HistoryEntry,
+) -> anyhow::Result<HistoryEntry> {
+    let _guard = state.history_action.lock().await;
+    local_data::append_history(app, entry)
+}
+
+fn settings_rollback_error(
+    save_error: &str,
+    hotkey_error: Option<String>,
+    startup_error: Option<String>,
+) -> String {
+    let mut message = format!("設定を保存できませんでした: {save_error}");
+    if let Some(error) = hotkey_error {
+        message.push_str(&format!(
+            "。以前のショートカットの復元にも失敗しました: {error}"
+        ));
+    }
+    if let Some(error) = startup_error {
+        message.push_str(&format!(
+            "。以前のログイン時起動設定の復元にも失敗しました: {error}"
+        ));
+    }
+    message
+}
+
+fn startup_change_error(startup_error: &str, hotkey_restore_error: Option<String>) -> String {
+    match hotkey_restore_error {
+        Some(restore_error) => format!(
+            "ログイン時起動の設定を変更できませんでした: {startup_error}。以前のショートカットの復元にも失敗しました: {restore_error}"
+        ),
+        None => format!("ログイン時起動の設定を変更できませんでした: {startup_error}"),
+    }
+}
+
+#[cfg(test)]
 fn should_start_realtime_asr(settings: &AppSettings, session_mode: &Mode) -> bool {
-    !settings.api_key.trim().is_empty()
-        && (settings.show_live_transcript_in_floating_bar || !matches!(session_mode, Mode::Raw))
+    data_flow::effective_realtime_model(settings, session_mode).is_some()
 }
 
 fn settings_for_ui(settings: &AppSettings) -> Result<serde_json::Value, String> {
@@ -379,6 +484,14 @@ async fn start_recording_locked(
     trigger: RecordingTrigger,
     mode_override: Option<Mode>,
 ) -> Result<(), String> {
+    if state.pending_selected_learning.lock().await.is_some()
+        || state.pending_selected_voice_edit.lock().await.is_some()
+        || state.active_selected_voice_edit.lock().await.is_some()
+    {
+        return Err(
+            "別の選択テキスト操作が進行中です。先に完了またはキャンセルしてください。".to_string(),
+        );
+    }
     if !matches!(*state.recording_state.lock().await, RecordingState::Idle) {
         return Ok(());
     }
@@ -390,21 +503,43 @@ async fn start_recording_locked(
 
     let (level_tx, mut level_rx) = tokio::sync::mpsc::unbounded_channel::<f32>();
     let settings = state.settings.lock().await.clone();
-    let session_mode = match mode_override {
-        Some(mode) => mode,
-        None => state.mode.lock().await.clone(),
-    };
     let focused_context_for_preset = focused_target.as_ref().map(|target| FocusedAppContext {
         process_name: target.process_name.clone(),
         window_title: target.window_title.clone(),
     });
-    let session_polish_preset = if matches!(session_mode, Mode::Polish) {
-        context::suggested_polish_preset(
-            focused_context_for_preset.as_ref(),
-            &settings.polish_preset,
+    let profile_store = {
+        let _guard = state.app_profiles_action.lock().await;
+        app_profiles::load(app).map_err(|error| error.to_string())?
+    };
+    let effective_profile = app_profiles::resolve(
+        &profile_store,
+        focused_context_for_preset.as_ref(),
+        &settings,
+        mode_override,
+    );
+    let session_mode = effective_profile.mode.clone();
+    let session_polish_preset = effective_profile.polish_preset.clone();
+    let session_app_process = focused_target
+        .as_ref()
+        .map(|target| target.process_name.clone())
+        .unwrap_or_default();
+    let manual_dictionary = state.dictionary_words.lock().await.clone();
+    let correction_snapshot = if settings.correction_learning_mode == CorrectionLearningMode::Ask {
+        let _guard = state.corrections_action.lock().await;
+        let store = corrections::load(app).map_err(|error| error.to_string())?;
+        corrections::make_session_snapshot(
+            CorrectionLearningMode::Ask,
+            &manual_dictionary,
+            store,
+            &session_app_process,
         )
     } else {
-        settings.polish_preset.clone()
+        corrections::make_session_snapshot(
+            CorrectionLearningMode::Off,
+            &manual_dictionary,
+            corrections::CorrectionStore::default(),
+            &session_app_process,
+        )
     };
     let (partial_tx, mut partial_rx) = if settings.show_live_transcript_in_floating_bar {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -418,16 +553,7 @@ async fn start_recording_locked(
     } else {
         (None, None)
     };
-    let should_start_realtime = should_start_realtime_asr(&settings, &session_mode);
-    let realtime_model = if !should_start_realtime {
-        None
-    } else if supports_realtime_model(&settings.api_model) {
-        Some(settings.api_model.clone())
-    } else if settings.show_live_transcript_in_floating_bar {
-        Some(REALTIME_TRANSCRIPTION_MODEL.to_string())
-    } else {
-        None
-    };
+    let realtime_model = data_flow::effective_realtime_model(&settings, &session_mode);
     let (chunk_tx, realtime_task) = if let Some(realtime_model) = realtime_model {
         tracing::info!(
             configured_model = %settings.api_model,
@@ -437,10 +563,17 @@ async fn start_recording_locked(
             "starting recording with realtime ASR"
         );
         let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        let realtime_prompt = realtime_vocabulary_prompt(
+            &settings.api_base_url,
+            &realtime_model,
+            &correction_snapshot.dictionary_words,
+        );
         let task = tokio::spawn(transcribe_realtime(
             settings.api_base_url.clone(),
             settings.api_key.clone(),
             realtime_model,
+            effective_profile.language_mode,
+            realtime_prompt,
             chunk_rx,
             partial_tx,
             status_tx,
@@ -472,9 +605,14 @@ async fn start_recording_locked(
         }
         (None, None)
     };
-    let recovery_session =
-        recovery::create_session(app, session_mode.clone(), trigger_label(&trigger))
-            .map_err(|error| error.to_string())?;
+    let recovery_session = recovery::create_session(
+        app,
+        session_mode.clone(),
+        trigger_label(&trigger),
+        session_polish_preset.clone(),
+        session_app_process.clone(),
+    )
+    .map_err(|error| error.to_string())?;
     if let Err(error) = session_service::start_session_inner(
         state,
         Some(level_tx),
@@ -484,12 +622,21 @@ async fn start_recording_locked(
         Some(recovery_session.audio_path.clone()),
         session_mode.clone(),
         session_polish_preset.clone(),
+        session_app_process,
+        correction_snapshot,
+        effective_profile.language_mode,
+        focused_target,
     )
     .await
     {
         let _ = recovery::delete_session(app, &recovery_session.id);
         return Err(error);
     }
+    *state.session_kind.lock().await = Some(SessionKind::Dictation);
+    let cancel_hotkey_error = hotkey::set_cancel_hotkey_enabled(true).err().map(|error| {
+        tracing::warn!("recording started without Escape cancellation: {error}");
+        format!("録音は開始しましたが、Escapeによるキャンセルを有効にできませんでした: {error}")
+    });
     *state.recording_trigger.lock().await = Some(trigger);
 
     let mode_label = if matches!(session_mode, Mode::Polish) {
@@ -509,7 +656,7 @@ async fn start_recording_locked(
             final_text: None,
             history_id: None,
             polish_state: None,
-            error: None,
+            error: cancel_hotkey_error,
         },
     );
 
@@ -550,27 +697,51 @@ async fn start_recording_locked(
     Ok(())
 }
 
-async fn active_session_mode_and_preset(state: &AppState) -> (Mode, Option<String>) {
-    if let Some((mode, preset)) = {
+async fn active_session_snapshot(
+    state: &AppState,
+) -> (Mode, Option<String>, Option<FocusedWindowTarget>) {
+    if let Some((mode, preset, target)) = {
         let session = state.session.lock().await;
-        session
-            .as_ref()
-            .map(|controller| (controller.mode.clone(), controller.polish_preset.clone()))
+        session.as_ref().map(|controller| {
+            (
+                controller.mode.clone(),
+                controller.polish_preset.clone(),
+                controller.target_window.clone(),
+            )
+        })
     } {
-        return (mode, Some(preset));
+        return (mode, Some(preset), target);
     }
-    (state.mode.lock().await.clone(), None)
+    (
+        state.mode.lock().await.clone(),
+        None,
+        state.last_target_window.lock().await.clone(),
+    )
 }
 
 async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Result<String, String> {
-    if !matches!(
-        *state.recording_state.lock().await,
-        RecordingState::Recording
-    ) {
+    if *state.session_kind.lock().await == Some(SessionKind::SelectedVoiceEdit) {
+        return Err("選択音声編集は専用ホットキーでもう一度停止してください。".to_string());
+    }
+    let recording_state = state.recording_state.lock().await.clone();
+    if !matches!(recording_state, RecordingState::Recording) {
         return Ok(String::new());
     }
+    match state.commit_processing_or_observe_cancel() {
+        ProcessingGateOutcome::CancelRequested => {
+            cancel_recording_locked(app, state).await?;
+            return Ok(String::new());
+        }
+        ProcessingGateOutcome::ProcessingCommitted => {}
+    }
+    // 通常停止のcommit point。以降に検出されたEscapeでは処理を巻き戻さない。
+    *state.recording_state.lock().await = RecordingState::Processing;
 
-    let (mode, polish_preset) = active_session_mode_and_preset(state).await;
+    if let Err(error) = hotkey::set_cancel_hotkey_enabled(false) {
+        tracing::warn!("failed to disable recording cancel hotkey before stop: {error}");
+    }
+
+    let (mode, polish_preset, target_window) = active_session_snapshot(state).await;
     let _ = app.emit(
         "session://state-changed",
         SessionUiEvent {
@@ -587,9 +758,10 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
     );
 
     let injector = TargetWindowInjector {
-        target: state.last_target_window.lock().await.clone(),
+        target: target_window,
     };
     let result = session_service::stop_session_inner(state, &injector, Some(app.clone())).await;
+    *state.session_kind.lock().await = None;
     *state.recording_trigger.lock().await = None;
 
     let has_error = match &result {
@@ -608,15 +780,18 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
     );
     let history_id = match &result {
         Ok(outcome) if !outcome.final_text.is_empty() && outcome.inject_error.is_none() => {
-            let entry = local_data::make_history_entry(
+            let entry = local_data::make_history_entry_with_context(
                 outcome.raw_text.clone(),
                 outcome.final_text.clone(),
                 outcome.mode.clone(),
                 outcome.duration_ms,
                 None,
                 outcome.polish_state.clone(),
+                outcome.polish_preset.clone(),
+                outcome.app_process.clone(),
             );
-            let saved_id = local_data::append_history(app, entry)
+            let saved_id = append_history_locked(state, app, entry)
+                .await
                 .map(|entry| entry.id)
                 .map_err(|error| tracing::warn!("failed to save history: {error}"))
                 .ok();
@@ -654,7 +829,8 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
                 Some(error.clone()),
                 PolishState::Unknown,
             );
-            local_data::append_history(app, entry)
+            append_history_locked(state, app, entry)
+                .await
                 .map(|entry| entry.id)
                 .map_err(|save_error| tracing::warn!("failed to save error history: {save_error}"))
                 .ok()
@@ -684,12 +860,420 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
                 .ok()
                 .map(|outcome| outcome.polish_state.clone()),
             error: match &result {
-                Ok(outcome) => outcome.inject_error.clone(),
+                Ok(outcome) => outcome
+                    .inject_error
+                    .clone()
+                    .or_else(|| outcome.inject_warning.clone()),
                 Err(error) => Some(error.clone()),
             },
         },
     );
     result.map(|outcome| outcome.final_text)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingCancelRoute {
+    Dictation,
+    SelectedVoiceEdit,
+}
+
+fn recording_cancel_route(kind: Option<SessionKind>) -> RecordingCancelRoute {
+    if kind == Some(SessionKind::SelectedVoiceEdit) {
+        RecordingCancelRoute::SelectedVoiceEdit
+    } else {
+        RecordingCancelRoute::Dictation
+    }
+}
+
+fn complete_dictation_cancel(
+    outcome: &session_service::CancelSessionOutcome,
+    mut cleanup_recovery: impl FnMut(&str) -> anyhow::Result<()>,
+) -> Result<bool, String> {
+    if !outcome.cancelled {
+        return Ok(false);
+    }
+    if let Some(id) = outcome.recovery_id.as_deref() {
+        cleanup_recovery(id).map_err(|error| {
+            format!("キャンセルした録音の一時データを削除できませんでした: {error}")
+        })?;
+    }
+    Ok(true)
+}
+
+async fn cancel_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Result<bool, String> {
+    if recording_cancel_route(*state.session_kind.lock().await)
+        == RecordingCancelRoute::SelectedVoiceEdit
+    {
+        return cancel_selected_voice_edit_recording_locked(app, state).await;
+    }
+    if !matches!(
+        *state.recording_state.lock().await,
+        RecordingState::Recording
+    ) {
+        return Ok(false);
+    }
+
+    let (mode, polish_preset, _) = active_session_snapshot(state).await;
+    if let Err(error) = hotkey::set_cancel_hotkey_enabled(false) {
+        tracing::warn!("failed to disable recording cancel hotkey during cancellation: {error}");
+    }
+    let outcome = session_service::cancel_session_inner(state).await;
+    *state.session_kind.lock().await = None;
+    if !outcome.cancelled {
+        return Ok(false);
+    }
+    if let Some(error) = &outcome.capture_error {
+        tracing::warn!("audio capture ended with an error during cancellation: {error}");
+    }
+
+    let completion =
+        complete_dictation_cancel(&outcome, |id| recovery::cleanup_completed_session(app, id));
+    let cleanup_error = completion.as_ref().err().cloned();
+    let mode_label = if matches!(mode, Mode::Polish) {
+        "Polish"
+    } else {
+        "Raw"
+    };
+    tray::update_status(app, "待機中", mode_label);
+    let _ = app.emit(
+        "session://state-changed",
+        SessionUiEvent {
+            state: RecordingState::Idle,
+            mode,
+            polish_preset,
+            phase: "cancelled".to_string(),
+            raw_text: None,
+            final_text: None,
+            history_id: None,
+            polish_state: None,
+            error: cleanup_error.clone(),
+        },
+    );
+
+    completion
+}
+
+async fn start_selected_voice_edit_locked(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<SelectedVoiceEditToggleResult, String> {
+    let recording_state = state.recording_state.lock().await.clone();
+    let has_session = state.session.lock().await.is_some();
+    let has_selected_learning = state.pending_selected_learning.lock().await.is_some();
+    let has_active = state.active_selected_voice_edit.lock().await.is_some();
+    let has_pending = state.pending_selected_voice_edit.lock().await.is_some();
+    selected_voice_edit::ensure_operation_available(
+        &recording_state,
+        has_session,
+        has_selected_learning,
+        has_active,
+        has_pending,
+    )?;
+    let settings = state.settings.lock().await.clone();
+    if settings.api_key.trim().is_empty() {
+        return Err("APIキーが設定されていません。設定画面から入力してください。".to_string());
+    }
+    if settings.polish_model.trim().is_empty() {
+        return Err("選択音声編集に使うPolishモデルが設定されていません。".to_string());
+    }
+
+    // KoeTypeへfocusを移す前に対象windowと選択本文をmemory snapshotする。
+    let capture = crate::selection::capture_selected_text()
+        .await
+        .map_err(|error| error.to_string())?;
+    let recovery_session = recovery::create_session_with_operation(
+        app,
+        Mode::Polish,
+        "selected_voice_edit".to_string(),
+        "selected_voice_edit".to_string(),
+        capture.target.process_name.clone(),
+        OperationKind::SelectedVoiceEdit,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Err(error) = session_service::start_session_inner(
+        state,
+        None,
+        None,
+        None,
+        Some(recovery_session.id.clone()),
+        Some(recovery_session.audio_path.clone()),
+        Mode::Polish,
+        "selected_voice_edit".to_string(),
+        capture.target.process_name.clone(),
+        corrections::CorrectionSessionSnapshot::default(),
+        settings.language_mode,
+        Some(capture.target.clone()),
+    )
+    .await
+    {
+        let _ = recovery::delete_session(app, &recovery_session.id);
+        return Err(error);
+    }
+    *state.active_selected_voice_edit.lock().await = Some(ActiveSelectedVoiceEdit {
+        target: capture.target,
+        original_text: capture.text,
+        selection_method: capture.method,
+        selection_warning: capture.warning,
+        recovery_id: recovery_session.id,
+    });
+    *state.session_kind.lock().await = Some(SessionKind::SelectedVoiceEdit);
+    *state.recording_trigger.lock().await = Some(RecordingTrigger::Manual);
+    let warning = hotkey::set_cancel_hotkey_enabled(true).err().map(|error| {
+        format!("録音は開始しましたが、Escapeキャンセルを登録できませんでした: {error}")
+    });
+    if let Err(error) = show_and_focus_main(app) {
+        let _ = cancel_selected_voice_edit_recording_locked(app, state).await;
+        return Err(error);
+    }
+    tray::update_status(app, "選択編集を録音中", "Voice Edit");
+    Ok(SelectedVoiceEditToggleResult::Recording { warning })
+}
+
+async fn stop_selected_voice_edit_locked(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<SelectedVoiceEditPreview, String> {
+    if !matches!(
+        *state.recording_state.lock().await,
+        RecordingState::Recording
+    ) {
+        return Err("選択音声編集は録音中ではありません。".to_string());
+    }
+    match state.commit_processing_or_observe_cancel() {
+        ProcessingGateOutcome::CancelRequested => {
+            cancel_selected_voice_edit_recording_locked(app, state).await?;
+            return Err("選択音声編集をキャンセルしました。".to_string());
+        }
+        ProcessingGateOutcome::ProcessingCommitted => {}
+    }
+    *state.recording_state.lock().await = RecordingState::Processing;
+    if let Err(error) = hotkey::set_cancel_hotkey_enabled(false) {
+        tracing::warn!("failed to disable selected voice edit Escape hotkey: {error}");
+    }
+    let controller = state.session.lock().await.take();
+    let active = state.active_selected_voice_edit.lock().await.take();
+    let (controller, active) = match (controller, active) {
+        (Some(controller), Some(active)) => (controller, active),
+        (controller, active) => {
+            if let Some(controller) = controller {
+                let _ = controller.stop_tx.send(true);
+                let _ = controller.capture_task.await;
+            }
+            if let Some(active) = active {
+                let _ = recovery::mark_failed(
+                    app,
+                    &active.recovery_id,
+                    "選択音声編集の内部状態が不整合でした。元の選択本文は変更していません。"
+                        .to_string(),
+                );
+            }
+            *state.recording_state.lock().await = RecordingState::Idle;
+            *state.recording_trigger.lock().await = None;
+            *state.session_kind.lock().await = None;
+            state.reset_cancellation_gate();
+            tray::update_status(app, "エラー", "Voice Edit");
+            return Err(
+                "選択音声編集の内部状態が不整合でした。元の選択本文は変更していません。"
+                    .to_string(),
+            );
+        }
+    };
+    let duration_ms = controller.started_at.elapsed().as_millis() as u64;
+
+    let result: Result<SelectedVoiceEditPreview, String> = async {
+        let _ = controller.stop_tx.send(true);
+        let audio = controller
+            .capture_task
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        recovery::mark_captured(
+            app,
+            &active.recovery_id,
+            audio.sample_rate,
+            audio.channels,
+            audio.frames(),
+            duration_ms,
+        )
+        .map_err(|error| error.to_string())?;
+        recovery::mark_transcribing(app, &active.recovery_id)
+            .map_err(|error| error.to_string())?;
+        let settings = state.settings.lock().await.clone();
+        let provider = OpenAiCompatibleProvider {
+            base_url: settings.api_base_url.clone(),
+            api_key: settings.api_key.clone(),
+            model: settings.api_model.clone(),
+            language_mode: settings.language_mode,
+            dictionary_words: Vec::new(),
+            focused_context: None,
+            partial_tx: None,
+        };
+        let instruction = match tokio::time::timeout(
+            std::time::Duration::from_secs(selected_voice_edit::ASR_TIMEOUT_SECS),
+            provider.transcribe(&audio),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|error| {
+                let message = error.to_string();
+                let _ = recovery::mark_failed(app, &active.recovery_id, message.clone());
+                message
+            })?,
+            Err(_) => {
+                let message = "選択音声編集の音声認識が90秒でタイムアウトしました。元の選択本文は変更していません。".to_string();
+                let _ = recovery::mark_failed(app, &active.recovery_id, message.clone());
+                return Err(message);
+            }
+        };
+        if instruction.trim().is_empty() {
+            let message = "音声編集指示を認識できませんでした。元の選択本文は変更していません。".to_string();
+            let _ = recovery::mark_failed(app, &active.recovery_id, message.clone());
+            return Err(message);
+        }
+        // 原選択本文はrecoveryへ保存しない。raw_text相当は音声指示だけ。
+        recovery::mark_text_ready(app, &active.recovery_id, instruction.clone(), String::new())
+            .map_err(|error| error.to_string())?;
+        let proposal = match tokio::time::timeout(
+            std::time::Duration::from_secs(selected_voice_edit::EDIT_TIMEOUT_SECS),
+            crate::polish::edit_selected_text(&settings, &active.original_text, &instruction),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|error| {
+                let message = format!("選択音声編集APIに失敗しました。元の選択本文は変更していません: {error}");
+                let _ = recovery::mark_failed(app, &active.recovery_id, message.clone());
+                message
+            })?,
+            Err(_) => {
+                let message = "選択音声編集APIが90秒でタイムアウトしました。元の選択本文は変更していません。".to_string();
+                let _ = recovery::mark_failed(app, &active.recovery_id, message.clone());
+                return Err(message);
+            }
+        };
+        if proposal.trim().is_empty()
+            || proposal.chars().count() > crate::selection::MAX_SELECTED_TEXT_CHARS
+        {
+            let message = "選択音声編集APIの提案本文が空、または20,000文字を超えています。元の選択本文は変更していません。".to_string();
+            let _ = recovery::mark_failed(app, &active.recovery_id, message.clone());
+            return Err(message);
+        }
+        recovery::mark_text_ready(
+            app,
+            &active.recovery_id,
+            instruction.clone(),
+            proposal.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+
+        let history = local_data::make_selected_voice_edit_history_entry(
+            instruction.clone(),
+            proposal.clone(),
+            duration_ms,
+            None,
+            active.target.process_name.clone(),
+        );
+        let history_id = match append_history_locked(state, app, history).await {
+            Ok(saved) => {
+                if let Err(error) = recovery::delete_session(app, &active.recovery_id) {
+                    tracing::warn!("failed to delete completed selected voice edit recovery: {error}");
+                }
+                Some(saved.id)
+            }
+            Err(error) => {
+                tracing::warn!("failed to save selected voice edit history: {error}");
+                let _ = recovery::mark_failed(
+                    app,
+                    &active.recovery_id,
+                    "選択音声編集の履歴保存に失敗しました。previewから提案を回収してください。".to_string(),
+                );
+                None
+            }
+        };
+        let preview = {
+            let mut pending = state.pending_selected_voice_edit.lock().await;
+            selected_voice_edit::replace_pending(
+                &mut pending,
+                active,
+                instruction,
+                proposal,
+                history_id,
+                selected_voice_edit::now_secs(),
+            )
+        };
+        let expiry_app = app.clone();
+        let expiry_token = preview.token.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                selected_voice_edit::PREVIEW_TTL_SECS,
+            ))
+            .await;
+            let managed = expiry_app.state::<AppState>();
+            let mut pending = managed.pending_selected_voice_edit.lock().await;
+            selected_voice_edit::expire_pending(&mut pending, &expiry_token);
+        });
+        Ok(preview)
+    }
+    .await;
+
+    *state.recording_state.lock().await = RecordingState::Idle;
+    *state.recording_trigger.lock().await = None;
+    *state.session_kind.lock().await = None;
+    state.reset_cancellation_gate();
+    tray::update_status(
+        app,
+        if result.is_ok() {
+            "確認待ち"
+        } else {
+            "エラー"
+        },
+        "Voice Edit",
+    );
+    result
+}
+
+async fn cancel_selected_voice_edit_recording_locked(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<bool, String> {
+    if let Err(error) = hotkey::set_cancel_hotkey_enabled(false) {
+        tracing::warn!("failed to disable selected voice edit Escape hotkey: {error}");
+    }
+    let active = state.active_selected_voice_edit.lock().await.take();
+    let outcome = session_service::cancel_session_inner(state).await;
+    *state.session_kind.lock().await = None;
+    *state.recording_trigger.lock().await = None;
+    if let Some(active) = active {
+        recovery::cleanup_completed_session(app, &active.recovery_id)
+            .map_err(|error| error.to_string())?;
+    }
+    tray::update_status(app, "待機中", "Voice Edit");
+    Ok(outcome.cancelled)
+}
+
+#[tauri::command]
+pub async fn toggle_selected_voice_edit(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<SelectedVoiceEditToggleResult, String> {
+    let _guard = state.session_action.lock().await;
+    if *state.session_kind.lock().await == Some(SessionKind::SelectedVoiceEdit) {
+        return stop_selected_voice_edit_locked(&app, &state)
+            .await
+            .map(|preview| SelectedVoiceEditToggleResult::Preview { preview });
+    }
+    start_selected_voice_edit_locked(&app, &state).await
+}
+
+#[tauri::command]
+pub async fn get_selected_voice_edit_status(state: State<'_, AppState>) -> Result<String, String> {
+    let _guard = state.session_action.lock().await;
+    if *state.session_kind.lock().await == Some(SessionKind::SelectedVoiceEdit) {
+        Ok("recording".to_string())
+    } else if state.pending_selected_voice_edit.lock().await.is_some() {
+        Ok("preview".to_string())
+    } else {
+        Ok("idle".to_string())
+    }
 }
 
 #[tauri::command]
@@ -710,18 +1294,37 @@ pub async fn stop_recording_session(
     stop_recording_locked(&app, &state).await
 }
 
+#[tauri::command]
+pub async fn cancel_recording_session(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let _guard = state.session_action.lock().await;
+    cancel_recording_locked(&app, &state).await
+}
+
 async fn stop_recording_preview_locked(
     app: &tauri::AppHandle,
     state: &AppState,
 ) -> Result<String, String> {
-    if !matches!(
-        *state.recording_state.lock().await,
-        RecordingState::Recording
-    ) {
+    let recording_state = state.recording_state.lock().await.clone();
+    if !matches!(recording_state, RecordingState::Recording) {
         return Ok(String::new());
     }
+    match state.commit_processing_or_observe_cancel() {
+        ProcessingGateOutcome::CancelRequested => {
+            cancel_recording_locked(app, state).await?;
+            return Ok(String::new());
+        }
+        ProcessingGateOutcome::ProcessingCommitted => {}
+    }
+    *state.recording_state.lock().await = RecordingState::Processing;
 
-    let (mode, polish_preset) = active_session_mode_and_preset(state).await;
+    if let Err(error) = hotkey::set_cancel_hotkey_enabled(false) {
+        tracing::warn!("failed to disable recording cancel hotkey before preview stop: {error}");
+    }
+
+    let (mode, polish_preset, _) = active_session_snapshot(state).await;
     let _ = app.emit(
         "session://state-changed",
         SessionUiEvent {
@@ -876,20 +1479,27 @@ fn normalize_polish_preset(preset: &str) -> Result<String, String> {
     }
 }
 
+fn ensure_polish_preset_change_allowed(session_active: bool) -> Result<(), String> {
+    if session_active {
+        Err("録音開始時のPolishプリセットはこのセッション中は変更できません。次回の録音前に設定してください。".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 #[tauri::command]
 pub async fn set_active_polish_preset(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     preset: String,
 ) -> Result<String, String> {
+    let _guard = state.session_action.lock().await;
     let preset = normalize_polish_preset(&preset)?;
-    let mut session = state.session.lock().await;
-    let Some(controller) = session.as_mut() else {
-        return Err("録音中のPolishセッションがありません。".to_string());
-    };
-    if !matches!(controller.mode, Mode::Polish) {
-        return Err("Raw録音中はPolishプリセットを変更できません。".to_string());
-    }
-    controller.polish_preset = preset.clone();
+    ensure_polish_preset_change_allowed(state.session.lock().await.is_some())?;
+    let mut next = state.settings.lock().await.clone();
+    next.polish_preset = preset.clone();
+    settings::save(&app, &next).map_err(|error| error.to_string())?;
+    *state.settings.lock().await = next;
     Ok(preset)
 }
 
@@ -897,6 +1507,67 @@ pub async fn set_active_polish_preset(
 pub async fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let settings = state.settings.lock().await.clone();
     settings_for_ui(&settings)
+}
+
+#[tauri::command]
+pub async fn get_data_processing_summary(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<data_flow::DataProcessingSummary, String> {
+    let mut settings = state.settings.lock().await.clone();
+    let focused = settings_target_context(&state).await;
+    let effective = {
+        let _guard = state.app_profiles_action.lock().await;
+        let store = app_profiles::load(&app).map_err(|error| error.to_string())?;
+        app_profiles::resolve(&store, focused.as_ref(), &settings, None)
+    };
+    let mode = effective.mode;
+    settings.language_mode = effective.language_mode;
+    settings.polish_preset = effective.polish_preset;
+    let has_dictionary = !state.dictionary_words.lock().await.is_empty();
+    let correction_state = if settings.correction_learning_mode == CorrectionLearningMode::Ask {
+        match corrections::load(&app) {
+            Ok(store) => {
+                let active_items = store
+                    .items
+                    .iter()
+                    .filter(|item| item.status == CorrectionStatus::Active)
+                    .collect::<Vec<_>>();
+                data_flow::CorrectionFlowState {
+                    total: store.items.len(),
+                    active: active_items.len(),
+                    has_vocabulary: active_items.iter().any(|item| {
+                        item.artifacts.iter().any(|artifact| {
+                            matches!(artifact, CorrectionArtifact::Vocabulary { .. })
+                        })
+                    }),
+                    has_replacement: active_items.iter().any(|item| {
+                        item.artifacts.iter().any(|artifact| {
+                            matches!(artifact, CorrectionArtifact::Replacement { .. })
+                        })
+                    }),
+                    has_style_example: active_items.iter().any(|item| {
+                        item.artifacts.iter().any(|artifact| {
+                            matches!(artifact, CorrectionArtifact::StyleExample { .. })
+                        })
+                    }),
+                    store_error: false,
+                }
+            }
+            Err(_) => data_flow::CorrectionFlowState {
+                store_error: true,
+                ..Default::default()
+            },
+        }
+    } else {
+        data_flow::CorrectionFlowState::default()
+    };
+    Ok(data_flow::summarize_with_corrections(
+        &settings,
+        &mode,
+        has_dictionary,
+        &correction_state,
+    ))
 }
 
 async fn list_models_with_key(base_url: String, api_key: String) -> Result<Vec<String>, String> {
@@ -965,7 +1636,10 @@ pub async fn copy_text(text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn inject_text(state: State<'_, AppState>, text: String) -> Result<(), String> {
+pub async fn inject_text(
+    state: State<'_, AppState>,
+    text: String,
+) -> Result<Option<String>, String> {
     if text.trim().is_empty() {
         return Err("注入するテキストがありません。".to_string());
     }
@@ -974,8 +1648,16 @@ pub async fn inject_text(state: State<'_, AppState>, text: String) -> Result<(),
         .lock()
         .await
         .clone()
-        .ok_or_else(|| "入力先アプリを一度クリックしてから再注入してください。".to_string())?;
-    crate::inject::inject_text_to_window(&text, &target).map_err(|error| error.to_string())
+        .ok_or_else(|| {
+            crate::inject::error_with_clipboard_backup(
+                &text,
+                anyhow::anyhow!("入力先アプリを一度クリックしてから再注入してください"),
+            )
+            .to_string()
+        })?;
+    dispatch_user_injection(&SystemUserInjectionBackend, &text, Some(&target))
+        .map(|success| success.warning)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -986,16 +1668,20 @@ pub async fn get_history(app: tauri::AppHandle) -> Result<Vec<HistoryEntry>, Str
 #[tauri::command]
 pub async fn delete_history_item(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<HistoryEntry>, String> {
+    let _guard = state.history_action.lock().await;
     local_data::delete_history_item(&app, &id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub async fn toggle_history_pin(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<HistoryEntry>, String> {
+    let _guard = state.history_action.lock().await;
     local_data::toggle_history_pin(&app, &id).map_err(|error| error.to_string())
 }
 
@@ -1005,11 +1691,17 @@ pub async fn rerun_history_polish(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<HistoryEntry>, String> {
-    let mut history = local_data::load_history(&app).map_err(|error| error.to_string())?;
+    let history = {
+        let _guard = state.history_action.lock().await;
+        local_data::load_history(&app).map_err(|error| error.to_string())?
+    };
     let index = history
         .iter()
         .position(|item| item.id == id)
         .ok_or_else(|| "履歴が見つかりません。".to_string())?;
+    if history[index].operation_kind == OperationKind::SelectedVoiceEdit {
+        return Err("選択音声編集の履歴はPolish再実行できません。".to_string());
+    }
     let source_text = if !history[index].raw_text.trim().is_empty() {
         history[index].raw_text.clone()
     } else {
@@ -1019,39 +1711,606 @@ pub async fn rerun_history_polish(
         return Err("Polish再実行に使えるテキストがありません。".to_string());
     }
 
-    let current_settings = state.settings.lock().await.clone();
+    let mut current_settings = state.settings.lock().await.clone();
     if current_settings.api_key.is_empty() {
         return Err("APIキーが設定されていません。設定画面から入力してください。".to_string());
     }
-    let dictionary_words = state.dictionary_words.lock().await.clone();
-    let focused_context = if current_settings.deep_context_enabled {
-        context::focused_app_context()
+    if !history[index].polish_preset.is_empty() {
+        current_settings.polish_preset = history[index].polish_preset.clone();
+    }
+    let manual_dictionary = state.dictionary_words.lock().await.clone();
+    let correction_store =
+        if current_settings.correction_learning_mode == CorrectionLearningMode::Ask {
+            let _guard = state.corrections_action.lock().await;
+            corrections::load(&app).map_err(|error| error.to_string())?
+        } else {
+            corrections::CorrectionStore::default()
+        };
+    let dictionary_words =
+        if current_settings.correction_learning_mode == CorrectionLearningMode::Ask {
+            corrections::effective_vocabulary(
+                &manual_dictionary,
+                &correction_store,
+                &history[index].app_process,
+            )
+        } else {
+            manual_dictionary
+        };
+    let focused_context =
+        if current_settings.deep_context_enabled && !history[index].app_process.is_empty() {
+            Some(FocusedAppContext {
+                process_name: history[index].app_process.clone(),
+                window_title: String::new(),
+            })
+        } else {
+            None
+        };
+    let post_asr_text = if current_settings.correction_learning_mode == CorrectionLearningMode::Ask
+    {
+        corrections::apply_replacements(
+            &source_text,
+            &correction_store,
+            &history[index].app_process,
+        )
     } else {
-        None
+        source_text.clone()
     };
-    let routed = mode::route(
+    let style_examples = corrections::select_style_examples(
+        &correction_store,
+        &current_settings.polish_preset,
+        &history[index].app_process,
+    );
+    let routed = mode::route_with_style_examples(
         &Mode::Polish,
         &current_settings,
         &dictionary_words,
         focused_context.as_ref(),
-        &source_text,
+        &style_examples,
+        &post_asr_text,
     )
     .await;
     let snippets = local_data::load_snippets(&app).map_err(|error| error.to_string())?;
     let final_text = local_data::expand_snippets(&routed.text, &snippets);
-    history[index].raw_text = source_text;
-    history[index].final_text = final_text;
-    history[index].mode = Mode::Polish;
-    history[index].polish_state = routed.polish_state;
-    history[index].status = local_data::HistoryStatus::Success;
-    history[index].error = None;
-    local_data::save_history(&app, &history).map_err(|error| error.to_string())?;
-    Ok(history)
+    let _guard = state.history_action.lock().await;
+    let mut latest = local_data::load_history(&app).map_err(|error| error.to_string())?;
+    let latest_item = latest
+        .iter_mut()
+        .find(|item| item.id == id)
+        .ok_or_else(|| "履歴が処理中に削除されました。".to_string())?;
+    latest_item.raw_text = source_text;
+    latest_item.final_text = final_text;
+    latest_item.mode = Mode::Polish;
+    latest_item.polish_state = routed.polish_state;
+    latest_item.status = local_data::HistoryStatus::Success;
+    latest_item.error = None;
+    local_data::save_history(&app, &latest).map_err(|error| error.to_string())?;
+    Ok(latest)
 }
 
 #[tauri::command]
-pub async fn clear_history(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn clear_history(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let _guard = state.history_action.lock().await;
     local_data::clear_history(&app).map_err(|error| error.to_string())
+}
+
+fn correction_history_entry<'a>(
+    history: &'a [HistoryEntry],
+    id: &str,
+) -> Result<&'a HistoryEntry, String> {
+    history
+        .iter()
+        .find(|item| {
+            item.id == id
+                && item.status == local_data::HistoryStatus::Success
+                && item.operation_kind == OperationKind::Dictation
+        })
+        .ok_or_else(|| {
+            "修正元の履歴が見つかりません。履歴が削除済みか、処理に失敗しています。".to_string()
+        })
+}
+
+fn selected_history_entry<'a>(
+    history: &'a [HistoryEntry],
+    resolved: &ResolvedPendingSelection,
+) -> Result<&'a HistoryEntry, String> {
+    let entry = correction_history_entry(history, &resolved.candidate.id)?;
+    if !selected_learning::candidate_matches_history(&resolved.candidate, entry) {
+        return Err(
+            "選択した履歴候補は準備後に変更されました。もう一度選択からやり直してください。"
+                .to_string(),
+        );
+    }
+    Ok(entry)
+}
+
+fn show_and_focus_main(app: &tauri::AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "KoeTypeの確認画面が見つかりません。".to_string())?;
+    let _ = window.unminimize();
+    window
+        .show()
+        .map_err(|_| "KoeTypeの確認画面を表示できませんでした。".to_string())?;
+    window
+        .set_focus()
+        .map_err(|_| "KoeTypeの確認画面へフォーカスできませんでした。".to_string())
+}
+
+#[tauri::command]
+pub fn show_main_for_selected_correction_error(app: tauri::AppHandle) -> Result<(), String> {
+    show_and_focus_main(&app)
+}
+
+#[tauri::command]
+pub async fn prepare_selected_correction(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PrepareSelectedCorrectionResult, String> {
+    let _selected_guard = state.selected_learning_action.lock().await;
+    *state.pending_selected_learning.lock().await = None;
+    let _session_guard = state.session_action.lock().await;
+    if state.active_selected_voice_edit.lock().await.is_some()
+        || state.pending_selected_voice_edit.lock().await.is_some()
+    {
+        return Err("選択音声編集が進行中です。先に完了またはキャンセルしてください。".to_string());
+    }
+    selected_learning::ensure_learning_enabled(
+        state.settings.lock().await.correction_learning_mode,
+    )?;
+    let recording_state = state.recording_state.lock().await.clone();
+    let has_session = state.session.lock().await.is_some();
+    selected_learning::ensure_session_idle(&recording_state, has_session)?;
+
+    // KoeTypeへfocusを移す前に、外部アプリの選択範囲を取得する。
+    let capture = crate::selection::capture_selected_text()
+        .await
+        .map_err(|error| error.to_string())?;
+    let history = local_data::load_history(&app).map_err(|error| error.to_string())?;
+    let store = {
+        let _guard = state.corrections_action.lock().await;
+        corrections::load(&app).map_err(|error| error.to_string())?
+    };
+    let now = selected_learning::now_secs();
+    let candidates =
+        selected_learning::select_candidates(&history, &store, &capture.target.process_name, now);
+    if candidates.is_empty() {
+        return Err("直近30分に学習元として使える音声入力履歴がありません。".to_string());
+    }
+    if selected_learning::all_candidates_match_selected(&candidates, &capture.text) {
+        return Err(
+            "選択テキストは利用可能な履歴の出力と同じため、学習する変更がありません。".to_string(),
+        );
+    }
+    selected_learning::ensure_learning_enabled(
+        state.settings.lock().await.correction_learning_mode,
+    )?;
+    let result = {
+        let mut pending = state.pending_selected_learning.lock().await;
+        selected_learning::replace_pending(
+            &mut pending,
+            capture.text,
+            candidates,
+            now,
+            capture.target,
+            capture.warning,
+        )
+    };
+    if let Err(error) = show_and_focus_main(&app) {
+        let mut pending = state.pending_selected_learning.lock().await;
+        let _ = selected_learning::consume_pending(&mut pending, &result.token);
+        return Err(error);
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn preview_selected_correction(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+    history_id: String,
+) -> Result<CorrectionPreview, String> {
+    let _selected_guard = state.selected_learning_action.lock().await;
+    selected_learning::ensure_learning_enabled(
+        state.settings.lock().await.correction_learning_mode,
+    )?;
+    let resolved = {
+        let mut pending = state.pending_selected_learning.lock().await;
+        selected_learning::resolve_pending(
+            &mut pending,
+            &token,
+            &history_id,
+            selected_learning::now_secs(),
+        )?
+    };
+    let history = local_data::load_history(&app).map_err(|error| error.to_string())?;
+    let source = selected_history_entry(&history, &resolved)?;
+    corrections::preview(
+        source.id.clone(),
+        source.final_text.clone(),
+        resolved.selected_text,
+        &source.mode,
+        source.app_process.clone(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn create_selected_correction(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+    history_id: String,
+    artifacts: Vec<CorrectionArtifact>,
+) -> Result<CreateSelectedCorrectionResult, String> {
+    let _selected_guard = state.selected_learning_action.lock().await;
+    selected_learning::ensure_learning_enabled(
+        state.settings.lock().await.correction_learning_mode,
+    )?;
+    let resolved = {
+        let mut pending = state.pending_selected_learning.lock().await;
+        selected_learning::resolve_pending(
+            &mut pending,
+            &token,
+            &history_id,
+            selected_learning::now_secs(),
+        )?
+    };
+    let history = local_data::load_history(&app).map_err(|error| error.to_string())?;
+    let source = selected_history_entry(&history, &resolved)?;
+    let preview = corrections::preview(
+        source.id.clone(),
+        source.final_text.clone(),
+        resolved.selected_text.clone(),
+        &source.mode,
+        source.app_process.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    let configured_api_key = state.settings.lock().await.api_key.clone();
+    corrections::reject_configured_api_key(
+        &configured_api_key,
+        &source.raw_text,
+        &source.final_text,
+        &resolved.selected_text,
+        &source.polish_preset,
+        &source.app_process,
+        &artifacts,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let record = {
+        let _guard = state.corrections_action.lock().await;
+        let mut store = corrections::load(&app).map_err(|error| error.to_string())?;
+        if store
+            .items
+            .iter()
+            .any(|item| item.source_history_id == source.id)
+        {
+            return Err("この履歴はすでに修正学習へ使用されています。".to_string());
+        }
+        let record = corrections::insert(
+            &mut store,
+            NewCorrection {
+                source_history_id: source.id.clone(),
+                raw_text: source.raw_text.clone(),
+                original_text: source.final_text.clone(),
+                corrected_text: resolved.selected_text,
+                mode: source.mode.clone(),
+                polish_preset: source.polish_preset.clone(),
+                app_process: source.app_process.clone(),
+                classification: preview.classification,
+                artifacts,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        corrections::save(&app, &store).map_err(|error| error.to_string())?;
+        record
+    };
+    let target = {
+        let mut pending = state.pending_selected_learning.lock().await;
+        selected_learning::consume_pending(&mut pending, &token)
+    };
+    let focus_warning = target
+        .map(|target| selected_focus_warning(context::focus_window(&target)))
+        .unwrap_or_else(|| {
+            Some("修正内容は保存しましたが、元の入力先情報が失われました。".to_string())
+        });
+    Ok(CreateSelectedCorrectionResult {
+        record,
+        focus_warning,
+    })
+}
+
+#[tauri::command]
+pub async fn cancel_selected_correction(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<(), String> {
+    let _selected_guard = state.selected_learning_action.lock().await;
+    let target = {
+        let mut pending = state.pending_selected_learning.lock().await;
+        selected_learning::cancel_pending(&mut pending, &token)?
+    };
+    context::focus_window(&target).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn replace_selected_voice_edit(
+    _app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<SelectedVoiceEditReplaceResult, String> {
+    let _guard = state.session_action.lock().await;
+    let resolved = {
+        let mut pending = state.pending_selected_voice_edit.lock().await;
+        selected_voice_edit::resolve_pending(&mut pending, &token, selected_voice_edit::now_secs())?
+    };
+    if let Err(error) = context::focus_window(&resolved.target) {
+        return Ok(SelectedVoiceEditReplaceResult {
+            replaced: false,
+            code: "focus_mismatch".to_string(),
+            message: format!("元の入力先へフォーカスを戻せないため置換していません: {error}"),
+            partial: false,
+        });
+    }
+    let current = match crate::selection::capture_selected_text().await {
+        Ok(capture) => capture,
+        Err(error) => {
+            return Ok(SelectedVoiceEditReplaceResult {
+                replaced: false,
+                code: "selection_unavailable".to_string(),
+                message: format!("選択範囲を再確認できないため置換していません: {error}"),
+                partial: false,
+            });
+        }
+    };
+    let decision = selected_voice_edit::replacement_decision(&resolved, &current);
+    if decision != ReplaceDecision::Replace {
+        let (code, message) = match decision {
+            ReplaceDecision::ClipboardCaptureUnsupported => (
+                "clipboard_capture_unsupported",
+                "安全な直接置換に必要なUI Automation選択を確認できません。Copyで提案を回収してください。",
+            ),
+            ReplaceDecision::TargetMismatch => (
+                "target_mismatch",
+                "入力先ウィンドウが開始時と異なるため置換していません。",
+            ),
+            ReplaceDecision::SelectionMismatch => (
+                "selection_mismatch",
+                "選択本文が開始時から変わったため置換していません。",
+            ),
+            ReplaceDecision::Replace => unreachable!(),
+        };
+        return Ok(SelectedVoiceEditReplaceResult {
+            replaced: false,
+            code: code.to_string(),
+            message: message.to_string(),
+            partial: false,
+        });
+    }
+    match crate::inject::inject_clipboard_replacement(&resolved.proposal, &resolved.target) {
+        Ok(success) => {
+            let mut pending = state.pending_selected_voice_edit.lock().await;
+            selected_voice_edit::finish_pending(&mut pending, &token)?;
+            Ok(SelectedVoiceEditReplaceResult {
+                replaced: true,
+                code: "replaced".to_string(),
+                message: success
+                    .warning
+                    .unwrap_or_else(|| "選択範囲を提案文へ置換しました。".to_string()),
+                partial: false,
+            })
+        }
+        Err(failure) => Ok(SelectedVoiceEditReplaceResult {
+            replaced: false,
+            code: if failure.partial {
+                "partial_injection"
+            } else {
+                "injection_failed"
+            }
+            .to_string(),
+            message: failure.message,
+            partial: failure.partial,
+        }),
+    }
+}
+
+#[tauri::command]
+pub async fn cancel_selected_voice_edit_preview(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<(), String> {
+    let _guard = state.session_action.lock().await;
+    let target = {
+        let mut pending = state.pending_selected_voice_edit.lock().await;
+        selected_voice_edit::cancel_pending(&mut pending, &token)?
+    };
+    context::focus_window(&target).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn preview_correction(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    history_id: String,
+    corrected_text: String,
+) -> Result<CorrectionPreview, String> {
+    if state.settings.lock().await.correction_learning_mode == CorrectionLearningMode::Off {
+        return Err("修正学習はオフです。設定で「保存前に確認」を選択してください。".to_string());
+    }
+    let history = local_data::load_history(&app).map_err(|error| error.to_string())?;
+    let source = correction_history_entry(&history, &history_id)?;
+    corrections::preview(
+        history_id,
+        source.final_text.clone(),
+        corrected_text,
+        &source.mode,
+        source.app_process.clone(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_corrections(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<CorrectionRecord>, String> {
+    let _guard = state.corrections_action.lock().await;
+    corrections::load(&app)
+        .map(|store| store.items)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn create_correction(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    history_id: String,
+    corrected_text: String,
+    artifacts: Vec<CorrectionArtifact>,
+) -> Result<CorrectionRecord, String> {
+    if state.settings.lock().await.correction_learning_mode == CorrectionLearningMode::Off {
+        return Err("修正学習はオフです。設定で「保存前に確認」を選択してください。".to_string());
+    }
+    let history = local_data::load_history(&app).map_err(|error| error.to_string())?;
+    let source = correction_history_entry(&history, &history_id)?;
+    let preview = corrections::preview(
+        history_id.clone(),
+        source.final_text.clone(),
+        corrected_text.clone(),
+        &source.mode,
+        source.app_process.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    let configured_api_key = state.settings.lock().await.api_key.clone();
+    corrections::reject_configured_api_key(
+        &configured_api_key,
+        &source.raw_text,
+        &source.final_text,
+        &corrected_text,
+        &source.polish_preset,
+        &source.app_process,
+        &artifacts,
+    )
+    .map_err(|error| error.to_string())?;
+    let _guard = state.corrections_action.lock().await;
+    let mut store = corrections::load(&app).map_err(|error| error.to_string())?;
+    let record = corrections::insert(
+        &mut store,
+        NewCorrection {
+            source_history_id: history_id,
+            raw_text: source.raw_text.clone(),
+            original_text: source.final_text.clone(),
+            corrected_text,
+            mode: source.mode.clone(),
+            polish_preset: source.polish_preset.clone(),
+            app_process: source.app_process.clone(),
+            classification: preview.classification,
+            artifacts,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    corrections::save(&app, &store).map_err(|error| error.to_string())?;
+    Ok(record)
+}
+
+#[tauri::command]
+pub async fn update_correction(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    corrected_text: String,
+    artifacts: Vec<CorrectionArtifact>,
+) -> Result<CorrectionRecord, String> {
+    let _guard = state.corrections_action.lock().await;
+    let mut store = corrections::load(&app).map_err(|error| error.to_string())?;
+    let existing = store
+        .items
+        .iter()
+        .find(|item| item.id == id)
+        .cloned()
+        .ok_or_else(|| "修正学習データが見つかりません。".to_string())?;
+    let classification = corrections::classify(&existing.original_text, &corrected_text);
+    let configured_api_key = state.settings.lock().await.api_key.clone();
+    corrections::reject_configured_api_key(
+        &configured_api_key,
+        &existing.raw_text,
+        &existing.original_text,
+        &corrected_text,
+        &existing.polish_preset,
+        &existing.app_process,
+        &artifacts,
+    )
+    .map_err(|error| error.to_string())?;
+    let record = corrections::update(
+        &mut store,
+        &id,
+        UpdateCorrection {
+            corrected_text,
+            classification,
+            artifacts,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    corrections::save(&app, &store).map_err(|error| error.to_string())?;
+    Ok(record)
+}
+
+async fn set_correction_status_command(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    id: &str,
+    status: CorrectionStatus,
+) -> Result<Vec<CorrectionRecord>, String> {
+    let _guard = state.corrections_action.lock().await;
+    let mut store = corrections::load(app).map_err(|error| error.to_string())?;
+    corrections::set_status(&mut store, id, status).map_err(|error| error.to_string())?;
+    corrections::save(app, &store).map_err(|error| error.to_string())?;
+    Ok(store.items)
+}
+
+#[tauri::command]
+pub async fn undo_correction(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<CorrectionRecord>, String> {
+    set_correction_status_command(&app, &state, &id, CorrectionStatus::Undone).await
+}
+
+#[tauri::command]
+pub async fn reactivate_correction(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<CorrectionRecord>, String> {
+    set_correction_status_command(&app, &state, &id, CorrectionStatus::Active).await
+}
+
+#[tauri::command]
+pub async fn delete_correction(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<CorrectionRecord>, String> {
+    let _guard = state.corrections_action.lock().await;
+    let mut store = corrections::load(&app).map_err(|error| error.to_string())?;
+    corrections::delete(&mut store, &id).map_err(|error| error.to_string())?;
+    corrections::save(&app, &store).map_err(|error| error.to_string())?;
+    Ok(store.items)
+}
+
+#[tauri::command]
+pub async fn clear_corrections(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let _guard = state.corrections_action.lock().await;
+    // 唯一の破損復旧経路。通常loadを先に呼ばず、ユーザーの明示操作で空v1へ置換する。
+    corrections::clear(&app).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1130,6 +2389,11 @@ pub async fn retry_recovery_session(
     id: String,
 ) -> Result<RecoverySessionSummary, String> {
     let meta = recovery::load_meta(&app, &id).map_err(|error| error.to_string())?;
+    if meta.operation_kind == OperationKind::SelectedVoiceEdit {
+        return Err(
+            "選択音声編集は原選択本文を保存しないため、Recoveryから再実行できません。".to_string(),
+        );
+    }
     let wav_path = recovery::audio_path(&app, &id).map_err(|error| error.to_string())?;
     if !wav_path.exists() {
         return Err("復元できる音声ファイルがありません。".to_string());
@@ -1145,15 +2409,36 @@ pub async fn retry_recovery_session(
     )
     .map_err(|error| error.to_string())?;
 
-    let current_settings = state.settings.lock().await.clone();
+    let mut current_settings = state.settings.lock().await.clone();
     if current_settings.api_key.is_empty() {
         let error = "APIキーが設定されていません。設定画面から入力してください。".to_string();
         let _ = recovery::mark_failed(&app, &id, error.clone());
         return Err(error);
     }
-    let dictionary_words = state.dictionary_words.lock().await.clone();
-    let focused_context = if current_settings.deep_context_enabled {
-        context::focused_app_context()
+    if !meta.polish_preset.is_empty() {
+        current_settings.polish_preset = meta.polish_preset.clone();
+    }
+    let manual_dictionary = state.dictionary_words.lock().await.clone();
+    // Recoveryは本文snapshotを重複保存せず、再実行開始時点のstoreを録音時app/presetへ適用する。
+    let app_process = meta.app_process.clone();
+    let correction_store =
+        if current_settings.correction_learning_mode == CorrectionLearningMode::Ask {
+            let _guard = state.corrections_action.lock().await;
+            corrections::load(&app).map_err(|error| error.to_string())?
+        } else {
+            corrections::CorrectionStore::default()
+        };
+    let dictionary_words =
+        if current_settings.correction_learning_mode == CorrectionLearningMode::Ask {
+            corrections::effective_vocabulary(&manual_dictionary, &correction_store, &app_process)
+        } else {
+            manual_dictionary
+        };
+    let focused_context = if current_settings.deep_context_enabled && !app_process.is_empty() {
+        Some(FocusedAppContext {
+            process_name: app_process.clone(),
+            window_title: String::new(),
+        })
     } else {
         None
     };
@@ -1170,6 +2455,7 @@ pub async fn retry_recovery_session(
         base_url: current_settings.api_base_url.clone(),
         api_key: current_settings.api_key.clone(),
         model: current_settings.api_model.clone(),
+        language_mode: current_settings.language_mode,
         dictionary_words: dictionary_words.clone(),
         focused_context: focused_context.clone(),
         partial_tx: None,
@@ -1182,12 +2468,24 @@ pub async fn retry_recovery_session(
             return Err(error);
         }
     };
-    let routed = mode::route(
+    let post_asr_text = if current_settings.correction_learning_mode == CorrectionLearningMode::Ask
+    {
+        corrections::apply_replacements(&raw_text, &correction_store, &app_process)
+    } else {
+        raw_text.clone()
+    };
+    let style_examples = corrections::select_style_examples(
+        &correction_store,
+        &current_settings.polish_preset,
+        &app_process,
+    );
+    let routed = mode::route_with_style_examples(
         &meta.mode,
         &current_settings,
         &dictionary_words,
         focused_context.as_ref(),
-        &raw_text,
+        &style_examples,
+        &post_asr_text,
     )
     .await;
     let snippets = local_data::load_snippets(&app).map_err(|error| error.to_string())?;
@@ -1204,6 +2502,12 @@ pub async fn inject_recovery_session(
     id: String,
 ) -> Result<RecoverySessionSummary, String> {
     let meta = recovery::load_meta(&app, &id).map_err(|error| error.to_string())?;
+    if meta.operation_kind == OperationKind::SelectedVoiceEdit {
+        return Err(
+            "選択音声編集のRecovery結果は自動再注入できません。Copyで回収してください。"
+                .to_string(),
+        );
+    }
     if meta.final_text.trim().is_empty() {
         return Err("再注入できるテキストがありません。".to_string());
     }
@@ -1212,42 +2516,70 @@ pub async fn inject_recovery_session(
         .lock()
         .await
         .clone()
-        .ok_or_else(|| "入力先アプリを一度クリックしてから再注入してください。".to_string())?;
-    if let Err(error) = crate::inject::inject_text_to_window(&meta.final_text, &target) {
-        let error = error.to_string();
-        let _ = recovery::mark_failed(&app, &id, error.clone());
-        return Err(error);
-    }
+        .ok_or_else(|| {
+            crate::inject::error_with_clipboard_backup(
+                &meta.final_text,
+                anyhow::anyhow!("入力先アプリを一度クリックしてから再注入してください"),
+            )
+            .to_string()
+        })?;
+    let injection =
+        dispatch_user_injection(&SystemUserInjectionBackend, &meta.final_text, Some(&target));
+    let injection_warning = match injection {
+        Ok(success) => success.warning,
+        Err(error) => {
+            let error = error.to_string();
+            let _ = recovery::mark_failed(&app, &id, error.clone());
+            return Err(error);
+        }
+    };
     recovery::update_meta(&app, &id, |meta| {
         meta.status = recovery::RecoveryStatus::TextReady;
         meta.error = None;
     })
     .map_err(|error| error.to_string())?;
-    recovery::summarize(&app, &id).map_err(|error| error.to_string())
+    let mut summary = recovery::summarize(&app, &id).map_err(|error| error.to_string())?;
+    summary.injection_warning = injection_warning;
+    Ok(summary)
 }
 
 #[tauri::command]
 pub async fn save_recovery_session_to_history(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     id: String,
 ) -> Result<HistoryEntry, String> {
     let meta = recovery::load_meta(&app, &id).map_err(|error| error.to_string())?;
     if meta.final_text.trim().is_empty() {
         return Err("履歴に保存できるテキストがありません。".to_string());
     }
-    let entry = local_data::make_history_entry(
-        meta.raw_text.clone(),
-        meta.final_text.clone(),
-        meta.mode.clone(),
-        meta.duration_ms,
-        None,
-        if matches!(meta.mode, Mode::Polish) {
-            PolishState::Unknown
-        } else {
-            PolishState::NotRequested
-        },
-    );
-    let saved = local_data::append_history(&app, entry).map_err(|error| error.to_string())?;
+    let entry = if meta.operation_kind == OperationKind::SelectedVoiceEdit {
+        local_data::make_selected_voice_edit_history_entry(
+            meta.raw_text.clone(),
+            meta.final_text.clone(),
+            meta.duration_ms,
+            None,
+            meta.app_process.clone(),
+        )
+    } else {
+        local_data::make_history_entry_with_context(
+            meta.raw_text.clone(),
+            meta.final_text.clone(),
+            meta.mode.clone(),
+            meta.duration_ms,
+            None,
+            if matches!(meta.mode, Mode::Polish) {
+                PolishState::Unknown
+            } else {
+                PolishState::NotRequested
+            },
+            meta.polish_preset.clone(),
+            meta.app_process.clone(),
+        )
+    };
+    let saved = append_history_locked(&state, &app, entry)
+        .await
+        .map_err(|error| error.to_string())?;
     recovery::mark_completed(&app, &id, Some(saved.id.clone()))
         .map_err(|error| error.to_string())?;
     recovery::delete_session(&app, &id).map_err(|error| error.to_string())?;
@@ -1263,9 +2595,143 @@ pub async fn delete_recovery_session(
     recovery::list_sessions(&app).map_err(|error| error.to_string())
 }
 
+async fn settings_target_context(state: &AppState) -> Option<FocusedAppContext> {
+    let target = match context::current_external_focused_window() {
+        Some(target) => Some(target),
+        None => state.last_target_window.lock().await.clone(),
+    };
+    target.map(|target| FocusedAppContext {
+        process_name: target.process_name,
+        window_title: target.window_title,
+    })
+}
+
 #[tauri::command]
-pub async fn get_focused_app_context() -> Result<Option<FocusedAppContext>, String> {
-    Ok(context::focused_app_context())
+pub async fn get_focused_app_context(
+    state: State<'_, AppState>,
+) -> Result<Option<FocusedAppContext>, String> {
+    Ok(settings_target_context(&state).await)
+}
+
+#[tauri::command]
+pub async fn get_app_profiles(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<AppProfile>, String> {
+    let _guard = state.app_profiles_action.lock().await;
+    app_profiles::load(&app)
+        .map(|store| store.items)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_app_profile_conflict_warnings(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    input: AppProfileInput,
+    exclude_id: Option<String>,
+) -> Result<Vec<String>, String> {
+    let _guard = state.app_profiles_action.lock().await;
+    let store = app_profiles::load(&app).map_err(|error| error.to_string())?;
+    Ok(app_profiles::conflict_warnings(
+        &store,
+        &input,
+        exclude_id.as_deref(),
+    ))
+}
+
+#[tauri::command]
+pub async fn create_app_profile(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    input: AppProfileInput,
+) -> Result<ProfileMutationResult, String> {
+    let api_key = state.settings.lock().await.api_key.clone();
+    app_profiles::reject_configured_api_key(&api_key, &input).map_err(|error| error.to_string())?;
+    let _guard = state.app_profiles_action.lock().await;
+    let mut store = app_profiles::load(&app).map_err(|error| error.to_string())?;
+    let result = app_profiles::insert(&mut store, input).map_err(|error| error.to_string())?;
+    app_profiles::save(&app, &store).map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn update_app_profile(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    input: AppProfileInput,
+) -> Result<ProfileMutationResult, String> {
+    let api_key = state.settings.lock().await.api_key.clone();
+    app_profiles::reject_configured_api_key(&api_key, &input).map_err(|error| error.to_string())?;
+    let _guard = state.app_profiles_action.lock().await;
+    let mut store = app_profiles::load(&app).map_err(|error| error.to_string())?;
+    let result = app_profiles::update(&mut store, &id, input).map_err(|error| error.to_string())?;
+    app_profiles::save(&app, &store).map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn set_app_profile_enabled(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> Result<AppProfile, String> {
+    let _guard = state.app_profiles_action.lock().await;
+    let mut store = app_profiles::load(&app).map_err(|error| error.to_string())?;
+    let item = store
+        .items
+        .iter_mut()
+        .find(|item| item.id == id)
+        .ok_or_else(|| "プロファイルが見つかりません。".to_string())?;
+    item.enabled = enabled;
+    item.updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let result = item.clone();
+    app_profiles::save(&app, &store).map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn delete_app_profile(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<AppProfile>, String> {
+    let _guard = state.app_profiles_action.lock().await;
+    let mut store = app_profiles::load(&app).map_err(|error| error.to_string())?;
+    app_profiles::delete(&mut store, &id).map_err(|error| error.to_string())?;
+    app_profiles::save(&app, &store).map_err(|error| error.to_string())?;
+    Ok(store.items)
+}
+
+#[tauri::command]
+pub async fn clear_app_profiles(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let _guard = state.app_profiles_action.lock().await;
+    app_profiles::clear(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn preview_current_app_profile(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<EffectiveAppProfile, String> {
+    let focused = settings_target_context(&state).await;
+    let settings = state.settings.lock().await.clone();
+    let _guard = state.app_profiles_action.lock().await;
+    let store = app_profiles::load(&app).map_err(|error| error.to_string())?;
+    Ok(app_profiles::resolve(
+        &store,
+        focused.as_ref(),
+        &settings,
+        None,
+    ))
 }
 
 #[tauri::command]
@@ -1342,24 +2808,30 @@ pub async fn save_settings(
     new_settings.push_to_talk_hotkey = normalized.push_to_talk;
     new_settings.hands_free_raw_hotkey = normalized.hands_free_raw;
     new_settings.hands_free_polish_hotkey = normalized.hands_free_polish;
-    if previous.launch_at_login != new_settings.launch_at_login {
+    new_settings.learn_selected_hotkey = normalized.learn_selected;
+    new_settings.voice_edit_selected_hotkey = normalized.voice_edit_selected;
+    let startup_changed = previous.launch_at_login != new_settings.launch_at_login;
+    if startup_changed {
         if let Err(error) = crate::startup::set_launch_at_login(new_settings.launch_at_login) {
-            let _ = hotkey::reconfigure_hotkeys(hotkey_set(&previous));
-            return Err(format!(
-                "ログイン時起動の設定を変更できませんでした: {error}"
+            let hotkey_restore_error = hotkey::reconfigure_hotkeys(hotkey_set(&previous)).err();
+            return Err(startup_change_error(
+                &error.to_string(),
+                hotkey_restore_error,
             ));
         }
     }
 
     if let Err(error) = settings::save(&app, &new_settings) {
-        let restore_error = hotkey::reconfigure_hotkeys(hotkey_set(&previous)).err();
+        let hotkey_restore_error = hotkey::reconfigure_hotkeys(hotkey_set(&previous)).err();
+        let startup_restore_error = startup_changed
+            .then(|| crate::startup::set_launch_at_login(previous.launch_at_login).err())
+            .flatten();
         let _ = settings::save(&app, &previous);
-        return Err(match restore_error {
-            Some(restore_error) => format!(
-                "設定を保存できませんでした: {error}。以前のショートカットの復元にも失敗しました: {restore_error}"
-            ),
-            None => format!("設定を保存できませんでした: {error}"),
-        });
+        return Err(settings_rollback_error(
+            &error.to_string(),
+            hotkey_restore_error,
+            startup_restore_error.map(|error| error.to_string()),
+        ));
     }
 
     *state.mode.lock().await = new_settings.mode.clone();
@@ -1374,17 +2846,171 @@ pub async fn save_settings(
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         io::{Read, Write},
         net::TcpListener,
         thread,
+        time::Instant,
     };
 
     use super::{
-        cleanup_api_key_import_file, extract_openai_api_key_env, hands_free_action,
-        list_models_with_key, parse_model_ids, push_to_talk_down_action, push_to_talk_up_action,
-        read_api_key_from_env_file, select_api_key, settings_for_ui, should_start_realtime_asr,
-        ShortcutAction,
+        cleanup_api_key_import_file, complete_dictation_cancel, correction_history_entry,
+        dispatch_user_injection, ensure_polish_preset_change_allowed, extract_openai_api_key_env,
+        hands_free_action, list_models_with_key, parse_model_ids, push_to_talk_down_action,
+        push_to_talk_up_action, read_api_key_from_env_file, recording_cancel_route, select_api_key,
+        selected_focus_warning, settings_for_ui, settings_rollback_error,
+        should_start_realtime_asr, startup_change_error, RecordingCancelRoute, ShortcutAction,
+        UserInjectionBackend,
     };
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum RecordedInjection {
+        Current {
+            text: String,
+        },
+        Target {
+            text: String,
+            target: crate::context::FocusedWindowTarget,
+        },
+    }
+
+    #[derive(Default)]
+    struct RecordingInjectionBackend(std::cell::RefCell<Vec<RecordedInjection>>);
+
+    impl UserInjectionBackend for RecordingInjectionBackend {
+        fn inject_current(&self, text: &str) -> anyhow::Result<crate::inject::InjectionSuccess> {
+            self.0.borrow_mut().push(RecordedInjection::Current {
+                text: text.to_string(),
+            });
+            Ok(crate::inject::InjectionSuccess { warning: None })
+        }
+
+        fn inject_target(
+            &self,
+            text: &str,
+            target: &crate::context::FocusedWindowTarget,
+        ) -> anyhow::Result<crate::inject::InjectionSuccess> {
+            self.0.borrow_mut().push(RecordedInjection::Target {
+                text: text.to_string(),
+                target: target.clone(),
+            });
+            Ok(crate::inject::InjectionSuccess { warning: None })
+        }
+    }
+
+    #[test]
+    fn shared_user_injection_dispatch_forwards_all_call_sites() {
+        let backend = RecordingInjectionBackend::default();
+        let target = crate::context::FocusedWindowTarget {
+            hwnd: 42,
+            process_id: 7,
+            process_name: "notepad.exe".to_string(),
+            window_title: "note".to_string(),
+        };
+
+        dispatch_user_injection(&backend, "recording", None).unwrap();
+        dispatch_user_injection(&backend, "history", Some(&target)).unwrap();
+        dispatch_user_injection(&backend, "recovery", Some(&target)).unwrap();
+
+        assert_eq!(
+            *backend.0.borrow(),
+            vec![
+                RecordedInjection::Current {
+                    text: "recording".to_string(),
+                },
+                RecordedInjection::Target {
+                    text: "history".to_string(),
+                    target: target.clone(),
+                },
+                RecordedInjection::Target {
+                    text: "recovery".to_string(),
+                    target,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_cleanup_failure_keeps_cancelled_session_idle() {
+        use tokio::sync::watch;
+
+        let state = crate::state::AppState::default();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let capture_task = tokio::task::spawn_blocking(move || {
+            drop(stop_rx);
+            Ok::<crate::audio::CapturedAudio, anyhow::Error>(Default::default())
+        });
+        *state.session.lock().await = Some(crate::state::SessionController {
+            stop_tx,
+            capture_task,
+            realtime_task: None,
+            started_at: Instant::now(),
+            recovery_id: Some("rec-1-2".to_string()),
+            mode: crate::state::Mode::Raw,
+            polish_preset: "memo".to_string(),
+            app_process: "notepad.exe".to_string(),
+            correction_snapshot: crate::corrections::CorrectionSessionSnapshot::default(),
+            language_mode: crate::settings::LanguageMode::Auto,
+            target_window: None,
+        });
+        *state.recording_state.lock().await = crate::state::RecordingState::Recording;
+
+        let outcome = crate::session_service::cancel_session_inner(&state).await;
+        let cleanup_calls = Cell::new(0);
+        let result = complete_dictation_cancel(&outcome, |_| {
+            cleanup_calls.set(cleanup_calls.get() + 1);
+            anyhow::bail!("locked recovery directory")
+        });
+
+        assert!(result.unwrap_err().contains("一時データを削除できません"));
+        assert_eq!(cleanup_calls.get(), 1);
+        assert!(matches!(
+            *state.recording_state.lock().await,
+            crate::state::RecordingState::Idle
+        ));
+        assert!(state.session.lock().await.is_none());
+    }
+
+    #[test]
+    fn onboarding_dictation_session_uses_the_regular_cancel_route() {
+        assert_eq!(
+            recording_cancel_route(Some(crate::state::SessionKind::Dictation)),
+            RecordingCancelRoute::Dictation
+        );
+        assert_eq!(
+            recording_cancel_route(Some(crate::state::SessionKind::SelectedVoiceEdit)),
+            RecordingCancelRoute::SelectedVoiceEdit
+        );
+    }
+
+    #[test]
+    fn correction_learning_rejects_a_missing_source_history() {
+        let error = correction_history_entry(&[], "deleted-history").unwrap_err();
+        assert!(error.contains("履歴が見つかりません"));
+    }
+
+    #[test]
+    fn settings_rollback_error_combines_hotkey_and_startup_failures() {
+        let message = settings_rollback_error(
+            "store failed",
+            Some("hotkey failed".to_string()),
+            Some("startup failed".to_string()),
+        );
+        assert!(message.contains("store failed"));
+        assert!(message.contains("hotkey failed"));
+        assert!(message.contains("startup failed"));
+    }
+
+    #[test]
+    fn startup_change_error_preserves_hotkey_restore_failure() {
+        let combined =
+            startup_change_error("registry failed", Some("hotkey restore failed".into()));
+        assert!(combined.contains("registry failed"));
+        assert!(combined.contains("hotkey restore failed"));
+        let startup_only = startup_change_error("registry failed", None);
+        assert!(startup_only.contains("registry failed"));
+        assert!(!startup_only.contains("ショートカットの復元にも失敗"));
+    }
     use crate::{
         settings::{AppSettings, HotkeyBinding},
         state::{Mode, RecordingState, RecordingTrigger},
@@ -1404,6 +3030,20 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         format!("http://{address}")
+    }
+
+    #[test]
+    fn polish_preset_change_is_rejected_after_session_start() {
+        assert!(ensure_polish_preset_change_allowed(true).is_err());
+        assert!(ensure_polish_preset_change_allowed(false).is_ok());
+    }
+
+    #[test]
+    fn saved_selected_correction_surfaces_focus_failure_as_warning() {
+        assert!(selected_focus_warning(Ok(())).is_none());
+        let warning = selected_focus_warning(Err(anyhow::anyhow!("focus failed"))).unwrap();
+        assert!(warning.contains("保存しました"));
+        assert!(!warning.contains("focus failed"));
     }
 
     #[test]

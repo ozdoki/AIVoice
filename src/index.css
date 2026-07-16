@@ -204,6 +204,49 @@ select:focus-visible {
   line-height: 1.6;
 }
 
+.selected-voice-edit-status {
+  min-height: 238px;
+  margin-top: 8px;
+  padding: 34px 24px 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.selected-voice-edit-status-indicator {
+  width: 18px;
+  height: 18px;
+  margin-bottom: 22px;
+  border-radius: 50%;
+}
+
+.selected-voice-edit-status-indicator.is-recording {
+  background: var(--danger);
+  box-shadow: 0 0 0 8px rgba(235, 87, 87, 0.14);
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+
+.selected-voice-edit-status-indicator.is-processing {
+  border: 2px solid rgba(89, 168, 255, 0.35);
+  border-top-color: #59a8ff;
+  animation: orbit-spin 1.2s linear infinite;
+}
+
+.selected-voice-edit-status h2 {
+  font-size: 25px;
+  font-weight: 620;
+  letter-spacing: 0.01em;
+}
+
+.selected-voice-edit-status p {
+  margin-top: 12px;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
 .session-phase-row {
   margin-top: 13px;
   min-height: 26px;
@@ -351,6 +394,138 @@ select:focus-visible {
 .latest-text.is-empty {
   color: var(--text-dim);
   font-size: 13px;
+}
+
+.correction-editor,
+.correction-confirmation,
+.correction-artifact-editor {
+  display: grid;
+  gap: 10px;
+}
+
+.selected-correction-backdrop {
+  z-index: 1200;
+}
+
+.selected-voice-edit-backdrop {
+  z-index: 1250;
+}
+
+.selected-correction-dialog {
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+
+.selected-voice-edit-dialog {
+  width: min(880px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+
+.selected-voice-edit-comparison {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.selected-candidate-list {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.selected-candidate-option {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.selected-candidate-option > span,
+.selected-candidate-excerpt {
+  display: grid;
+  gap: 4px;
+}
+
+.selected-candidate-option em {
+  margin-left: 8px;
+  color: var(--warning-color, #9a5b00);
+  font-style: normal;
+}
+
+.selected-candidate-excerpt {
+  white-space: pre-wrap;
+}
+
+.selected-text-comparison {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.dialog-warning {
+  padding: 10px;
+  border-radius: 8px;
+  background: #fff4ce;
+  color: #6b4500;
+}
+
+@media (max-width: 640px) {
+  .selected-text-comparison,
+  .selected-voice-edit-comparison {
+    grid-template-columns: 1fr;
+  }
+}
+
+.inline-status {
+  margin-bottom: 20px;
+  padding: 10px 12px;
+  border: 1px solid rgba(89, 168, 255, 0.45);
+  border-radius: 9px;
+  background: rgba(24, 62, 99, 0.55);
+  color: #cde7ff;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.correction-editor textarea,
+.correction-artifact-editor textarea,
+.correction-artifact-editor input,
+.correction-artifact-editor select {
+  width: 100%;
+}
+
+.correction-confirmation {
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-raised);
+}
+
+.correction-learning-actions,
+.correction-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.correction-artifact-editor {
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+@media (max-width: 720px) {
+  .correction-artifact-editor {
+    grid-template-columns: 1fr;
+  }
 }
 
 .shortcut-strip {
@@ -687,10 +862,18 @@ kbd {
 }
 
 .form-field {
+  display: block;
   margin-bottom: 15px;
 }
 
-.form-field label {
+.settings-loading-fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.form-field > span {
   display: block;
   margin-bottom: 6px;
   color: var(--text-muted);

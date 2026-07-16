@@ -8,6 +8,33 @@ const STORE_PATH: &str = "settings.json";
 const KEYRING_SERVICE: &str = "aivoice";
 const KEYRING_USER: &str = "api_key";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LanguageMode {
+    #[default]
+    Auto,
+    Ja,
+    En,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CorrectionLearningMode {
+    #[default]
+    Off,
+    Ask,
+}
+
+impl LanguageMode {
+    pub fn api_language(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Ja => Some("ja"),
+            Self::En => Some("en"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HotkeyBinding {
@@ -60,6 +87,24 @@ impl HotkeyBinding {
         }
     }
 
+    pub fn learn_selected_default() -> Self {
+        Self {
+            ctrl: true,
+            shift: true,
+            key: "F8".to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn voice_edit_selected_default() -> Self {
+        Self {
+            ctrl: true,
+            shift: true,
+            key: "F9".to_string(),
+            ..Default::default()
+        }
+    }
+
     pub fn toggle_mode_default() -> Self {
         Self {
             ctrl: true,
@@ -94,6 +139,7 @@ pub struct AppSettings {
     #[serde(skip_serializing, default)]
     pub api_key: String,
     pub api_model: String,
+    pub language_mode: LanguageMode,
     pub polish_model: String,
     pub mode: Mode,
     pub device_id: Option<String>,
@@ -102,11 +148,14 @@ pub struct AppSettings {
     pub deep_context_enabled: bool,
     pub show_floating_bar: bool,
     pub show_live_transcript_in_floating_bar: bool,
+    pub correction_learning_mode: CorrectionLearningMode,
     pub launch_at_login: bool,
     pub onboarding_completed: bool,
     pub push_to_talk_hotkey: HotkeyBinding,
     pub hands_free_raw_hotkey: HotkeyBinding,
     pub hands_free_polish_hotkey: HotkeyBinding,
+    pub learn_selected_hotkey: HotkeyBinding,
+    pub voice_edit_selected_hotkey: HotkeyBinding,
     #[serde(skip_serializing, default)]
     pub hands_free_hotkey: HotkeyBinding,
     #[serde(skip_serializing, default)]
@@ -119,6 +168,7 @@ impl Default for AppSettings {
             api_base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
             api_model: "gpt-realtime-whisper".to_string(),
+            language_mode: LanguageMode::Auto,
             polish_model: "gpt-4o-mini".to_string(),
             mode: Mode::default(),
             device_id: None,
@@ -127,12 +177,15 @@ impl Default for AppSettings {
             deep_context_enabled: false,
             show_floating_bar: true,
             show_live_transcript_in_floating_bar: false,
+            correction_learning_mode: CorrectionLearningMode::Off,
             launch_at_login: false,
             onboarding_completed: false,
             push_to_talk_hotkey: HotkeyBinding::push_to_talk_default(),
             hands_free_hotkey: HotkeyBinding::hands_free_default(),
             hands_free_raw_hotkey: HotkeyBinding::hands_free_raw_default(),
             hands_free_polish_hotkey: HotkeyBinding::hands_free_polish_default(),
+            learn_selected_hotkey: HotkeyBinding::learn_selected_default(),
+            voice_edit_selected_hotkey: HotkeyBinding::voice_edit_selected_default(),
             toggle_mode_hotkey: HotkeyBinding::toggle_mode_default(),
         }
     }
@@ -227,6 +280,8 @@ mod tests {
             push_to_talk_hotkey: HotkeyBinding::push_to_talk_default(),
             hands_free_raw_hotkey: HotkeyBinding::hands_free_raw_default(),
             hands_free_polish_hotkey: HotkeyBinding::hands_free_polish_default(),
+            learn_selected_hotkey: HotkeyBinding::learn_selected_default(),
+            voice_edit_selected_hotkey: HotkeyBinding::voice_edit_selected_default(),
             ..Default::default()
         };
         let json = serde_json::to_value(&original).unwrap();
@@ -234,6 +289,7 @@ mod tests {
 
         assert_eq!(restored.api_base_url, original.api_base_url);
         assert_eq!(restored.api_model, original.api_model);
+        assert_eq!(restored.language_mode, original.language_mode);
         assert_eq!(restored.polish_model, original.polish_model);
         assert_eq!(restored.device_id, original.device_id);
         assert_eq!(restored.mode, original.mode);
@@ -259,6 +315,14 @@ mod tests {
             restored.hands_free_polish_hotkey,
             original.hands_free_polish_hotkey
         );
+        assert_eq!(
+            restored.learn_selected_hotkey,
+            original.learn_selected_hotkey
+        );
+        assert_eq!(
+            restored.voice_edit_selected_hotkey,
+            original.voice_edit_selected_hotkey
+        );
         // api_key は serde(skip) のため JSON 経由では復元されない
         assert!(restored.api_key.is_empty());
     }
@@ -269,6 +333,7 @@ mod tests {
         assert!(d.api_key.is_empty());
         assert_eq!(d.api_base_url, "https://api.openai.com/v1");
         assert_eq!(d.api_model, "gpt-realtime-whisper");
+        assert_eq!(d.language_mode, LanguageMode::Auto);
         assert!(d.device_id.is_none());
         assert_eq!(d.mode, Mode::Raw);
         assert_eq!(d.polish_preset, "memo");
@@ -281,6 +346,8 @@ mod tests {
         assert_eq!(d.push_to_talk_hotkey.display(), "Ctrl + Shift + F4");
         assert_eq!(d.hands_free_raw_hotkey.display(), "Ctrl + Shift + F6");
         assert_eq!(d.hands_free_polish_hotkey.display(), "Ctrl + Shift + F7");
+        assert_eq!(d.learn_selected_hotkey.display(), "Ctrl + Shift + F8");
+        assert_eq!(d.voice_edit_selected_hotkey.display(), "Ctrl + Shift + F9");
     }
 
     #[test]
@@ -294,6 +361,7 @@ mod tests {
         });
         let s: AppSettings = serde_json::from_value(json).unwrap();
         assert!(s.device_id.is_none());
+        assert_eq!(s.language_mode, LanguageMode::Auto);
         assert_eq!(s.push_to_talk_hotkey, HotkeyBinding::push_to_talk_default());
         assert_eq!(
             s.hands_free_raw_hotkey,
@@ -302,6 +370,14 @@ mod tests {
         assert_eq!(
             s.hands_free_polish_hotkey,
             HotkeyBinding::hands_free_polish_default()
+        );
+        assert_eq!(
+            s.learn_selected_hotkey,
+            HotkeyBinding::learn_selected_default()
+        );
+        assert_eq!(
+            s.voice_edit_selected_hotkey,
+            HotkeyBinding::voice_edit_selected_default()
         );
     }
 
@@ -315,6 +391,47 @@ mod tests {
         });
         let s: AppSettings = serde_json::from_value(json).unwrap();
         assert_eq!(s.polish_preset, "memo");
+    }
+
+    #[test]
+    fn legacy_clipboard_setting_is_ignored_and_stripped_on_save() {
+        let mut json = serde_json::to_value(AppSettings::default()).unwrap();
+        json["leave_result_on_clipboard"] = serde_json::json!(true);
+        let settings: AppSettings = serde_json::from_value(json).unwrap();
+        let saved = serde_json::to_value(settings).unwrap();
+        assert!(saved.get("leave_result_on_clipboard").is_none());
+    }
+
+    #[test]
+    fn language_mode_serde_uses_stable_values() {
+        for (mode, value) in [
+            (LanguageMode::Auto, "auto"),
+            (LanguageMode::Ja, "ja"),
+            (LanguageMode::En, "en"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), value);
+            assert_eq!(
+                serde_json::from_value::<LanguageMode>(serde_json::json!(value)).unwrap(),
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn correction_learning_mode_has_only_off_and_ask_stable_values() {
+        assert_eq!(
+            serde_json::to_value(CorrectionLearningMode::Off).unwrap(),
+            "off"
+        );
+        assert_eq!(
+            serde_json::to_value(CorrectionLearningMode::Ask).unwrap(),
+            "ask"
+        );
+        assert!(serde_json::from_str::<CorrectionLearningMode>("\"auto\"").is_err());
+        assert_eq!(
+            AppSettings::default().correction_learning_mode,
+            CorrectionLearningMode::Off
+        );
     }
 
     #[test]

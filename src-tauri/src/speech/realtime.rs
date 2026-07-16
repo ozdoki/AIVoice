@@ -14,11 +14,41 @@ use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, Message},
 };
 
-use crate::audio::AudioChunk;
+use crate::{audio::AudioChunk, settings::LanguageMode};
 
 pub const REALTIME_TRANSCRIPTION_MODEL: &str = "gpt-realtime-whisper";
 const REALTIME_SAMPLE_RATE: u32 = 24_000;
 const LIVE_COMMIT_INTERVAL_MS: u64 = 800;
+
+struct AbortOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .map_or(true, |handle| handle.is_finished())
+    }
+
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        self.handle.take().expect("join handle missing").await
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RealtimeStatus {
@@ -57,6 +87,86 @@ fn send_status(
 
 pub fn supports_realtime_model(model: &str) -> bool {
     model.trim() == REALTIME_TRANSCRIPTION_MODEL
+}
+
+pub fn supports_realtime_language(base_url: &str, model: &str) -> bool {
+    supports_realtime_model(model)
+        && reqwest::Url::parse(base_url.trim())
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
+            })
+            .unwrap_or(false)
+}
+
+pub fn supports_realtime_prompt(base_url: &str, model: &str) -> bool {
+    supports_realtime_language(base_url, model)
+}
+
+pub fn realtime_vocabulary_prompt(
+    base_url: &str,
+    model: &str,
+    dictionary_words: &[String],
+) -> Option<String> {
+    if !supports_realtime_prompt(base_url, model) {
+        return None;
+    }
+    const PREFIX: &str = "Important vocabulary: ";
+    let mut prompt = PREFIX.to_string();
+    let mut added = false;
+    for word in dictionary_words {
+        let word = word.trim();
+        if word.is_empty() {
+            continue;
+        }
+        let separator = if added { ", " } else { "" };
+        if prompt
+            .chars()
+            .count()
+            .saturating_add(separator.chars().count())
+            .saturating_add(word.chars().count())
+            > crate::corrections::MAX_EFFECTIVE_VOCABULARY_CHARS
+        {
+            break;
+        }
+        prompt.push_str(separator);
+        prompt.push_str(word);
+        added = true;
+    }
+    added.then_some(prompt)
+}
+
+fn build_session_update(
+    base_url: &str,
+    model: &str,
+    live_enabled: bool,
+    language_mode: LanguageMode,
+    prompt: Option<&str>,
+) -> serde_json::Value {
+    let mut transcription = serde_json::json!({ "model": model });
+    if live_enabled {
+        transcription["delay"] = serde_json::json!("minimal");
+    }
+    if supports_realtime_language(base_url, model) {
+        if let Some(language) = language_mode.api_language() {
+            transcription["language"] = serde_json::json!(language);
+        }
+        if let Some(prompt) = prompt.filter(|prompt| !prompt.trim().is_empty()) {
+            transcription["prompt"] = serde_json::json!(prompt);
+        }
+    }
+    serde_json::json!({
+        "type": "session.update",
+        "session": {
+            "type": "transcription",
+            "audio": { "input": {
+                "format": { "type": "audio/pcm", "rate": REALTIME_SAMPLE_RATE },
+                "transcription": transcription,
+                "turn_detection": null
+            }}
+        }
+    })
 }
 
 fn realtime_url(base_url: &str) -> String {
@@ -111,6 +221,8 @@ pub async fn transcribe_realtime(
     base_url: String,
     api_key: String,
     model: String,
+    language_mode: LanguageMode,
+    prompt: Option<String>,
     mut audio_rx: mpsc::UnboundedReceiver<AudioChunk>,
     partial_tx: Option<mpsc::UnboundedSender<String>>,
     status_tx: Option<mpsc::UnboundedSender<RealtimeStatus>>,
@@ -158,32 +270,13 @@ pub async fn transcribe_realtime(
         live_enabled,
         "starting realtime transcription"
     );
-    let transcription = if live_enabled {
-        serde_json::json!({
-            "model": model,
-            "delay": "minimal"
-        })
-    } else {
-        serde_json::json!({
-            "model": model
-        })
-    };
-    let session_update = serde_json::json!({
-        "type": "session.update",
-        "session": {
-            "type": "transcription",
-            "audio": {
-                "input": {
-                    "format": {
-                        "type": "audio/pcm",
-                        "rate": REALTIME_SAMPLE_RATE
-                    },
-                    "transcription": transcription,
-                    "turn_detection": null
-                }
-            }
-        }
-    });
+    let session_update = build_session_update(
+        &base_url,
+        &model,
+        live_enabled,
+        language_mode,
+        prompt.as_deref(),
+    );
     if let Err(error) = write
         .send(Message::Text(session_update.to_string().into()))
         .await
@@ -199,7 +292,7 @@ pub async fn transcribe_realtime(
     let commit_count = Arc::new(AtomicUsize::new(0));
     let sender_commit_count = commit_count.clone();
     let sender_status_tx = status_tx.clone();
-    let sender = tokio::spawn(async move {
+    let sender = AbortOnDrop::new(tokio::spawn(async move {
         let mut last_commit = Instant::now();
         let mut has_uncommitted_audio = false;
         while let Some(chunk) = audio_rx.recv().await {
@@ -256,7 +349,7 @@ pub async fn transcribe_realtime(
             live_debug(format!("sent final realtime audio commit count={commits}"));
         }
         Ok(())
-    });
+    }));
 
     let mut final_text = String::new();
     let mut completed_segments: Vec<String> = Vec::new();
@@ -393,7 +486,7 @@ pub async fn transcribe_realtime(
         }
     }
 
-    match sender.await {
+    match sender.join().await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(error),
         Err(error) => return Err(format!("Realtime sender task failed: {error}")),
@@ -439,5 +532,99 @@ mod tests {
     fn detects_realtime_model() {
         assert!(supports_realtime_model("gpt-realtime-whisper"));
         assert!(!supports_realtime_model("gpt-4o-mini-transcribe"));
+    }
+
+    #[test]
+    fn realtime_language_is_optional_and_model_gated() {
+        let auto = build_session_update(
+            "https://api.openai.com/v1",
+            REALTIME_TRANSCRIPTION_MODEL,
+            false,
+            LanguageMode::Auto,
+            None,
+        );
+        assert!(auto["session"]["audio"]["input"]["transcription"]
+            .get("language")
+            .is_none());
+        let en = build_session_update(
+            "https://api.openai.com/v1",
+            REALTIME_TRANSCRIPTION_MODEL,
+            false,
+            LanguageMode::En,
+            None,
+        );
+        assert_eq!(
+            en["session"]["audio"]["input"]["transcription"]["language"],
+            "en"
+        );
+        let unsupported = build_session_update(
+            "https://compatible.example/v1",
+            REALTIME_TRANSCRIPTION_MODEL,
+            false,
+            LanguageMode::Ja,
+            None,
+        );
+        assert!(unsupported["session"]["audio"]["input"]["transcription"]
+            .get("language")
+            .is_none());
+    }
+
+    #[test]
+    fn realtime_prompt_is_official_only_and_optional() {
+        let words = vec!["KoeType".to_string(), "音声入力".to_string()];
+        let prompt = realtime_vocabulary_prompt(
+            "https://api.openai.com/v1",
+            REALTIME_TRANSCRIPTION_MODEL,
+            &words,
+        );
+        let official = build_session_update(
+            "https://api.openai.com/v1",
+            REALTIME_TRANSCRIPTION_MODEL,
+            false,
+            LanguageMode::Auto,
+            prompt.as_deref(),
+        );
+        assert!(
+            official["session"]["audio"]["input"]["transcription"]["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("KoeType")
+        );
+        assert!(realtime_vocabulary_prompt(
+            "https://compatible.example/v1",
+            REALTIME_TRANSCRIPTION_MODEL,
+            &words
+        )
+        .is_none());
+        assert!(realtime_vocabulary_prompt(
+            "https://api.openai.com/v1",
+            REALTIME_TRANSCRIPTION_MODEL,
+            &[]
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_parent_guard_aborts_sender_task() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let guard = AbortOnDrop::new(tokio::spawn(async move {
+            let _signal = DropSignal(Some(tx));
+            std::future::pending::<()>().await;
+        }));
+        tokio::task::yield_now().await;
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("sender task was not aborted")
+            .expect("drop signal was lost");
     }
 }
