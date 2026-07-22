@@ -87,8 +87,15 @@ const settingsNavGroups = [
     items: [
       ["settings-api", "API"],
       ["settings-models", "モデル"],
+    ],
+  },
+  {
+    id: "settings-customization-category",
+    label: "カスタマイズ",
+    items: [
       ["settings-custom", "カスタム指示"],
       ["settings-corrections", "修正学習"],
+      ["settings-app-profiles", "アプリ別プロファイル"],
     ],
   },
   {
@@ -108,15 +115,27 @@ const settingsNavGroups = [
     ],
   },
   {
-    id: "settings-details",
-    label: "詳細",
+    id: "settings-data-privacy",
+    label: "データとプライバシー",
     items: [
       ["settings-context", "コンテキスト"],
-      ["settings-app-profiles", "アプリ別プロファイル"],
       ["settings-data-flow", "データ処理経路"],
     ],
   },
 ] as const;
+
+const settingsContentOrder = new Map<string, number>();
+settingsNavGroups.forEach((group, groupIndex) => {
+  const groupOrder = (groupIndex + 1) * 100;
+  settingsContentOrder.set(group.id, groupOrder);
+  group.items.forEach(([id], itemIndex) => {
+    settingsContentOrder.set(id, groupOrder + itemIndex + 1);
+  });
+});
+
+function getSettingsContentOrder(id: string): number {
+  return settingsContentOrder.get(id) ?? (settingsNavGroups.length + 1) * 100;
+}
 
 function connectionKey(settings: AppSettings): string {
   return settings.api_base_url.trim();
@@ -1282,7 +1301,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
           <SettingsCategory
             id="settings-ai"
             title="AI"
-            description="APIキー、モデル、Polishの出力品質をまとめて調整します。"
+            description="APIキーと、音声認識・Polishに使用するモデルを設定します。"
           />
           <SettingsSection id="settings-api" title="API">
             <FormField label="API Base URL">
@@ -1833,6 +1852,11 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
             )}
           </SettingsSection>
 
+          <SettingsCategory
+            id="settings-customization-category"
+            title="カスタマイズ"
+            description="入力結果や、アプリごとの動作を自分向けに調整します。"
+          />
           <SettingsSection id="settings-custom" title="カスタム指示">
             <FormField label="Polish プリセット">
               <select
@@ -2008,9 +2032,9 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
           </SettingsSection>
 
           <SettingsCategory
-            id="settings-details"
-            title="詳細"
-            description="コンテキスト確認や利用量など、必要な時だけ見る項目です。"
+            id="settings-data-privacy"
+            title="データとプライバシー"
+            description="取得するコンテキストと、外部送信・ローカル保存の経路を確認します。"
           />
           <SettingsSection id="settings-context" title="コンテキスト">
             <label className="toggle-row">
@@ -2501,13 +2525,17 @@ function SettingsSection({
   action,
   children,
 }: {
-  id?: string;
+  id: string;
   title: string;
   action?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
-    <section id={id} className="settings-section">
+    <section
+      id={id}
+      className="settings-section"
+      style={{ order: getSettingsContentOrder(id) }}
+    >
       <div className="settings-section-header">
         <h3>{title}</h3>
         {action}
@@ -2527,7 +2555,11 @@ function SettingsCategory({
   description: string;
 }) {
   return (
-    <div id={id} className="settings-category">
+    <div
+      id={id}
+      className="settings-category"
+      style={{ order: getSettingsContentOrder(id) }}
+    >
       <h3>{title}</h3>
       <p>{description}</p>
     </div>
