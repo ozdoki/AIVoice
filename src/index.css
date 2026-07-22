@@ -956,23 +956,6 @@ kbd {
   border-bottom: 0;
 }
 
-#settings-input { order: 10; }
-#settings-audio { order: 11; }
-#settings-hotkeys { order: 12; }
-#settings-general { order: 13; }
-#settings-ai { order: 20; }
-#settings-api { order: 21; }
-#settings-models { order: 22; }
-#settings-custom { order: 23; }
-#settings-dictionary-category { order: 30; }
-#settings-dictionary { order: 31; }
-#settings-snippets { order: 32; }
-#settings-history-category { order: 40; }
-#settings-history { order: 41; }
-#settings-details { order: 50; }
-#settings-context { order: 51; }
-#settings-usage { order: 52; }
-
 .settings-section-header {
   margin-bottom: 15px;
   display: flex;
