@@ -45,6 +45,7 @@ export interface AppSettings {
   show_floating_bar: boolean;
   show_live_transcript_in_floating_bar: boolean;
   correction_learning_mode: CorrectionLearningMode;
+  correction_learning_multi_diff_enabled: boolean;
   launch_at_login: boolean;
   onboarding_completed: boolean;
   push_to_talk_hotkey: HotkeyBinding;
@@ -116,6 +117,23 @@ export interface ProfileMutationResult {
 export type CorrectionStatus = "active" | "undone";
 export type CorrectionClassification = "minor" | "substantial" | "meaning_change_suspected";
 export type LearningScope = "global" | "app";
+export type ComparisonMode = "full" | "explicit_range";
+export type CorrectionCandidateStatus = "eligible" | "needs_review" | "unsupported";
+export type CorrectionCandidateReasonCode =
+  | "none"
+  | "short_source"
+  | "ambiguous_source"
+  | "overlapping_candidate"
+  | "conflicting_destination"
+  | "pure_insertion"
+  | "pure_deletion"
+  | "meaning_change_suspected"
+  | "manual_revalidation_required"
+  | "existing_rule_conflict"
+  | "candidate_limit_exceeded"
+  | "diff_budget_exceeded"
+  | "range_mismatch";
+export type CorrectionCandidatePersistenceState = "new" | "persisted_verified" | "persisted_unverified";
 export type CorrectionArtifact =
   | { type: "vocabulary"; value: string; scope: LearningScope }
   | { type: "replacement"; from: string; to: string; scope: LearningScope }
@@ -138,14 +156,55 @@ export interface CorrectionRecord {
   updated_at: number;
 }
 
+export interface CorrectionTextRange {
+  /** Grapheme-cluster offsets, end-exclusive. */
+  start: number;
+  end: number;
+}
+
+export interface CorrectionCandidate {
+  id: string;
+  artifact: CorrectionArtifact;
+  source_range: CorrectionTextRange;
+  corrected_range: CorrectionTextRange;
+  occurrence_count: number;
+  context_before: string;
+  context_after: string;
+  status: CorrectionCandidateStatus;
+  reason_code: CorrectionCandidateReasonCode;
+  reason: string;
+  origin: "automatic" | "manual";
+  persistence_state: CorrectionCandidatePersistenceState;
+  warnings: string[];
+}
+
 export interface CorrectionPreview {
   source_history_id: string;
   original_text: string;
   corrected_text: string;
   app_process: string;
+  mode: Mode;
+  comparison_mode: ComparisonMode;
+  source_display_text: string;
+  source_display_fingerprint: string;
+  preview_fingerprint: string;
+  idempotency_key: string;
+  target_record_id: string | null;
+  record_edit_fingerprint: string | null;
+  source_records_fingerprint: string;
+  persisted_unverified_artifacts: CorrectionArtifact[];
+  persisted_artifacts: CorrectionArtifact[];
+  target_record_corrected_text: string | null;
   classification: CorrectionClassification;
-  candidates: CorrectionArtifact[];
+  candidates: CorrectionCandidate[];
+  warnings: string[];
+  total_candidates: number;
+  omitted_candidates: number;
   default_artifacts: CorrectionArtifact[];
+  source_range?: CorrectionTextRange | null;
+  corrected_excerpt_range?: CorrectionTextRange | null;
+  original_excerpt?: string | null;
+  corrected_excerpt?: string | null;
 }
 
 export interface SelectedCorrectionCandidate {
@@ -156,6 +215,29 @@ export interface SelectedCorrectionCandidate {
   app_process: string;
   created_at: number;
   same_app: boolean;
+  source_display_text: string;
+  source_display_fingerprint: string;
+  existing_records: ExistingCorrectionSummary[];
+}
+
+export interface ExistingCorrectionSummary {
+  id: string;
+  status: CorrectionStatus;
+  updated_at: number;
+  corrected_excerpt: string;
+}
+
+export type SelectedCorrectionOperation = "create" | "update" | "delete" | "none";
+
+export interface CreateSelectedCorrectionResult {
+  record_id: string;
+  replayed: boolean;
+  focus_warning: string | null;
+}
+
+export interface VocabularyCandidateAssociation {
+  artifact_index: number;
+  candidate_id: string;
 }
 
 export interface PrepareSelectedCorrectionResult {
@@ -163,6 +245,7 @@ export interface PrepareSelectedCorrectionResult {
   candidates: SelectedCorrectionCandidate[];
   token: string;
   warning: "external_clipboard_change_preserved" | null;
+  multi_diff_enabled: boolean;
 }
 
 export function polishStateLabel(state: PolishState | null | undefined): string | null {
@@ -314,6 +397,7 @@ export const defaultSettings: AppSettings = {
   show_floating_bar: true,
   show_live_transcript_in_floating_bar: false,
   correction_learning_mode: "off",
+  correction_learning_multi_diff_enabled: false,
   launch_at_login: false,
   onboarding_completed: false,
   push_to_talk_hotkey: { ctrl: true, alt: false, shift: true, key: "F4" },

@@ -12,7 +12,7 @@ use crate::{
     audio::CapturedAudio,
     context::FocusedWindowTarget,
     corrections::CorrectionSessionSnapshot,
-    selected_learning::PendingSelectedLearning,
+    selected_learning::{PendingSelectedLearning, SelectedLearningReplay},
     selected_voice_edit::{ActiveSelectedVoiceEdit, PendingSelectedVoiceEdit},
     settings::{AppSettings, LanguageMode},
 };
@@ -102,6 +102,7 @@ pub struct AppState {
     pub selected_learning_action: Mutex<()>,
     /// 本文を永続化せず、単一の確認操作だけを最大10分保持する。
     pub pending_selected_learning: Mutex<Option<PendingSelectedLearning>>,
+    pub selected_learning_replays: Mutex<Vec<SelectedLearningReplay>>,
     pub active_selected_voice_edit: Mutex<Option<ActiveSelectedVoiceEdit>>,
     pub pending_selected_voice_edit: Mutex<Option<PendingSelectedVoiceEdit>>,
     /// app_profiles.json のread-modify-writeを直列化する。
@@ -125,6 +126,7 @@ impl Default for AppState {
             corrections_action: Mutex::new(()),
             selected_learning_action: Mutex::new(()),
             pending_selected_learning: Mutex::new(None),
+            selected_learning_replays: Mutex::new(Vec::new()),
             active_selected_voice_edit: Mutex::new(None),
             pending_selected_voice_edit: Mutex::new(None),
             app_profiles_action: Mutex::new(()),

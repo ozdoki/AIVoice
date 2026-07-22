@@ -275,6 +275,7 @@ function App() {
             resultMode={lastResultMode}
             polishPreset={lastPolishPreset}
             correctionLearningMode={settings.correction_learning_mode}
+            correctionLearningMultiDiffEnabled={settings.correction_learning_multi_diff_enabled}
             elapsedMs={recordingStartedAt ? now - recordingStartedAt : 0}
             pushToTalk={settings.push_to_talk_hotkey}
             handsFreeRaw={settings.hands_free_raw_hotkey}
