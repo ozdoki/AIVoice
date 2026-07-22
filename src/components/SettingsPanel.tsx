@@ -166,6 +166,24 @@ function historyDictionaryCandidate(
   );
 }
 
+function correctionArtifactWarning(item: CorrectionRecord): string | null {
+  const originalChars = Array.from(item.original_text).length;
+  const fullTextLike = item.artifacts.some((artifact) => {
+    if (artifact.type !== "replacement") return false;
+    const fromChars = Array.from(artifact.from).length;
+    const sentenceCount = (artifact.from.match(/[。！？]|[.!?](?=\s|$)/gu) ?? []).length;
+    return (
+      artifact.from === item.original_text ||
+      (originalChars > 0 && fromChars / originalChars >= 0.6) ||
+      /\r?\n/.test(artifact.from) ||
+      sentenceCount >= 2
+    );
+  });
+  return fullTextLike
+    ? "全文に近い置換は入力全体へ広く適用されます。必要なら短い部分置換へ分割してください。"
+    : null;
+}
+
 export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
   const apiKeyInputRef = useRef<HTMLInputElement>(null);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
@@ -1429,6 +1447,17 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
             <p className="settings-note">
               オフでは保存済み学習もASR・置換・Polishへ一切適用しません。自動学習はなく、確認画面で選んだ内容だけを保存します。
             </p>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={settings.correction_learning_multi_diff_enabled}
+                onChange={(event) => setSettings((current) => ({
+                  ...current,
+                  correction_learning_multi_diff_enabled: event.target.checked,
+                }))}
+              />
+              <span>複数差分の抽出と既存レコード再編集（段階導入）</span>
+            </label>
             <p className="settings-note">
               Raw・元の出力・修正後はローカルへ平文保存され、暗号化は保証されません。語彙とPolish文体例は外部APIへ送信され得ます。決定的置換は端末内だけで適用します。
             </p>
@@ -1494,6 +1523,9 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                       />
                     ) : (
                       <p>{item.corrected_text}</p>
+                    )}
+                    {correctionArtifactWarning(item) && (
+                      <p className="settings-note" role="status">{correctionArtifactWarning(item)}</p>
                     )}
                     {editingCorrectionId === item.id ? (
                       <div className="correction-artifact-management">

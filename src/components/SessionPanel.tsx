@@ -27,6 +27,22 @@ import {
   correctionPreviewArgs,
   correctionSaveArgs,
 } from "../correctionLearningFlow";
+import {
+  addContextualInsertionDraft,
+  candidateIsSelected,
+  type CorrectionArtifactDraft,
+  addManualDraft,
+  artifactsFromDrafts,
+  draftsFromDefaultArtifacts,
+  draftSelectionCounts,
+  editCandidateDraft,
+  markDraftRevalidation,
+  removeDraft,
+  setDraftsToNone,
+  toggleCandidateDraft,
+  toggleRevalidatedDraftSelection,
+  updateDraft,
+} from "../correctionCandidateState";
 
 interface Props {
   state: RecordingState;
@@ -38,6 +54,7 @@ interface Props {
   resultMode: Mode;
   polishPreset: string;
   correctionLearningMode: CorrectionLearningMode;
+  correctionLearningMultiDiffEnabled: boolean;
   elapsedMs: number;
   pushToTalk: HotkeyBinding;
   handsFreeRaw: HotkeyBinding;
@@ -62,6 +79,7 @@ export function SessionPanel({
   resultMode,
   polishPreset,
   correctionLearningMode,
+  correctionLearningMultiDiffEnabled,
   elapsedMs,
   pushToTalk,
   handsFreeRaw,
@@ -76,7 +94,12 @@ export function SessionPanel({
   const [isEditing, setIsEditing] = useState(false);
   const [editDraft, setEditDraft] = useState("");
   const [correctionPreview, setCorrectionPreview] = useState<CorrectionPreview | null>(null);
-  const [learningArtifacts, setLearningArtifacts] = useState<CorrectionArtifact[]>([]);
+  const [learningDrafts, setLearningDrafts] = useState<CorrectionArtifactDraft[]>([]);
+  const learningArtifacts = artifactsFromDrafts(learningDrafts);
+  const learningDraftCounts = draftSelectionCounts(learningDrafts);
+  const hasUnselectedRevalidationDraft = learningDrafts.some(
+    (draft) => draft.revalidation !== undefined && draft.selected !== true,
+  );
   const [learningBusy, setLearningBusy] = useState(false);
   const [learningNotice, setLearningNotice] = useState<string | null>(null);
   const confirmationRef = useRef<HTMLDivElement>(null);
@@ -98,7 +121,7 @@ export function SessionPanel({
     setIsEditing(false);
     setEditDraft(lastText ?? "");
     setCorrectionPreview(null);
-    setLearningArtifacts([]);
+    setLearningDrafts(setDraftsToNone());
     setLearningNotice(null);
   }, [resultIdentity]);
 
@@ -171,7 +194,7 @@ export function SessionPanel({
     setConfirmedText(transition.confirmedText);
     setIsEditing(false);
     setCorrectionPreview(null);
-    setLearningArtifacts([]);
+    setLearningDrafts(setDraftsToNone());
     setLearningNotice(transition.notice);
   };
 
@@ -184,7 +207,9 @@ export function SessionPanel({
       confirmationReturnFocusRef.current = document.activeElement as HTMLElement | null;
       const preview = await invoke<CorrectionPreview>("preview_correction", args);
       setCorrectionPreview(preview);
-      setLearningArtifacts(preview.default_artifacts);
+      setLearningDrafts(
+        correctionLearningMultiDiffEnabled ? [] : draftsFromDefaultArtifacts(preview),
+      );
     } catch (error) {
       setLearningNotice(String(error));
     } finally {
@@ -197,27 +222,36 @@ export function SessionPanel({
     window.setTimeout(() => confirmationReturnFocusRef.current?.focus(), 0);
   };
 
-  const toggleCandidate = (candidate: CorrectionArtifact) => {
-    setLearningArtifacts((current) => {
-      const key = JSON.stringify(candidate);
-      const exists = current.some((item) => JSON.stringify(item) === key);
-      if (exists) {
-        const next = current.filter((item) => JSON.stringify(item) !== key);
-        return next.length > 0 ? next : [{ type: "none" }];
-      }
-      return [...current.filter((item) => item.type !== "none"), candidate];
-    });
+  const updateLearningArtifact = (id: string, artifact: CorrectionArtifact) => {
+    setLearningDrafts((current) => updateDraft(current, id, artifact));
   };
 
-  const updateLearningArtifact = (index: number, artifact: CorrectionArtifact) => {
-    setLearningArtifacts((current) =>
-      current.map((item, itemIndex) => (itemIndex === index ? artifact : item))
-    );
+  const revalidateLearningDraft = async (draftId: string) => {
+    const draft = learningDrafts.find((item) => item.id === draftId);
+    if (!draft || !historyId || !confirmedText || !isTauri) return;
+    setLearningBusy(true);
+    setLearningNotice(null);
+    try {
+      await invoke("revalidate_correction_artifacts", {
+        historyId,
+        correctedText: confirmedText,
+        artifacts: [
+          ...artifactsFromDrafts(learningDrafts.filter((item) => item.id !== draftId)),
+          draft.artifact,
+        ],
+      });
+      setLearningDrafts((current) => markDraftRevalidation(current, draftId, true));
+    } catch (error) {
+      setLearningDrafts((current) => markDraftRevalidation(current, draftId, false));
+      setLearningNotice(String(error));
+    } finally {
+      setLearningBusy(false);
+    }
   };
 
   const handleSaveLearning = async () => {
     const args = correctionSaveArgs(historyId, confirmedText, learningArtifacts);
-    if (!args || !isTauri || learningArtifactError) return;
+    if (!args || !isTauri || learningArtifactError || hasUnselectedRevalidationDraft) return;
     setLearningBusy(true);
     setLearningNotice(null);
     try {
@@ -372,35 +406,90 @@ export function SessionPanel({
               分類: {correctionPreview.classification} / モード: {resultMode} / プリセット: {polishPreset}
             </small>
             <p>適用する候補（複数選択可）</p>
+            <p>
+              抽出結果：{correctionPreview.total_candidates}件（保存可能：
+              {correctionPreview.candidates.filter((candidate) => candidate.status === "eligible").length}件／要確認：
+              {correctionPreview.candidates.filter((candidate) => candidate.status === "needs_review").length}件／自動学習対象外：
+              {correctionPreview.candidates.filter((candidate) => candidate.status === "unsupported").length}件）
+            </p>
+            <p aria-live="polite">
+              保存対象：{learningDraftCounts.selected}件
+              {learningDraftCounts.pending > 0 && `／再検証待ち：${learningDraftCounts.pending}件`}
+              {learningDraftCounts.invalid > 0 && `／再検証失敗：${learningDraftCounts.invalid}件`}
+            </p>
+            <small>この修正履歴から保存できる学習項目は最大16件です。</small>
             {correctionPreview.candidates.length === 0 ? (
               <small>安全に適用できる候補を判定できないため、既定は「適用なし」です。</small>
             ) : (
               correctionPreview.candidates.map((candidate, index) => (
-                <label key={`${candidate.type}-${index}`} className="checkbox-row">
+                <label key={candidate.id} className="checkbox-row">
                   <input
                     type="checkbox"
-                    checked={learningArtifacts.some(
-                      (item) => JSON.stringify(item) === JSON.stringify(candidate)
-                    )}
-                    onChange={() => toggleCandidate(candidate)}
+                    checked={candidateIsSelected(learningDrafts, candidate)}
+                    disabled={candidate.status !== "eligible"}
+                    onChange={() => setLearningDrafts((current) => toggleCandidateDraft(current, candidate))}
                   />
                   <span>
-                    {candidate.type === "replacement"
-                      ? `置換: ${candidate.from} → ${candidate.to} (${candidate.scope})`
-                      : candidate.type === "vocabulary"
-                        ? `語彙: ${candidate.value} (${candidate.scope})`
-                        : candidate.type === "style_example"
+                    候補{index + 1}：{candidate.artifact.type === "replacement"
+                      ? `置換: ${candidate.artifact.from} → ${candidate.artifact.to} (${candidate.artifact.scope})`
+                      : candidate.artifact.type === "vocabulary"
+                        ? `語彙: ${candidate.artifact.value} (${candidate.artifact.scope})`
+                        : candidate.artifact.type === "style_example"
                           ? "Polish文体例"
-                          : "適用なし"}
+                          : "適用なし"} / {correctionCandidateStatusLabel(candidate)}
+                    {candidate.occurrence_count > 1 && ` (${candidate.occurrence_count}箇所)`}
+                    {candidate.status !== "eligible" && <small>{candidate.reason || "安全確認が必要なため選択できません。"}</small>}
+                    {candidate.warnings.map((warning) => <small key={warning}>{warning}</small>)}
+                    {candidate.status === "needs_review" && (
+                      <button
+                        type="button"
+                        className="copy-button"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          setLearningDrafts((current) => editCandidateDraft(current, candidate));
+                        }}
+                        disabled={learningDrafts.length >= 16}
+                      >
+                        編集して再検証
+                      </button>
+                    )}
+                    {candidate.reason_code === "pure_insertion" && (
+                      <>
+                        <small>元の文章に置換元がないため、そのままでは追加位置を特定できません。</small>
+                        <button
+                          type="button"
+                          className="copy-button"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            setLearningDrafts((current) =>
+                              addContextualInsertionDraft(current, correctionPreview, candidate)
+                            );
+                          }}
+                          disabled={learningDrafts.length >= 16}
+                        >
+                          前後を含む部分置換として追加
+                        </button>
+                      </>
+                    )}
                   </span>
                 </label>
               ))
             )}
+            {(correctionPreview.warnings.length > 0 || correctionPreview.omitted_candidates > 0) && (
+              <div className="dialog-warning" role="status">
+                {correctionPreview.warnings.map((warning) => <small key={warning}>{warning}</small>)}
+                {correctionPreview.omitted_candidates > 0 && (
+                  <small>先頭{correctionPreview.candidates.length}件を表示し、{correctionPreview.omitted_candidates}件を安全のため省略しました。</small>
+                )}
+              </div>
+            )}
             <label className="checkbox-row">
               <input
                 type="radio"
-                checked={learningArtifacts.length === 1 && learningArtifacts[0].type === "none"}
-                onChange={() => setLearningArtifacts([{ type: "none" }])}
+                checked={learningDrafts.length === 0}
+                onChange={() => setLearningDrafts(setDraftsToNone())}
               />
               <span>適用なし（修正例だけ保存）</span>
             </label>
@@ -408,10 +497,9 @@ export function SessionPanel({
               <button
                 className="copy-button"
                 onClick={() =>
-                  setLearningArtifacts((current) => [
-                    ...current.filter((item) => item.type !== "none"),
-                    { type: "vocabulary", value: "", scope: "global" },
-                  ])
+                  setLearningDrafts((current) =>
+                    correctionPreview ? addManualDraft(current, correctionPreview, "vocabulary") : current
+                  )
                 }
               >
                 語彙を追加
@@ -419,41 +507,31 @@ export function SessionPanel({
               <button
                 className="copy-button"
                 onClick={() =>
-                  setLearningArtifacts((current) => [
-                    ...current.filter((item) => item.type !== "none"),
-                    {
-                      type: "replacement",
-                      from: correctionPreview.original_text,
-                      to: correctionPreview.corrected_text,
-                      scope: "global",
-                    },
-                  ])
+                  setLearningDrafts((current) =>
+                    correctionPreview ? addManualDraft(current, correctionPreview, "replacement") : current
+                  )
                 }
               >
-                置換を追加
+                部分置換を追加
               </button>
               {resultMode === "polish" && (
                 <button
                   className="copy-button"
                   onClick={() =>
-                    setLearningArtifacts((current) => [
-                      ...current.filter((item) => item.type !== "none"),
-                      {
-                        type: "style_example",
-                        input: correctionPreview.original_text,
-                        output: correctionPreview.corrected_text,
-                      },
-                    ])
+                    setLearningDrafts((current) =>
+                      correctionPreview ? addManualDraft(current, correctionPreview, "style_example") : current
+                    )
                   }
                 >
                   文体例を追加
                 </button>
               )}
             </div>
-            {learningArtifacts.map((artifact, index) => {
+            {learningDrafts.map((draft) => {
+              const { id, artifact } = draft;
               if (artifact.type === "none") return null;
               return (
-                <div className="correction-artifact-editor" key={`selected-${index}`}>
+                <div className="correction-artifact-editor" key={id}>
                   {artifact.type === "vocabulary" && (
                     <>
                       <input
@@ -461,13 +539,13 @@ export function SessionPanel({
                         maxLength={128}
                         placeholder="学習する語彙"
                         onChange={(event) =>
-                          updateLearningArtifact(index, { ...artifact, value: event.target.value })
+                          updateLearningArtifact(id, { ...artifact, value: event.target.value })
                         }
                       />
                       <select
                         value={artifact.scope}
                         onChange={(event) =>
-                          updateLearningArtifact(index, {
+                          updateLearningArtifact(id, {
                             ...artifact,
                             scope: event.target.value as "global" | "app",
                           })
@@ -485,7 +563,7 @@ export function SessionPanel({
                         maxLength={128}
                         aria-label="置換元"
                         onChange={(event) =>
-                          updateLearningArtifact(index, { ...artifact, from: event.target.value })
+                          updateLearningArtifact(id, { ...artifact, from: event.target.value })
                         }
                       />
                       <span>→</span>
@@ -494,13 +572,13 @@ export function SessionPanel({
                         maxLength={2000}
                         aria-label="置換先"
                         onChange={(event) =>
-                          updateLearningArtifact(index, { ...artifact, to: event.target.value })
+                          updateLearningArtifact(id, { ...artifact, to: event.target.value })
                         }
                       />
                       <select
                         value={artifact.scope}
                         onChange={(event) =>
-                          updateLearningArtifact(index, {
+                          updateLearningArtifact(id, {
                             ...artifact,
                             scope: event.target.value as "global" | "app",
                           })
@@ -518,7 +596,7 @@ export function SessionPanel({
                         maxLength={8000}
                         aria-label="文体例の入力"
                         onChange={(event) =>
-                          updateLearningArtifact(index, { ...artifact, input: event.target.value })
+                          updateLearningArtifact(id, { ...artifact, input: event.target.value })
                         }
                       />
                       <textarea
@@ -526,18 +604,34 @@ export function SessionPanel({
                         maxLength={8000}
                         aria-label="文体例の出力"
                         onChange={(event) =>
-                          updateLearningArtifact(index, { ...artifact, output: event.target.value })
+                          updateLearningArtifact(id, { ...artifact, output: event.target.value })
                         }
                       />
                     </>
                   )}
+                  {draft.revalidation && (
+                    <div>
+                      <button className="copy-button" onClick={() => void revalidateLearningDraft(id)} disabled={learningBusy}>
+                        再検証
+                      </button>
+                      {draft.revalidation === "valid" ? (
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={draft.selected === true}
+                            onChange={() => setLearningDrafts((current) => toggleRevalidatedDraftSelection(current, id))}
+                          />
+                          再検証済み候補を選択
+                        </label>
+                      ) : (
+                        <small>{draft.revalidation === "invalid" ? "再検証に失敗しました。" : "編集後は再検証が必要です。"}</small>
+                      )}
+                    </div>
+                  )}
                   <button
                     className="copy-button"
                     onClick={() =>
-                      setLearningArtifacts((current) => {
-                        const next = current.filter((_, itemIndex) => itemIndex !== index);
-                        return next.length > 0 ? next : [{ type: "none" }];
-                      })
+                      setLearningDrafts((current) => removeDraft(current, id))
                     }
                   >
                     候補を削除
@@ -550,7 +644,7 @@ export function SessionPanel({
             </small>
             {learningArtifactError && <p className="field-error" role="alert">{learningArtifactError}</p>}
             <div className="latest-text-actions">
-              <button className="copy-button" onClick={handleSaveLearning} disabled={learningBusy || Boolean(learningArtifactError)}>
+              <button className="copy-button" onClick={handleSaveLearning} disabled={learningBusy || Boolean(learningArtifactError) || hasUnselectedRevalidationDraft}>
                 確認して保存
               </button>
               <button className="copy-button" onClick={closeCorrectionPreview}>
@@ -579,6 +673,14 @@ export function SessionPanel({
       </div>
     </div>
   );
+}
+
+function correctionCandidateStatusLabel(candidate: CorrectionPreview["candidates"][number]): string {
+  if (candidate.status === "eligible") return "保存可能";
+  if (candidate.status === "needs_review") return "要確認";
+  if (candidate.reason_code === "pure_insertion") return "自動学習対象外（追加のみ）";
+  if (candidate.reason_code === "pure_deletion") return "自動学習対象外（削除のみ）";
+  return "自動学習対象外";
 }
 
 function Shortcut({

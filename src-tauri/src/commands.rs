@@ -12,8 +12,9 @@ use crate::{
     audio,
     context::{self, FocusedAppContext, FocusedWindowTarget},
     corrections::{
-        self, CorrectionArtifact, CorrectionPreview, CorrectionRecord, CorrectionStatus,
-        NewCorrection, UpdateCorrection,
+        self, ComparisonMode, CorrectionArtifact, CorrectionCandidatePersistenceState,
+        CorrectionPreview, CorrectionRecord, CorrectionStatus, NewCorrection, UpdateCorrection,
+        VocabularyCandidateAssociation,
     },
     data_flow,
     hotkey::{self, HotkeySet},
@@ -24,7 +25,10 @@ use crate::{
     mode,
     polish::PolishState,
     recovery::{self, RecoverySessionSummary},
-    selected_learning::{self, PrepareSelectedCorrectionResult, ResolvedPendingSelection},
+    selected_learning::{
+        self, ConfirmedSelectedPreview, PrepareSelectedCorrectionResult, ResolvedPendingSelection,
+        SelectedCorrectionOperation, SelectedLearningReplay,
+    },
     selected_voice_edit::{
         self, ActiveSelectedVoiceEdit, ReplaceDecision, SelectedVoiceEditPreview,
     },
@@ -80,7 +84,8 @@ pub struct SelectedVoiceEditReplaceResult {
 
 #[derive(serde::Serialize)]
 pub struct CreateSelectedCorrectionResult {
-    pub record: CorrectionRecord,
+    pub record_id: String,
+    pub replayed: bool,
     pub focus_warning: Option<String>,
 }
 
@@ -1857,9 +1862,14 @@ pub async fn prepare_selected_correction(
     {
         return Err("選択音声編集が進行中です。先に完了またはキャンセルしてください。".to_string());
     }
-    selected_learning::ensure_learning_enabled(
-        state.settings.lock().await.correction_learning_mode,
-    )?;
+    let correction_settings = {
+        let settings = state.settings.lock().await;
+        (
+            settings.correction_learning_mode,
+            settings.correction_learning_multi_diff_enabled,
+        )
+    };
+    selected_learning::ensure_learning_enabled(correction_settings.0)?;
     let recording_state = state.recording_state.lock().await.clone();
     let has_session = state.session.lock().await.is_some();
     selected_learning::ensure_session_idle(&recording_state, has_session)?;
@@ -1874,8 +1884,13 @@ pub async fn prepare_selected_correction(
         corrections::load(&app).map_err(|error| error.to_string())?
     };
     let now = selected_learning::now_secs();
-    let candidates =
-        selected_learning::select_candidates(&history, &store, &capture.target.process_name, now);
+    let candidates = selected_learning::select_candidates(
+        &history,
+        &store,
+        &capture.target.process_name,
+        now,
+        correction_settings.1,
+    );
     if candidates.is_empty() {
         return Err("直近30分に学習元として使える音声入力履歴がありません。".to_string());
     }
@@ -1896,6 +1911,7 @@ pub async fn prepare_selected_correction(
             now,
             capture.target,
             capture.warning,
+            correction_settings.1,
         )
     };
     if let Err(error) = show_and_focus_main(&app) {
@@ -1912,6 +1928,11 @@ pub async fn preview_selected_correction(
     state: State<'_, AppState>,
     token: String,
     history_id: String,
+    comparison_mode: ComparisonMode,
+    source_start_utf16: Option<usize>,
+    source_end_utf16: Option<usize>,
+    source_display_fingerprint: String,
+    record_id: Option<String>,
 ) -> Result<CorrectionPreview, String> {
     let _selected_guard = state.selected_learning_action.lock().await;
     selected_learning::ensure_learning_enabled(
@@ -1924,18 +1945,137 @@ pub async fn preview_selected_correction(
             &token,
             &history_id,
             selected_learning::now_secs(),
-        )?
+        )
+        .and_then(|resolved| {
+            selected_learning::begin_preview(&mut pending, &token, &history_id)?;
+            Ok(resolved)
+        })?
     };
     let history = local_data::load_history(&app).map_err(|error| error.to_string())?;
     let source = selected_history_entry(&history, &resolved)?;
-    corrections::preview(
-        source.id.clone(),
-        source.final_text.clone(),
-        resolved.selected_text,
-        &source.mode,
-        source.app_process.clone(),
-    )
-    .map_err(|error| error.to_string())
+    if !resolved.multi_diff_enabled
+        && (comparison_mode != ComparisonMode::Full || record_id.is_some())
+    {
+        return Err("複数差分機能が無効なため、従来の全文比較で新規保存してください。".to_string());
+    }
+    if corrections::source_display_fingerprint(&source.final_text) != source_display_fingerprint {
+        return Err("元の出力表示が変更されました。履歴を選び直してください。".to_string());
+    }
+    let mut preview = match comparison_mode {
+        ComparisonMode::Full => {
+            if source_start_utf16.is_some() || source_end_utf16.is_some() {
+                return Err("全文比較では元範囲を指定できません。".to_string());
+            }
+            if resolved.multi_diff_enabled {
+                corrections::preview(
+                    source.id.clone(),
+                    source.final_text.clone(),
+                    resolved.selected_text.clone(),
+                    &source.mode,
+                    source.app_process.clone(),
+                )
+            } else {
+                corrections::preview_legacy(
+                    source.id.clone(),
+                    source.final_text.clone(),
+                    resolved.selected_text.clone(),
+                    &source.mode,
+                    source.app_process.clone(),
+                )
+            }
+        }
+        ComparisonMode::ExplicitRange => {
+            let (Some(start), Some(end)) = (source_start_utf16, source_end_utf16) else {
+                return Err("範囲指定では確認済みの元範囲が必要です。".to_string());
+            };
+            corrections::preview_selected_excerpt(
+                source.id.clone(),
+                source.final_text.clone(),
+                resolved.selected_text.clone(),
+                start,
+                end,
+                &source.mode,
+                source.app_process.clone(),
+            )
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let store = {
+        let _guard = state.corrections_action.lock().await;
+        corrections::load(&app).map_err(|error| error.to_string())?
+    };
+    let records = store
+        .items
+        .iter()
+        .filter(|record| record.source_history_id == source.id)
+        .collect::<Vec<_>>();
+    let target = match (record_id.as_deref(), records.as_slice()) {
+        (Some(id), _) => Some(
+            records
+                .iter()
+                .copied()
+                .find(|record| record.id == id)
+                .ok_or_else(|| "選択した既存修正レコードが見つかりません。".to_string())?,
+        ),
+        (None, []) => None,
+        (None, [record]) => Some(*record),
+        (None, _) => {
+            return Err(
+                "この履歴には複数の既存修正があります。編集対象を選択してください。".to_string(),
+            )
+        }
+    };
+    let source_records_fingerprint = corrections::source_records_fingerprint(&store, &source.id);
+    let target_record_id = target.map(|record| record.id.clone());
+    let record_edit_fingerprint = target.map(|record| corrections::record_edit_fingerprint(record));
+    if let Some(record) = target {
+        preview.persisted_artifacts = record.artifacts.clone();
+        preview.target_record_corrected_text = Some(record.corrected_text.clone());
+        for artifact in &record.artifacts {
+            if let Some(candidate) = preview.candidates.iter_mut().find(|candidate| {
+                candidate.artifact == *artifact
+                    && candidate.status == corrections::CorrectionCandidateStatus::Eligible
+                    && candidate.persistence_state == CorrectionCandidatePersistenceState::New
+            }) {
+                candidate.persistence_state =
+                    CorrectionCandidatePersistenceState::PersistedVerified;
+            } else {
+                preview
+                    .persisted_unverified_artifacts
+                    .push(artifact.clone());
+            }
+        }
+    }
+    corrections::bind_selected_preview_identity(
+        &mut preview,
+        target_record_id.as_deref(),
+        record_edit_fingerprint.as_deref(),
+        &source_records_fingerprint,
+    );
+    preview.idempotency_key = selected_learning::new_idempotency_key();
+    {
+        let mut pending = state.pending_selected_learning.lock().await;
+        selected_learning::confirm_preview(
+            &mut pending,
+            &token,
+            &history_id,
+            ConfirmedSelectedPreview {
+                history_id: history_id.clone(),
+                comparison_mode,
+                source_start_utf16,
+                source_end_utf16,
+                source_display_fingerprint,
+                preview_fingerprint: preview.preview_fingerprint.clone(),
+                idempotency_key: preview.idempotency_key.clone(),
+                target_record_id: preview.target_record_id.clone(),
+                record_edit_fingerprint: preview.record_edit_fingerprint.clone(),
+                source_records_fingerprint: preview.source_records_fingerprint.clone(),
+                persisted_unverified_artifacts: preview.persisted_unverified_artifacts.clone(),
+                persisted_artifacts: preview.persisted_artifacts.clone(),
+            },
+        )?;
+    }
+    Ok(preview)
 }
 
 #[tauri::command]
@@ -1944,9 +2084,42 @@ pub async fn create_selected_correction(
     state: State<'_, AppState>,
     token: String,
     history_id: String,
+    comparison_mode: ComparisonMode,
+    source_start_utf16: Option<usize>,
+    source_end_utf16: Option<usize>,
+    source_display_fingerprint: String,
+    preview_fingerprint: String,
+    idempotency_key: String,
+    record_id: Option<String>,
+    operation: SelectedCorrectionOperation,
     artifacts: Vec<CorrectionArtifact>,
+    vocabulary_associations: Vec<VocabularyCandidateAssociation>,
 ) -> Result<CreateSelectedCorrectionResult, String> {
     let _selected_guard = state.selected_learning_action.lock().await;
+    let request_digest = corrections::create_request_digest(
+        &preview_fingerprint,
+        record_id.as_deref(),
+        operation.as_str(),
+        &artifacts,
+        &vocabulary_associations,
+    );
+    {
+        let mut replay_cache = state.selected_learning_replays.lock().await;
+        if let Some((record_id, focus_warning)) = selected_learning::check_replay(
+            &mut replay_cache,
+            &token,
+            &idempotency_key,
+            &preview_fingerprint,
+            &request_digest,
+            selected_learning::now_secs(),
+        )? {
+            return Ok(CreateSelectedCorrectionResult {
+                record_id,
+                replayed: true,
+                focus_warning,
+            });
+        }
+    }
     selected_learning::ensure_learning_enabled(
         state.settings.lock().await.correction_learning_mode,
     )?;
@@ -1959,55 +2132,234 @@ pub async fn create_selected_correction(
             selected_learning::now_secs(),
         )?
     };
+    let confirmed = {
+        let mut pending = state.pending_selected_learning.lock().await;
+        selected_learning::require_confirmed_preview(
+            &mut pending,
+            &token,
+            &history_id,
+            comparison_mode,
+            source_start_utf16,
+            source_end_utf16,
+            &source_display_fingerprint,
+            &preview_fingerprint,
+            &idempotency_key,
+            record_id.as_deref(),
+        )?
+    };
     let history = local_data::load_history(&app).map_err(|error| error.to_string())?;
     let source = selected_history_entry(&history, &resolved)?;
-    let preview = corrections::preview(
-        source.id.clone(),
-        source.final_text.clone(),
-        resolved.selected_text.clone(),
-        &source.mode,
-        source.app_process.clone(),
-    )
+    if !resolved.multi_diff_enabled
+        && (comparison_mode != ComparisonMode::Full
+            || record_id.is_some()
+            || operation != SelectedCorrectionOperation::Create)
+    {
+        return Err("複数差分機能が無効なため、従来の全文比較で新規保存してください。".to_string());
+    }
+    if corrections::source_display_fingerprint(&source.final_text) != source_display_fingerprint {
+        return Err("元の出力表示が変更されました。再プレビューしてください。".to_string());
+    }
+    let mut preview = match comparison_mode {
+        ComparisonMode::Full => {
+            if resolved.multi_diff_enabled {
+                corrections::preview(
+                    source.id.clone(),
+                    source.final_text.clone(),
+                    resolved.selected_text.clone(),
+                    &source.mode,
+                    source.app_process.clone(),
+                )
+            } else {
+                corrections::preview_legacy(
+                    source.id.clone(),
+                    source.final_text.clone(),
+                    resolved.selected_text.clone(),
+                    &source.mode,
+                    source.app_process.clone(),
+                )
+            }
+        }
+        ComparisonMode::ExplicitRange => {
+            let (Some(start), Some(end)) = (source_start_utf16, source_end_utf16) else {
+                return Err("範囲指定では確認済みの元範囲が必要です。".to_string());
+            };
+            corrections::preview_selected_excerpt(
+                source.id.clone(),
+                source.final_text.clone(),
+                resolved.selected_text.clone(),
+                start,
+                end,
+                &source.mode,
+                source.app_process.clone(),
+            )
+        }
+    }
     .map_err(|error| error.to_string())?;
+    corrections::bind_selected_preview_identity(
+        &mut preview,
+        confirmed.target_record_id.as_deref(),
+        confirmed.record_edit_fingerprint.as_deref(),
+        &confirmed.source_records_fingerprint,
+    );
+    if preview.preview_fingerprint != preview_fingerprint {
+        return Err("プレビュー内容が古くなりました。もう一度プレビューしてください。".to_string());
+    }
+    if resolved.multi_diff_enabled
+        && !matches!(
+            operation,
+            SelectedCorrectionOperation::Delete | SelectedCorrectionOperation::None
+        )
+    {
+        let artifacts_to_validate_with_indexes =
+            corrections::changed_artifacts_with_indexes(&confirmed.persisted_artifacts, &artifacts);
+        let artifacts_to_validate = artifacts_to_validate_with_indexes
+            .iter()
+            .map(|(_, artifact)| artifact.clone())
+            .collect::<Vec<_>>();
+        if !artifacts_to_validate.is_empty() {
+            if vocabulary_associations.is_empty() {
+                corrections::validate_selected_preview_artifacts(&preview, &artifacts_to_validate)
+            } else {
+                let mapped_associations = vocabulary_associations
+                    .iter()
+                    .map(|association| {
+                        let artifact_index = artifacts_to_validate_with_indexes
+                            .iter()
+                            .position(|(original_index, _)| {
+                                *original_index == association.artifact_index
+                            })
+                            .ok_or_else(|| {
+                                "保持中の旧artifactへ語彙対応を付け直すことはできません。"
+                                    .to_string()
+                            })?;
+                        Ok(VocabularyCandidateAssociation {
+                            artifact_index,
+                            candidate_id: association.candidate_id.clone(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                corrections::validate_selected_preview_artifacts_with_associations(
+                    &preview,
+                    &artifacts_to_validate,
+                    &mapped_associations,
+                )
+            }
+            .map_err(|error| error.to_string())?;
+        } else if artifacts.is_empty() {
+            return Err("保存する候補を1件以上選択してください。".to_string());
+        }
+    }
     let configured_api_key = state.settings.lock().await.api_key.clone();
     corrections::reject_configured_api_key(
         &configured_api_key,
         &source.raw_text,
         &source.final_text,
-        &resolved.selected_text,
+        &preview.corrected_text,
         &source.polish_preset,
         &source.app_process,
         &artifacts,
     )
     .map_err(|error| error.to_string())?;
 
-    let record = {
+    let record_id = {
         let _guard = state.corrections_action.lock().await;
         let mut store = corrections::load(&app).map_err(|error| error.to_string())?;
-        if store
-            .items
-            .iter()
-            .any(|item| item.source_history_id == source.id)
+        if corrections::source_records_fingerprint(&store, &source.id)
+            != confirmed.source_records_fingerprint
         {
-            return Err("この履歴はすでに修正学習へ使用されています。".to_string());
+            return Err(
+                "修正学習データが別画面で変更されました。再読み込みしてください。".to_string(),
+            );
         }
-        let record = corrections::insert(
-            &mut store,
-            NewCorrection {
-                source_history_id: source.id.clone(),
-                raw_text: source.raw_text.clone(),
-                original_text: source.final_text.clone(),
-                corrected_text: resolved.selected_text,
-                mode: source.mode.clone(),
-                polish_preset: source.polish_preset.clone(),
-                app_process: source.app_process.clone(),
-                classification: preview.classification,
-                artifacts,
-            },
-        )
-        .map_err(|error| error.to_string())?;
+        let result_id = match operation {
+            SelectedCorrectionOperation::Create => {
+                if confirmed.target_record_id.is_some()
+                    || store
+                        .items
+                        .iter()
+                        .any(|record| record.source_history_id == source.id)
+                {
+                    return Err(
+                        "この履歴には既存の修正があります。再編集としてプレビューしてください。"
+                            .to_string(),
+                    );
+                }
+                corrections::insert(
+                    &mut store,
+                    NewCorrection {
+                        source_history_id: source.id.clone(),
+                        raw_text: source.raw_text.clone(),
+                        original_text: source.final_text.clone(),
+                        corrected_text: preview.corrected_text.clone(),
+                        mode: source.mode.clone(),
+                        polish_preset: source.polish_preset.clone(),
+                        app_process: source.app_process.clone(),
+                        classification: preview.classification,
+                        artifacts,
+                    },
+                )
+                .map_err(|error| error.to_string())?
+                .id
+            }
+            SelectedCorrectionOperation::Update | SelectedCorrectionOperation::None => {
+                let target_id = confirmed
+                    .target_record_id
+                    .as_deref()
+                    .ok_or_else(|| "更新対象の修正レコードがありません。".to_string())?;
+                let current = store
+                    .items
+                    .iter()
+                    .find(|record| record.id == target_id)
+                    .ok_or_else(|| "更新対象の修正レコードが見つかりません。".to_string())?;
+                if Some(corrections::record_edit_fingerprint(current))
+                    != confirmed.record_edit_fingerprint
+                {
+                    return Err(
+                        "修正レコードが別画面で更新されました。再読み込みしてください。"
+                            .to_string(),
+                    );
+                }
+                let next_artifacts = if operation == SelectedCorrectionOperation::None {
+                    vec![CorrectionArtifact::None]
+                } else {
+                    artifacts
+                };
+                corrections::update(
+                    &mut store,
+                    target_id,
+                    UpdateCorrection {
+                        corrected_text: preview.corrected_text.clone(),
+                        classification: preview.classification,
+                        artifacts: next_artifacts,
+                    },
+                )
+                .map_err(|error| error.to_string())?
+                .id
+            }
+            SelectedCorrectionOperation::Delete => {
+                let target_id = confirmed
+                    .target_record_id
+                    .as_deref()
+                    .ok_or_else(|| "削除対象の修正レコードがありません。".to_string())?;
+                let current = store
+                    .items
+                    .iter()
+                    .find(|record| record.id == target_id)
+                    .ok_or_else(|| "削除対象の修正レコードが見つかりません。".to_string())?;
+                if Some(corrections::record_edit_fingerprint(current))
+                    != confirmed.record_edit_fingerprint
+                {
+                    return Err(
+                        "修正レコードが別画面で更新されました。再読み込みしてください。"
+                            .to_string(),
+                    );
+                }
+                corrections::delete(&mut store, target_id).map_err(|error| error.to_string())?;
+                target_id.to_string()
+            }
+        };
         corrections::save(&app, &store).map_err(|error| error.to_string())?;
-        record
+        result_id
     };
     let target = {
         let mut pending = state.pending_selected_learning.lock().await;
@@ -2018,10 +2370,177 @@ pub async fn create_selected_correction(
         .unwrap_or_else(|| {
             Some("修正内容は保存しましたが、元の入力先情報が失われました。".to_string())
         });
+    state
+        .selected_learning_replays
+        .lock()
+        .await
+        .push(SelectedLearningReplay {
+            token,
+            idempotency_key,
+            preview_fingerprint,
+            create_request_digest: request_digest,
+            record_id: record_id.clone(),
+            focus_warning: focus_warning.clone(),
+            created_at: selected_learning::now_secs(),
+        });
     Ok(CreateSelectedCorrectionResult {
-        record,
+        record_id,
+        replayed: false,
         focus_warning,
     })
+}
+
+#[tauri::command]
+pub async fn revalidate_selected_correction_artifacts(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+    history_id: String,
+    comparison_mode: ComparisonMode,
+    source_start_utf16: Option<usize>,
+    source_end_utf16: Option<usize>,
+    source_display_fingerprint: String,
+    preview_fingerprint: String,
+    idempotency_key: String,
+    record_id: Option<String>,
+    artifacts: Vec<CorrectionArtifact>,
+    vocabulary_associations: Vec<VocabularyCandidateAssociation>,
+) -> Result<(), String> {
+    let _selected_guard = state.selected_learning_action.lock().await;
+    let resolved = {
+        let mut pending = state.pending_selected_learning.lock().await;
+        selected_learning::resolve_pending(
+            &mut pending,
+            &token,
+            &history_id,
+            selected_learning::now_secs(),
+        )?
+    };
+    let confirmed = {
+        let mut pending = state.pending_selected_learning.lock().await;
+        selected_learning::require_confirmed_preview(
+            &mut pending,
+            &token,
+            &history_id,
+            comparison_mode,
+            source_start_utf16,
+            source_end_utf16,
+            &source_display_fingerprint,
+            &preview_fingerprint,
+            &idempotency_key,
+            record_id.as_deref(),
+        )?
+    };
+    let history = local_data::load_history(&app).map_err(|error| error.to_string())?;
+    let source = selected_history_entry(&history, &resolved)?;
+    let mut preview = match comparison_mode {
+        ComparisonMode::Full => {
+            if resolved.multi_diff_enabled {
+                corrections::preview(
+                    source.id.clone(),
+                    source.final_text.clone(),
+                    resolved.selected_text.clone(),
+                    &source.mode,
+                    source.app_process.clone(),
+                )
+            } else {
+                corrections::preview_legacy(
+                    source.id.clone(),
+                    source.final_text.clone(),
+                    resolved.selected_text.clone(),
+                    &source.mode,
+                    source.app_process.clone(),
+                )
+            }
+        }
+        ComparisonMode::ExplicitRange => {
+            let (Some(start), Some(end)) = (source_start_utf16, source_end_utf16) else {
+                return Err("範囲指定では確認済みの元範囲が必要です。".to_string());
+            };
+            corrections::preview_selected_excerpt(
+                source.id.clone(),
+                source.final_text.clone(),
+                resolved.selected_text.clone(),
+                start,
+                end,
+                &source.mode,
+                source.app_process.clone(),
+            )
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    corrections::bind_selected_preview_identity(
+        &mut preview,
+        confirmed.target_record_id.as_deref(),
+        confirmed.record_edit_fingerprint.as_deref(),
+        &confirmed.source_records_fingerprint,
+    );
+    if preview.preview_fingerprint != preview_fingerprint {
+        return Err("プレビュー内容が古くなりました。もう一度プレビューしてください。".to_string());
+    }
+    let store = {
+        let _guard = state.corrections_action.lock().await;
+        let store = corrections::load(&app).map_err(|error| error.to_string())?;
+        corrections::validate_confirmed_store_state(
+            &store,
+            &source.id,
+            &confirmed.source_records_fingerprint,
+            confirmed.target_record_id.as_deref(),
+            confirmed.record_edit_fingerprint.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+        store
+    };
+    let artifacts_to_validate_with_indexes =
+        corrections::changed_artifacts_with_indexes(&confirmed.persisted_artifacts, &artifacts);
+    let artifacts_to_validate = artifacts_to_validate_with_indexes
+        .iter()
+        .map(|(_, artifact)| artifact.clone())
+        .collect::<Vec<_>>();
+    let changed_artifact_indexes = artifacts_to_validate_with_indexes
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<std::collections::HashSet<_>>();
+    let retained_artifacts = artifacts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, artifact)| {
+            (!changed_artifact_indexes.contains(&index)).then_some(artifact.clone())
+        })
+        .collect::<Vec<_>>();
+    let mapped_associations = vocabulary_associations
+        .iter()
+        .map(|association| {
+            let artifact_index = artifacts_to_validate_with_indexes
+                .iter()
+                .position(|(original_index, _)| *original_index == association.artifact_index)
+                .ok_or_else(|| {
+                    "保持中の旧artifactへ語彙対応を付け直すことはできません。".to_string()
+                })?;
+            Ok(VocabularyCandidateAssociation {
+                artifact_index,
+                candidate_id: association.candidate_id.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if resolved.multi_diff_enabled {
+        corrections::validate_selected_preview_artifacts_with_associations(
+            &preview,
+            &artifacts_to_validate,
+            &mapped_associations,
+        )
+    } else {
+        corrections::validate_preview_artifacts(&preview, &artifacts_to_validate)
+    }
+    .map_err(|error| error.to_string())?;
+    corrections::validate_changed_artifact_replacement_conflicts(
+        &store,
+        &artifacts_to_validate,
+        &retained_artifacts,
+        &source.app_process,
+        confirmed.target_record_id.as_deref(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2138,17 +2657,79 @@ pub async fn preview_correction(
     history_id: String,
     corrected_text: String,
 ) -> Result<CorrectionPreview, String> {
-    if state.settings.lock().await.correction_learning_mode == CorrectionLearningMode::Off {
+    let settings = state.settings.lock().await.clone();
+    if settings.correction_learning_mode == CorrectionLearningMode::Off {
         return Err("修正学習はオフです。設定で「保存前に確認」を選択してください。".to_string());
     }
     let history = local_data::load_history(&app).map_err(|error| error.to_string())?;
     let source = correction_history_entry(&history, &history_id)?;
-    corrections::preview(
-        history_id,
-        source.final_text.clone(),
-        corrected_text,
-        &source.mode,
-        source.app_process.clone(),
+    let preview = if settings.correction_learning_multi_diff_enabled {
+        corrections::preview(
+            history_id,
+            source.final_text.clone(),
+            corrected_text,
+            &source.mode,
+            source.app_process.clone(),
+        )
+    } else {
+        corrections::preview_legacy(
+            history_id,
+            source.final_text.clone(),
+            corrected_text,
+            &source.mode,
+            source.app_process.clone(),
+        )
+    };
+    preview.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn revalidate_correction_artifacts(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    history_id: String,
+    corrected_text: String,
+    artifacts: Vec<CorrectionArtifact>,
+) -> Result<(), String> {
+    let settings = state.settings.lock().await.clone();
+    if settings.correction_learning_mode == CorrectionLearningMode::Off {
+        return Err("修正学習はオフです。".to_string());
+    }
+    let history = local_data::load_history(&app).map_err(|error| error.to_string())?;
+    let source = correction_history_entry(&history, &history_id)?;
+    let preview = if settings.correction_learning_multi_diff_enabled {
+        corrections::preview(
+            history_id,
+            source.final_text.clone(),
+            corrected_text,
+            &source.mode,
+            source.app_process.clone(),
+        )
+    } else {
+        corrections::preview_legacy(
+            history_id,
+            source.final_text.clone(),
+            corrected_text,
+            &source.mode,
+            source.app_process.clone(),
+        )
+    }
+    .map_err(|error| error.to_string())?;
+    if settings.correction_learning_multi_diff_enabled {
+        corrections::validate_multi_diff_preview_artifacts(&preview, &artifacts)
+            .map_err(|error| error.to_string())?;
+    } else {
+        corrections::validate_preview_artifacts(&preview, &artifacts)
+            .map_err(|error| error.to_string())?;
+    }
+    let _guard = state.corrections_action.lock().await;
+    let store = corrections::load(&app).map_err(|error| error.to_string())?;
+    corrections::validate_changed_artifact_replacement_conflicts(
+        &store,
+        &artifacts,
+        &[],
+        &source.app_process,
+        None,
     )
     .map_err(|error| error.to_string())
 }
@@ -2172,20 +2753,35 @@ pub async fn create_correction(
     corrected_text: String,
     artifacts: Vec<CorrectionArtifact>,
 ) -> Result<CorrectionRecord, String> {
-    if state.settings.lock().await.correction_learning_mode == CorrectionLearningMode::Off {
+    let settings = state.settings.lock().await.clone();
+    if settings.correction_learning_mode == CorrectionLearningMode::Off {
         return Err("修正学習はオフです。設定で「保存前に確認」を選択してください。".to_string());
     }
     let history = local_data::load_history(&app).map_err(|error| error.to_string())?;
     let source = correction_history_entry(&history, &history_id)?;
-    let preview = corrections::preview(
-        history_id.clone(),
-        source.final_text.clone(),
-        corrected_text.clone(),
-        &source.mode,
-        source.app_process.clone(),
-    )
+    let preview = if settings.correction_learning_multi_diff_enabled {
+        corrections::preview(
+            history_id.clone(),
+            source.final_text.clone(),
+            corrected_text.clone(),
+            &source.mode,
+            source.app_process.clone(),
+        )
+    } else {
+        corrections::preview_legacy(
+            history_id.clone(),
+            source.final_text.clone(),
+            corrected_text.clone(),
+            &source.mode,
+            source.app_process.clone(),
+        )
+    }
     .map_err(|error| error.to_string())?;
-    let configured_api_key = state.settings.lock().await.api_key.clone();
+    if settings.correction_learning_multi_diff_enabled {
+        corrections::validate_multi_diff_preview_artifacts(&preview, &artifacts)
+            .map_err(|error| error.to_string())?;
+    }
+    let configured_api_key = settings.api_key;
     corrections::reject_configured_api_key(
         &configured_api_key,
         &source.raw_text,
