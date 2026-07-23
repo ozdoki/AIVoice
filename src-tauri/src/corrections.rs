@@ -545,6 +545,7 @@ struct ExpandedDiffSpan {
     pure_insertion: bool,
     pure_deletion: bool,
     safe_context: bool,
+    covers_all_matching_occurrences: bool,
     merged: bool,
 }
 
@@ -1264,21 +1265,63 @@ fn append_diff_candidates(
                 .cmp(&left.source_end.saturating_sub(left.source_start))
         })
     });
+    let raw_spans = spans
+        .into_iter()
+        .map(|span| trim_unchanged_span_edges(&span, source_graphemes, corrected_graphemes))
+        .collect::<Vec<_>>();
+    let mut raw_replacement_counts = HashMap::<(String, String), usize>::new();
+    for span in &raw_spans {
+        if span.source_start == span.source_end || span.corrected_start == span.corrected_end {
+            continue;
+        }
+        let from = source_graphemes[span.source_start..span.source_end].concat();
+        let to = corrected_graphemes[span.corrected_start..span.corrected_end].concat();
+        *raw_replacement_counts.entry((from, to)).or_default() += 1;
+    }
+    let repeated_consistent_replacements = raw_replacement_counts
+        .into_iter()
+        .filter_map(|((from, to), changed_count)| {
+            (changed_count > 1
+                && !overly_general_replacement_from(&from)
+                && occurrence_count(normalized_source, &from) == changed_count)
+                .then_some((from, to))
+        })
+        .collect::<HashSet<_>>();
+    let mut emitted_repeated_replacements = HashSet::new();
     let mut expanded_spans = Vec::<ExpandedDiffSpan>::new();
-    for raw_span in spans {
-        let raw_span = trim_unchanged_span_edges(&raw_span, source_graphemes, corrected_graphemes);
+    for raw_span in raw_spans {
         let pure_insertion = raw_span.source_start == raw_span.source_end;
         let pure_deletion = raw_span.corrected_start == raw_span.corrected_end;
-        let (span, safe_context) = if pure_insertion || pure_deletion {
-            (raw_span, false)
-        } else {
-            expand_replacement_span(
-                &raw_span,
-                source_graphemes,
-                corrected_graphemes,
-                normalized_source,
+        let raw_replacement = (!pure_insertion && !pure_deletion).then(|| {
+            (
+                source_graphemes[raw_span.source_start..raw_span.source_end].concat(),
+                corrected_graphemes[raw_span.corrected_start..raw_span.corrected_end].concat(),
             )
-        };
+        });
+        let covers_all_matching_occurrences = raw_replacement
+            .as_ref()
+            .is_some_and(|replacement| repeated_consistent_replacements.contains(replacement));
+        if covers_all_matching_occurrences
+            && !emitted_repeated_replacements.insert(
+                raw_replacement
+                    .as_ref()
+                    .expect("repeated replacement must exist")
+                    .clone(),
+            )
+        {
+            continue;
+        }
+        let (span, safe_context) =
+            if pure_insertion || pure_deletion || covers_all_matching_occurrences {
+                (raw_span, covers_all_matching_occurrences)
+            } else {
+                expand_replacement_span(
+                    &raw_span,
+                    source_graphemes,
+                    corrected_graphemes,
+                    normalized_source,
+                )
+            };
         if let Some(previous) = expanded_spans.last_mut() {
             let touches_source = span.source_start <= previous.span.source_end;
             let touches_corrected = span.corrected_start <= previous.span.corrected_end;
@@ -1292,6 +1335,8 @@ fn append_diff_candidates(
                 previous.pure_deletion =
                     previous.span.corrected_start == previous.span.corrected_end;
                 previous.safe_context = previous.safe_context || safe_context;
+                previous.covers_all_matching_occurrences =
+                    previous.covers_all_matching_occurrences || covers_all_matching_occurrences;
                 previous.merged = true;
                 continue;
             }
@@ -1301,6 +1346,7 @@ fn append_diff_candidates(
             pure_insertion,
             pure_deletion,
             safe_context,
+            covers_all_matching_occurrences,
             merged: false,
         });
     }
@@ -1323,6 +1369,7 @@ fn append_diff_candidates(
         let pure_insertion = expanded.pure_insertion;
         let pure_deletion = expanded.pure_deletion;
         let safe_context = expanded.safe_context;
+        let covers_all_matching_occurrences = expanded.covers_all_matching_occurrences;
         let merged = expanded.merged;
         let contains_unchanged_bridge = span.source_end - span.source_start
             == span.corrected_end - span.corrected_start
@@ -1382,7 +1429,7 @@ fn append_diff_candidates(
                 CorrectionCandidateReasonCode::MeaningChangeSuspected,
                 "変更範囲が大きいため、内容を確認して局所置換へ編集してください。",
             )
-        } else if !safe_context
+        } else if (!safe_context && !covers_all_matching_occurrences)
             || overly_general_replacement_from(&from)
             || char_count(&from) > MAX_REPLACEMENT_FROM_CHARS
             || char_count(&to) > MAX_REPLACEMENT_TO_CHARS
@@ -2057,15 +2104,24 @@ fn selected_replacement_candidates(
         if matches.is_empty() {
             let source_text = normalize_comparison_text(&preview.original_text).display;
             let corrected_text = normalize_comparison_text(&preview.corrected_text).display;
+            let source_occurrences = occurrence_count(&source_text, from);
+            let corrected_occurrences = occurrence_count(&corrected_text, to);
+            let replacement_pair = ReplacementPair {
+                from: from.clone(),
+                to: to.clone(),
+                app_specific: false,
+            };
+            let repeated_full_correspondence = source_occurrences > 1
+                && apply_replacement_pairs(&source_text, &[replacement_pair]) == corrected_text;
             if overly_general_replacement_from(from)
-                || occurrence_count(&source_text, from) != 1
-                || occurrence_count(&corrected_text, to) != 1
+                || (!repeated_full_correspondence
+                    && (source_occurrences != 1 || corrected_occurrences != 1))
             {
                 anyhow::bail!("手動置換は元・修正後全文へ一意に対応する安全な文脈が必要です。");
             }
-            let source_range = unique_grapheme_range(&source_text, from)
+            let source_range = first_grapheme_range(&source_text, from)
                 .ok_or_else(|| anyhow::anyhow!("手動置換の元範囲を対応付けできません。"))?;
-            let corrected_range = unique_grapheme_range(&corrected_text, to)
+            let corrected_range = first_grapheme_range(&corrected_text, to)
                 .ok_or_else(|| anyhow::anyhow!("手動置換の修正後範囲を対応付けできません。"))?;
             let source_graphemes = graphemes(&source_text);
             let (context_before, context_after) =
@@ -2075,7 +2131,7 @@ fn selected_replacement_candidates(
                 artifact: artifact.clone(),
                 source_range,
                 corrected_range,
-                occurrence_count: 1,
+                occurrence_count: source_occurrences,
                 context_before,
                 context_after,
                 status: CorrectionCandidateStatus::Eligible,
@@ -2103,11 +2159,17 @@ fn selected_replacement_candidates(
     Ok(selected)
 }
 
-fn unique_grapheme_range(text: &str, needle: &str) -> Option<CorrectionTextRange> {
-    let mut matches = text.match_indices(needle);
-    let (start_byte, _) = matches.next()?;
-    if matches.next().is_some()
-        || !is_grapheme_boundary(text, start_byte)
+fn first_grapheme_range(text: &str, needle: &str) -> Option<CorrectionTextRange> {
+    let (start_byte, _) = text.match_indices(needle).next()?;
+    grapheme_range_for_match(text, needle, start_byte)
+}
+
+fn grapheme_range_for_match(
+    text: &str,
+    needle: &str,
+    start_byte: usize,
+) -> Option<CorrectionTextRange> {
+    if !is_grapheme_boundary(text, start_byte)
         || !is_grapheme_boundary(text, start_byte + needle.len())
     {
         return None;
@@ -2132,6 +2194,7 @@ fn expected_partial_text_for_candidates(
     let mut expected = String::new();
     let mut source_cursor = 0_usize;
     let mut pairs = Vec::new();
+    let mut has_repeated_candidate = false;
     for candidate in &ordered {
         if candidate.source_range.start < source_cursor
             || candidate.source_range.end > source.len()
@@ -2146,13 +2209,14 @@ fn expected_partial_text_for_candidates(
         if source[candidate.source_range.start..candidate.source_range.end].concat() != *from
             || corrected[candidate.corrected_range.start..candidate.corrected_range.end].concat()
                 != *to
-            || occurrence_count(&source_text, from) != 1
+            || occurrence_count(&source_text, from) != candidate.occurrence_count
         {
             anyhow::bail!("置換候補の範囲と内容が一致しません。再プレビューしてください。");
         }
         expected.push_str(&source[source_cursor..candidate.source_range.start].concat());
         expected.push_str(to);
         source_cursor = candidate.source_range.end;
+        has_repeated_candidate |= candidate.occurrence_count > 1;
         pairs.push(ReplacementPair {
             from: from.clone(),
             to: to.clone(),
@@ -2160,7 +2224,12 @@ fn expected_partial_text_for_candidates(
         });
     }
     expected.push_str(&source[source_cursor..].concat());
-    if apply_replacement_pairs(&source_text, &pairs) != expected {
+    let applied = apply_replacement_pairs(&source_text, &pairs);
+    if has_repeated_candidate {
+        // A consolidated repeated candidate intentionally represents every
+        // matching raw diff with one representative range.
+        expected = applied.clone();
+    } else if applied != expected {
         anyhow::bail!("選択候補は実際の置換優先順位では安全に部分適用できません。");
     }
     for index in 0..pairs.len() {
@@ -3537,6 +3606,90 @@ mod tests {
             scope: LearningScope::Global,
         };
         assert!(validate_selected_preview_artifacts(&result, &[invalid]).is_err());
+    }
+
+    #[test]
+    fn repeated_consistent_replacement_becomes_one_generic_candidate() {
+        let original = "扱えるジェミニ。かつ、ジェミニも使える。そこで、ジェミニ3.1へ切り替える。";
+        let corrected = "扱えるGemini。かつ、Geminiも使える。そこで、Gemini3.1へ切り替える。";
+        let result = preview(
+            "repeated-consistent".into(),
+            original.into(),
+            corrected.into(),
+            &Mode::Raw,
+            "notepad.exe".into(),
+        )
+        .unwrap();
+
+        assert_eq!(result.candidates.len(), 1);
+        let candidate = &result.candidates[0];
+        assert_eq!(
+            candidate.artifact,
+            CorrectionArtifact::Replacement {
+                from: "ジェミニ".into(),
+                to: "Gemini".into(),
+                scope: LearningScope::App,
+            }
+        );
+        assert_eq!(candidate.occurrence_count, 3);
+        assert_eq!(candidate.status, CorrectionCandidateStatus::Eligible);
+        assert_eq!(
+            expected_partial_text(&result, &[candidate.artifact.clone()]).unwrap(),
+            result.corrected_text
+        );
+        assert!(
+            validate_multi_diff_preview_artifacts(&result, &[candidate.artifact.clone()]).is_ok()
+        );
+        assert!(
+            validate_selected_preview_artifacts(&result, &[candidate.artifact.clone()]).is_ok()
+        );
+
+        let mut manual_preview = result.clone();
+        manual_preview.candidates.clear();
+        assert!(validate_selected_preview_artifacts(
+            &manual_preview,
+            &[candidate.artifact.clone()]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn repeated_source_is_not_generic_when_only_one_occurrence_changes() {
+        let result = preview(
+            "repeated-partial".into(),
+            "ジェミニを使う。次もジェミニを使う。".into(),
+            "Geminiを使う。次もジェミニを使う。".into(),
+            &Mode::Raw,
+            String::new(),
+        )
+        .unwrap();
+
+        assert!(result.candidates.iter().all(|candidate| {
+            !matches!(
+                &candidate.artifact,
+                CorrectionArtifact::Replacement { from, to, .. }
+                    if from == "ジェミニ" && to == "Gemini"
+            )
+        }));
+    }
+
+    #[test]
+    fn repeated_source_is_not_generic_with_conflicting_destinations() {
+        let result = preview(
+            "repeated-conflict".into(),
+            "ジェミニを使う。次もジェミニを使う。".into(),
+            "Geminiを使う。次もGEMINIを使う。".into(),
+            &Mode::Raw,
+            String::new(),
+        )
+        .unwrap();
+
+        assert!(result.candidates.iter().all(|candidate| {
+            !matches!(
+                &candidate.artifact,
+                CorrectionArtifact::Replacement { from, .. } if from == "ジェミニ"
+            )
+        }));
     }
 
     #[test]
