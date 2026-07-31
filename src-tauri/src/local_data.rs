@@ -143,8 +143,9 @@ fn estimate_tokens(text: &str) -> f64 {
 fn asr_price_per_minute(model: &str) -> f64 {
     let model = model.to_ascii_lowercase();
     match model.as_str() {
-        // OpenAI API pricing checked 2026-06-24.
+        // OpenAI API pricing checked 2026-07-31.
         "gpt-4o-mini-transcribe" => 0.003,
+        "gpt-transcribe" => 0.0045,
         "gpt-4o-transcribe" | "whisper-1" => 0.006,
         "gpt-realtime-whisper" => 0.017,
         _ => 0.006,
@@ -644,6 +645,8 @@ mod tests {
     fn cost_estimates_use_model_specific_rates() {
         let asr = estimate_asr_cost(60_000, "gpt-4o-mini-transcribe");
         assert!((asr - 0.003).abs() < f64::EPSILON);
+        let gpt_transcribe = estimate_asr_cost(60_000, "gpt-transcribe");
+        assert!((gpt_transcribe - 0.0045).abs() < f64::EPSILON);
 
         let polish =
             estimate_polish_cost("hello world", "Hello world.", &Mode::Polish, "gpt-5.4-mini");

@@ -240,18 +240,15 @@ mod tests {
         let raw = summarize(&settings, &Mode::Raw, true);
         assert!(raw.polish.is_none());
         assert_eq!(raw.asr.processing, "Batch");
-        assert_eq!(raw.asr.model, "gpt-4o-mini-transcribe");
+        assert_eq!(raw.asr.model, "gpt-transcribe");
         assert!(raw.asr.sent_data.iter().any(|item| item.contains("辞書")));
         assert!(raw.asr.sent_data.iter().any(|item| item.contains("前面")));
         assert_eq!(raw.language, "英語（en）");
 
         let polish = summarize(&settings, &Mode::Polish, false);
         assert!(polish.polish.is_some());
-        assert!(polish.asr.processing.starts_with("Realtime"));
-        assert_eq!(
-            polish.asr.fallback_model.as_deref(),
-            Some("gpt-4o-mini-transcribe")
-        );
+        assert_eq!(polish.asr.processing, "Batch");
+        assert!(polish.asr.fallback_model.is_none());
         assert!(!polish.correction_learning_enabled);
     }
 
@@ -279,6 +276,7 @@ mod tests {
         let settings = AppSettings {
             api_base_url: "https://compatible.example/v1".to_string(),
             api_key: "test".to_string(),
+            api_model: "gpt-realtime-whisper".to_string(),
             language_mode: LanguageMode::Ja,
             ..AppSettings::default()
         };

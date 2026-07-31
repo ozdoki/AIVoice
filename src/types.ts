@@ -386,7 +386,7 @@ export interface SelectedVoiceEditReplaceResult {
 export const defaultSettings: AppSettings = {
   api_base_url: "https://api.openai.com/v1",
   api_key: "",
-  api_model: "gpt-realtime-whisper",
+  api_model: "gpt-transcribe",
   language_mode: "auto",
   polish_model: "gpt-4o-mini",
   mode: "raw",

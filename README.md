@@ -29,7 +29,7 @@ KoeType は、個人が安全に BYOK で使える音声入力アプリの実装
   - WASAPI 録音
   - 録音レベル表示
 - OpenAI 互換 ASR
-  - `gpt-realtime-whisper` を基本設定
+  - `gpt-transcribe` を基本設定
   - Realtime final が取れない場合の batch ASR フォールバック
   - 言語ヒントを Auto・日本語・英語から選択（Auto は言語指定を送信しない）
 - Polish

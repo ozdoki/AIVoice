@@ -270,7 +270,8 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
             baseUrl: source.api_base_url,
             apiKey: apiKeyOverride,
           })
-        : [
+          : [
+            "gpt-transcribe",
             "gpt-realtime-whisper",
             "gpt-4o-mini-transcribe",
             "gpt-4o-transcribe",
@@ -2470,7 +2471,7 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
               )}
             </div>
             <p className="settings-note">
-              料金はローカル推定です。OpenAI公式価格を2026-06-24時点で確認し、ASRは分単価、Polishは推定トークン数で概算しています。実際の請求額はプロバイダ、モデル、トークン化、割引、リージョン設定に依存します。
+              料金はローカル推定です。OpenAI公式価格を2026-07-31時点で確認し、ASRは分単価、Polishは推定トークン数で概算しています。実際の請求額はプロバイダ、モデル、トークン化、割引、リージョン設定に依存します。
             </p>
           </SettingsSection>
           </div>

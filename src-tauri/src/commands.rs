@@ -3682,6 +3682,7 @@ mod tests {
     fn raw_live_transcript_off_skips_realtime_asr() {
         let settings = AppSettings {
             api_key: "sk-test".to_string(),
+            api_model: "gpt-realtime-whisper".to_string(),
             show_live_transcript_in_floating_bar: false,
             ..Default::default()
         };
@@ -3693,6 +3694,7 @@ mod tests {
     fn raw_live_transcript_on_uses_realtime_asr() {
         let settings = AppSettings {
             api_key: "sk-test".to_string(),
+            api_model: "gpt-realtime-whisper".to_string(),
             show_live_transcript_in_floating_bar: true,
             ..Default::default()
         };
@@ -3704,6 +3706,7 @@ mod tests {
     fn polish_live_transcript_off_keeps_realtime_asr() {
         let settings = AppSettings {
             api_key: "sk-test".to_string(),
+            api_model: "gpt-realtime-whisper".to_string(),
             show_live_transcript_in_floating_bar: false,
             ..Default::default()
         };
