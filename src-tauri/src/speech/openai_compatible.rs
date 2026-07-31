@@ -111,8 +111,48 @@ fn build_transcription_prompt(
 fn supports_file_streaming(model: &str) -> bool {
     matches!(
         model.trim(),
-        "gpt-4o-transcribe" | "gpt-4o-mini-transcribe" | "gpt-4o-transcribe-diarize"
+        "gpt-transcribe"
+            | "gpt-4o-transcribe"
+            | "gpt-4o-mini-transcribe"
+            | "gpt-4o-transcribe-diarize"
     )
+}
+
+fn uses_gpt_transcribe_contract(model: &str) -> bool {
+    model.trim() == "gpt-transcribe"
+}
+
+fn safe_gpt_transcribe_keywords(dictionary_words: &[String]) -> Vec<String> {
+    let mut keywords = Vec::new();
+    let mut chars = 0_usize;
+    for word in dictionary_words {
+        let word = word.trim();
+        let word_chars = word.chars().count();
+        if word.is_empty()
+            || word.contains(['\r', '\n', '<', '>'])
+            || keywords.len() >= crate::corrections::MAX_EFFECTIVE_VOCABULARY
+            || chars.saturating_add(word_chars) > crate::corrections::MAX_EFFECTIVE_VOCABULARY_CHARS
+        {
+            continue;
+        }
+        chars += word_chars;
+        keywords.push(word.to_string());
+    }
+    keywords
+}
+
+fn transcription_prompt(
+    model: &str,
+    dictionary_words: &[String],
+    focused_context: Option<&FocusedAppContext>,
+    language_mode: LanguageMode,
+) -> Option<String> {
+    let prompt_words = if uses_gpt_transcribe_contract(model) {
+        &[]
+    } else {
+        dictionary_words
+    };
+    build_transcription_prompt(prompt_words, focused_context, language_mode)
 }
 
 pub fn batch_transcription_model(model: &str) -> String {
@@ -128,20 +168,35 @@ fn transcription_text_fields(
     language_mode: LanguageMode,
     prompt: Option<String>,
     streaming: bool,
+    dictionary_words: &[String],
 ) -> Vec<(&'static str, String)> {
     let mut fields = vec![
         ("model", model.to_string()),
         ("temperature", TRANSCRIPTION_TEMPERATURE.to_string()),
     ];
     if let Some(language) = language_mode.api_language() {
-        fields.push(("language", language.to_string()));
+        let field_name = if uses_gpt_transcribe_contract(model) {
+            "languages[]"
+        } else {
+            "language"
+        };
+        fields.push((field_name, language.to_string()));
+    }
+    if uses_gpt_transcribe_contract(model) {
+        fields.extend(
+            safe_gpt_transcribe_keywords(dictionary_words)
+                .into_iter()
+                .map(|keyword| ("keywords[]", keyword)),
+        );
     }
     if let Some(prompt) = prompt {
         fields.push(("prompt", prompt));
     }
     if streaming {
         fields.push(("stream", "true".to_string()));
-        fields.push(("response_format", "text".to_string()));
+        if !uses_gpt_transcribe_contract(model) {
+            fields.push(("response_format", "text".to_string()));
+        }
     }
     fields
 }
@@ -167,6 +222,25 @@ fn parse_transcript_event(line: &str) -> Option<(String, String)> {
     }
 }
 
+fn take_complete_sse_lines(buffer: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for index in 0..buffer.len() {
+        if buffer[index] == b'\n' {
+            lines.push(
+                String::from_utf8_lossy(&buffer[start..index])
+                    .trim()
+                    .to_string(),
+            );
+            start = index + 1;
+        }
+    }
+    if start > 0 {
+        buffer.drain(..start);
+    }
+    lines
+}
+
 #[async_trait::async_trait]
 impl SpeechProvider for OpenAiCompatibleProvider {
     async fn transcribe(&self, audio: &CapturedAudio) -> anyhow::Result<String> {
@@ -180,16 +254,21 @@ impl SpeechProvider for OpenAiCompatibleProvider {
             .file_name("audio.wav")
             .mime_str("audio/wav")?;
         let batch_model = batch_transcription_model(&self.model);
-        let prompt = build_transcription_prompt(
+        let prompt = transcription_prompt(
+            &batch_model,
             &self.dictionary_words,
             self.focused_context.as_ref(),
             self.language_mode,
         );
         let streaming = supports_file_streaming(&batch_model) && self.partial_tx.is_some();
         let mut form = Form::new().part("file", part);
-        for (name, value) in
-            transcription_text_fields(&batch_model, self.language_mode, prompt, streaming)
-        {
+        for (name, value) in transcription_text_fields(
+            &batch_model,
+            self.language_mode,
+            prompt,
+            streaming,
+            &self.dictionary_words,
+        ) {
             form = form.text(name, value);
         }
 
@@ -214,14 +293,12 @@ impl SpeechProvider for OpenAiCompatibleProvider {
 
         if supports_file_streaming(&batch_model) && self.partial_tx.is_some() {
             let mut stream = resp.bytes_stream();
-            let mut buffer = String::new();
+            let mut buffer = Vec::new();
             let mut final_text = String::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.context("ASR stream read failed")?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(index) = buffer.find('\n') {
-                    let line = buffer[..index].trim().to_string();
-                    buffer = buffer[index + 1..].to_string();
+                buffer.extend_from_slice(&chunk);
+                for line in take_complete_sse_lines(&mut buffer) {
                     let Some((event_type, text)) = parse_transcript_event(&line) else {
                         continue;
                     };
@@ -279,17 +356,113 @@ mod tests {
 
     #[test]
     fn batch_request_fields_omit_auto_and_map_explicit_languages() {
-        let auto =
-            transcription_text_fields("gpt-4o-mini-transcribe", LanguageMode::Auto, None, false);
+        let auto = transcription_text_fields(
+            "gpt-4o-mini-transcribe",
+            LanguageMode::Auto,
+            None,
+            false,
+            &[],
+        );
         assert!(!auto.iter().any(|(name, _)| *name == "language"));
-        let ja = transcription_text_fields("whisper-1", LanguageMode::Ja, None, false);
+        let ja = transcription_text_fields("whisper-1", LanguageMode::Ja, None, false, &[]);
         assert!(ja
             .iter()
             .any(|(name, value)| *name == "language" && value == "ja"));
-        let en = transcription_text_fields("whisper-1", LanguageMode::En, None, false);
+        let en = transcription_text_fields("whisper-1", LanguageMode::En, None, false, &[]);
         assert!(en
             .iter()
             .any(|(name, value)| *name == "language" && value == "en"));
+    }
+
+    #[test]
+    fn gpt_transcribe_uses_languages_and_safe_keyword_fields() {
+        let words = vec![
+            " KoeType ".to_string(),
+            String::new(),
+            "bad\nword".to_string(),
+            "<script>".to_string(),
+            "Obsidian".to_string(),
+        ];
+        let auto = transcription_text_fields(
+            "gpt-transcribe",
+            LanguageMode::Auto,
+            Some("app=notepad.exe".to_string()),
+            false,
+            &words,
+        );
+        assert!(!auto
+            .iter()
+            .any(|(name, _)| *name == "language" || *name == "languages[]"));
+        assert_eq!(
+            auto.iter()
+                .filter(|(name, _)| *name == "keywords[]")
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["KoeType", "Obsidian"]
+        );
+        assert!(auto
+            .iter()
+            .any(|(name, value)| *name == "prompt" && value == "app=notepad.exe"));
+
+        let ja = transcription_text_fields("gpt-transcribe", LanguageMode::Ja, None, false, &[]);
+        assert!(ja
+            .iter()
+            .any(|(name, value)| *name == "languages[]" && value == "ja"));
+        assert!(!ja.iter().any(|(name, _)| *name == "language"));
+
+        let en = transcription_text_fields("gpt-transcribe", LanguageMode::En, None, false, &[]);
+        assert!(en
+            .iter()
+            .any(|(name, value)| *name == "languages[]" && value == "en"));
+    }
+
+    #[test]
+    fn gpt_transcribe_keeps_dictionary_words_out_of_prompt() {
+        let context = FocusedAppContext {
+            process_name: "notepad.exe".to_string(),
+            window_title: String::new(),
+        };
+        let prompt = transcription_prompt(
+            "gpt-transcribe",
+            &["KoeType".to_string()],
+            Some(&context),
+            LanguageMode::Auto,
+        )
+        .unwrap();
+        assert!(prompt.contains("app=notepad.exe"));
+        assert!(!prompt.contains("KoeType"));
+    }
+
+    #[test]
+    fn gpt_transcribe_keywords_respect_effective_vocabulary_limit() {
+        let words = (0..crate::corrections::MAX_EFFECTIVE_VOCABULARY)
+            .map(|index| format!("term-{index}"))
+            .chain(std::iter::once("overflow".to_string()))
+            .collect::<Vec<_>>();
+        let keywords = safe_gpt_transcribe_keywords(&words);
+        assert_eq!(keywords.len(), crate::corrections::MAX_EFFECTIVE_VOCABULARY);
+        assert!(!keywords.iter().any(|keyword| keyword == "overflow"));
+    }
+
+    #[test]
+    fn gpt_transcribe_streaming_omits_incompatible_response_format() {
+        let fields =
+            transcription_text_fields("gpt-transcribe", LanguageMode::Auto, None, true, &[]);
+        assert!(fields
+            .iter()
+            .any(|(name, value)| *name == "stream" && value == "true"));
+        assert!(!fields.iter().any(|(name, _)| *name == "response_format"));
+
+        let legacy = transcription_text_fields(
+            "gpt-4o-mini-transcribe",
+            LanguageMode::Auto,
+            None,
+            true,
+            &[],
+        );
+        assert!(legacy
+            .iter()
+            .any(|(name, value)| *name == "response_format" && value == "text"));
     }
 
     #[test]
@@ -316,6 +489,7 @@ mod tests {
 
     #[test]
     fn detects_file_streaming_models() {
+        assert!(supports_file_streaming("gpt-transcribe"));
         assert!(supports_file_streaming("gpt-4o-transcribe"));
         assert!(supports_file_streaming("gpt-4o-mini-transcribe"));
         assert!(!supports_file_streaming("whisper-1"));
@@ -347,5 +521,27 @@ mod tests {
             ))
         );
         assert_eq!(parse_transcript_event("data: [DONE]"), None);
+    }
+
+    #[test]
+    fn sse_line_buffer_preserves_utf8_split_across_chunks() {
+        let event = "data: {\"type\":\"transcript.text.delta\",\"delta\":\"日本語\"}\n";
+        let bytes = event.as_bytes();
+        let split = bytes
+            .windows("日".len())
+            .position(|window| window == "日".as_bytes())
+            .unwrap()
+            + 1;
+        let mut buffer = bytes[..split].to_vec();
+        assert!(take_complete_sse_lines(&mut buffer).is_empty());
+
+        buffer.extend_from_slice(&bytes[split..]);
+        let lines = take_complete_sse_lines(&mut buffer);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            parse_transcript_event(&lines[0]),
+            Some(("transcript.text.delta".to_string(), "日本語".to_string()))
+        );
+        assert!(buffer.is_empty());
     }
 }

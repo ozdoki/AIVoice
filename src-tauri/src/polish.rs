@@ -25,6 +25,19 @@ pub enum PolishFailure {
     EmptyResponse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatCompletionUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct PolishAttempt {
+    pub result: Result<String, PolishFailure>,
+    pub usage: Option<ChatCompletionUsage>,
+    pub model_used: String,
+}
+
 impl PolishFailure {
     pub fn state(&self) -> PolishState {
         match self {
@@ -62,6 +75,7 @@ Fix grammar, punctuation, and formatting. \
 Remove filler words and false starts. \
 Output ONLY the improved text without any explanation or commentary.";
 const POLISH_TEMPERATURE: f32 = 0.1;
+const GPT_5_6_MAX_COMPLETION_TOKENS: u64 = 25_000;
 
 const OUTPUT_GUARDRAILS: &str = "\
 Core rules:
@@ -154,6 +168,47 @@ fn build_user_prompt(text: &str) -> String {
     )
 }
 
+fn is_gpt_5_6(model: &str) -> bool {
+    model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("gpt-5.6")
+}
+
+fn apply_chat_completion_request_policy(
+    body: &mut serde_json::Value,
+    model: &str,
+    legacy_token_limit: u64,
+) {
+    let is_gpt_5 = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("gpt-5");
+    let token_limit_key = if is_gpt_5 {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    let token_limit = if is_gpt_5_6(model) {
+        GPT_5_6_MAX_COMPLETION_TOKENS
+    } else {
+        legacy_token_limit
+    };
+    body[token_limit_key] = serde_json::json!(token_limit);
+    if is_gpt_5_6(model) {
+        body["reasoning_effort"] = serde_json::json!("low");
+        body["service_tier"] = serde_json::json!("default");
+    } else {
+        body["temperature"] = serde_json::json!(POLISH_TEMPERATURE);
+    }
+}
+
 #[cfg(test)]
 fn build_request_body(
     settings: &AppSettings,
@@ -194,24 +249,18 @@ fn build_request_body_with_examples(
 
     let mut body = serde_json::json!({
         "model": settings.polish_model,
-        "messages": messages,
-        "temperature": POLISH_TEMPERATURE
+        "messages": messages
     });
-    let token_limit_key = if settings
-        .polish_model
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("gpt-5")
-    {
-        "max_completion_tokens"
-    } else {
-        "max_tokens"
-    };
-    body[token_limit_key] = serde_json::json!(1024);
+    apply_chat_completion_request_policy(&mut body, &settings.polish_model, 1024);
     body
 }
 
 fn extract_polished_text(json: &serde_json::Value) -> Result<String, PolishFailure> {
+    if json["choices"][0]["finish_reason"].as_str() == Some("length") {
+        return Err(PolishFailure::InvalidResponse(
+            "choices[0] was truncated by the completion token limit".into(),
+        ));
+    }
     let content = json["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| {
@@ -221,6 +270,13 @@ fn extract_polished_text(json: &serde_json::Value) -> Result<String, PolishFailu
         return Err(PolishFailure::EmptyResponse);
     }
     Ok(content.to_string())
+}
+
+fn extract_chat_completion_usage(json: &serde_json::Value) -> Option<ChatCompletionUsage> {
+    Some(ChatCompletionUsage {
+        prompt_tokens: json["usage"]["prompt_tokens"].as_u64()?,
+        completion_tokens: json["usage"]["completion_tokens"].as_u64()?,
+    })
 }
 
 pub async fn polish_text(
@@ -239,8 +295,31 @@ pub async fn polish_text_with_examples(
     style_examples: &[StyleExample],
     text: &str,
 ) -> Result<String, PolishFailure> {
+    polish_attempt_with_examples(
+        settings,
+        dictionary_words,
+        focused_context,
+        style_examples,
+        text,
+    )
+    .await
+    .result
+}
+
+pub(crate) async fn polish_attempt_with_examples(
+    settings: &AppSettings,
+    dictionary_words: &[String],
+    focused_context: Option<&FocusedAppContext>,
+    style_examples: &[StyleExample],
+    text: &str,
+) -> PolishAttempt {
+    let model_used = settings.polish_model.clone();
     if settings.api_key.trim().is_empty() || settings.polish_model.trim().is_empty() {
-        return Err(PolishFailure::NotConfigured);
+        return PolishAttempt {
+            result: Err(PolishFailure::NotConfigured),
+            usage: None,
+            model_used,
+        };
     }
 
     let client = reqwest::Client::new();
@@ -263,17 +342,45 @@ pub async fn polish_text_with_examples(
         .json(&body)
         .send()
         .await
-        .map_err(|error| PolishFailure::Request(error.to_string()))?;
+        .map_err(|error| PolishFailure::Request(error.to_string()));
+    let resp = match resp {
+        Ok(resp) => resp,
+        Err(error) => {
+            return PolishAttempt {
+                result: Err(error),
+                usage: None,
+                model_used,
+            }
+        }
+    };
 
     if !resp.status().is_success() {
-        return Err(PolishFailure::HttpStatus(resp.status().as_u16()));
+        return PolishAttempt {
+            result: Err(PolishFailure::HttpStatus(resp.status().as_u16())),
+            usage: None,
+            model_used,
+        };
     }
 
-    let json: serde_json::Value = resp
+    let json = resp
         .json()
         .await
-        .map_err(|error| PolishFailure::InvalidResponse(error.to_string()))?;
-    extract_polished_text(&json)
+        .map_err(|error| PolishFailure::InvalidResponse(error.to_string()));
+    let json = match json {
+        Ok(json) => json,
+        Err(error) => {
+            return PolishAttempt {
+                result: Err(error),
+                usage: None,
+                model_used,
+            }
+        }
+    };
+    PolishAttempt {
+        result: extract_polished_text(&json),
+        usage: extract_chat_completion_usage(&json),
+        model_used,
+    }
 }
 
 const SELECTED_VOICE_EDIT_SYSTEM_PROMPT: &str = "You edit only the supplied selected text according to the supplied spoken instruction. Preserve the original meaning, proper nouns, names, technical tokens, dates, quantities, and every number unless the instruction explicitly asks to change that exact item. Apply only the requested change. Do not use web knowledge, outside facts, assumptions, or additional content. Do not answer the instruction. Return only the complete replacement text with no explanation, label, quotation marks, or Markdown fence.";
@@ -293,20 +400,9 @@ fn build_selected_voice_edit_request_body(
         "messages": [
             { "role": "system", "content": SELECTED_VOICE_EDIT_SYSTEM_PROMPT },
             { "role": "user", "content": user }
-        ],
-        "temperature": POLISH_TEMPERATURE
+        ]
     });
-    let token_limit_key = if settings
-        .polish_model
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("gpt-5")
-    {
-        "max_completion_tokens"
-    } else {
-        "max_tokens"
-    };
-    body[token_limit_key] = serde_json::json!(4096);
+    apply_chat_completion_request_policy(&mut body, &settings.polish_model, 4096);
     body
 }
 
@@ -315,8 +411,23 @@ pub async fn edit_selected_text(
     selected_text: &str,
     instruction: &str,
 ) -> Result<String, PolishFailure> {
+    edit_selected_text_attempt(settings, selected_text, instruction)
+        .await
+        .result
+}
+
+pub(crate) async fn edit_selected_text_attempt(
+    settings: &AppSettings,
+    selected_text: &str,
+    instruction: &str,
+) -> PolishAttempt {
+    let model_used = settings.polish_model.clone();
     if settings.api_key.trim().is_empty() || settings.polish_model.trim().is_empty() {
-        return Err(PolishFailure::NotConfigured);
+        return PolishAttempt {
+            result: Err(PolishFailure::NotConfigured),
+            usage: None,
+            model_used,
+        };
     }
     let client = reqwest::Client::new();
     let url = format!(
@@ -333,15 +444,43 @@ pub async fn edit_selected_text(
         ))
         .send()
         .await
-        .map_err(|error| PolishFailure::Request(error.to_string()))?;
+        .map_err(|error| PolishFailure::Request(error.to_string()));
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            return PolishAttempt {
+                result: Err(error),
+                usage: None,
+                model_used,
+            }
+        }
+    };
     if !response.status().is_success() {
-        return Err(PolishFailure::HttpStatus(response.status().as_u16()));
+        return PolishAttempt {
+            result: Err(PolishFailure::HttpStatus(response.status().as_u16())),
+            usage: None,
+            model_used,
+        };
     }
-    let json: serde_json::Value = response
+    let json = response
         .json()
         .await
-        .map_err(|error| PolishFailure::InvalidResponse(error.to_string()))?;
-    extract_polished_text(&json)
+        .map_err(|error| PolishFailure::InvalidResponse(error.to_string()));
+    let json = match json {
+        Ok(json) => json,
+        Err(error) => {
+            return PolishAttempt {
+                result: Err(error),
+                usage: None,
+                model_used,
+            }
+        }
+    };
+    PolishAttempt {
+        result: extract_polished_text(&json),
+        usage: extract_chat_completion_usage(&json),
+        model_used,
+    }
 }
 
 #[cfg(test)]
@@ -671,6 +810,79 @@ mod tests {
     }
 
     #[test]
+    fn gpt_5_6_request_policy_is_shared_by_polish_and_selected_edit() {
+        let settings = AppSettings {
+            polish_model: "gpt-5.6-terra-2026-07-31".to_string(),
+            ..AppSettings::default()
+        };
+        let polish = build_request_body(&settings, &[], None, "本文");
+        let selected = build_selected_voice_edit_request_body(&settings, "本文", "整えて");
+        for body in [&polish, &selected] {
+            assert_eq!(body["reasoning_effort"], "low");
+            assert_eq!(body["service_tier"], "default");
+            assert_eq!(body["max_completion_tokens"], 25_000);
+            assert!(body.get("temperature").is_none());
+        }
+    }
+
+    #[test]
+    fn namespaced_gpt_5_6_and_legacy_models_keep_their_policies() {
+        let namespaced = AppSettings {
+            polish_model: "provider/openai/gpt-5.6-terra-2026-07-31".to_string(),
+            ..AppSettings::default()
+        };
+        let body = build_request_body(&namespaced, &[], None, "本文");
+        assert_eq!(body["model"], namespaced.polish_model);
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["service_tier"], "default");
+        assert_eq!(body["max_completion_tokens"], 25_000);
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("max_tokens").is_none());
+        for (model, key, limit) in [
+            ("gpt-5.4-mini", "max_completion_tokens", 1024),
+            ("gpt-4o-mini", "max_tokens", 1024),
+        ] {
+            let body = build_request_body(
+                &AppSettings {
+                    polish_model: model.to_string(),
+                    ..AppSettings::default()
+                },
+                &[],
+                None,
+                "本文",
+            );
+            assert_eq!(body[key], limit);
+            assert_eq!(body["temperature"], POLISH_TEMPERATURE);
+            assert!(body.get("reasoning_effort").is_none());
+            assert!(body.get("service_tier").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn length_attempt_keeps_usage_and_model_snapshot() {
+        let (api_base_url, _) = serve_once("200 OK", serde_json::json!({ "choices": [{ "finish_reason": "length", "message": { "content": "cut" } }], "usage": { "prompt_tokens": 12, "completion_tokens": 25_000 } }).to_string());
+        let settings = AppSettings {
+            api_base_url,
+            api_key: "test-key".to_string(),
+            polish_model: "provider/openai/gpt-5.6-terra-2026-07-31".to_string(),
+            ..AppSettings::default()
+        };
+        let attempt = polish_attempt_with_examples(&settings, &[], None, &[], "本文").await;
+        assert!(matches!(
+            attempt.result,
+            Err(PolishFailure::InvalidResponse(_))
+        ));
+        assert_eq!(
+            attempt.usage,
+            Some(ChatCompletionUsage {
+                prompt_tokens: 12,
+                completion_tokens: 25_000
+            })
+        );
+        assert_eq!(attempt.model_used, settings.polish_model);
+    }
+
+    #[test]
     fn response_extraction_preserves_blank_lines() {
         let json = serde_json::json!({
             "choices": [{ "message": { "content": "第一段落。\n\n第二段落。" } }]
@@ -693,6 +905,30 @@ mod tests {
             })),
             Err(PolishFailure::EmptyResponse)
         ));
+        assert!(matches!(
+            extract_polished_text(&serde_json::json!({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": { "content": "truncated" }
+                }]
+            })),
+            Err(PolishFailure::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn response_extraction_reads_usage_when_complete() {
+        let response = serde_json::json!({
+            "choices": [{ "message": { "content": "本文" } }],
+            "usage": { "prompt_tokens": 123, "completion_tokens": 456 }
+        });
+        assert_eq!(
+            extract_chat_completion_usage(&response),
+            Some(ChatCompletionUsage {
+                prompt_tokens: 123,
+                completion_tokens: 456,
+            })
+        );
     }
 
     #[tokio::test]

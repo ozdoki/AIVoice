@@ -38,6 +38,8 @@ pub struct SessionOutcome {
     pub recovery_id: Option<String>,
     pub polish_preset: String,
     pub app_process: String,
+    pub polish_usage: Option<crate::polish::ChatCompletionUsage>,
+    pub polish_model_used: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -193,6 +195,8 @@ pub async fn stop_session_inner(
             recovery_id: None,
             polish_preset: String::new(),
             app_process: String::new(),
+            polish_usage: None,
+            polish_model_used: None,
         });
     };
 
@@ -385,6 +389,8 @@ pub async fn stop_session_inner(
             recovery_id,
             polish_preset: session_polish_preset,
             app_process: session_app_process,
+            polish_usage: routed.polish_usage,
+            polish_model_used: routed.polish_model_used,
         })
     }
     .await;

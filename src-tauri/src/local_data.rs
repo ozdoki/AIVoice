@@ -15,6 +15,7 @@ const MAX_HISTORY_ITEMS: usize = 200;
 pub const MAX_DICTIONARY_WORDS: usize = 800;
 pub const MAX_SNIPPETS: usize = 100;
 const MAX_DICTIONARY_SUGGESTIONS: usize = 16;
+static USAGE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -88,6 +89,7 @@ pub struct SessionMetrics {
     pub duration_ms: u64,
     pub api_model: String,
     pub polish_model: String,
+    pub polish_usage: Option<crate::polish::ChatCompletionUsage>,
 }
 
 fn now_secs() -> u64 {
@@ -141,10 +143,15 @@ fn estimate_tokens(text: &str) -> f64 {
 }
 
 fn asr_price_per_minute(model: &str) -> f64 {
-    let model = model.to_ascii_lowercase();
+    let model = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
     match model.as_str() {
-        // OpenAI API pricing checked 2026-06-24.
+        // OpenAI API pricing checked 2026-07-31.
         "gpt-4o-mini-transcribe" => 0.003,
+        "gpt-transcribe" => 0.0045,
         "gpt-4o-transcribe" | "whisper-1" => 0.006,
         "gpt-realtime-whisper" => 0.017,
         _ => 0.006,
@@ -152,9 +159,22 @@ fn asr_price_per_minute(model: &str) -> f64 {
 }
 
 fn text_model_price_per_million(model: &str) -> (f64, f64) {
-    let model = model.to_ascii_lowercase();
+    let model = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    if model.starts_with("gpt-5.6") {
+        return if model.contains("luna") {
+            (0.20, 1.20)
+        } else if model.contains("terra") {
+            (2.00, 12.00)
+        } else {
+            (5.00, 30.00)
+        };
+    }
     match model.as_str() {
-        // OpenAI API pricing checked 2026-06-24. Values are standard processing USD / 1M tokens.
+        // OpenAI API pricing checked 2026-07-31. Values are standard processing USD / 1M tokens.
         "gpt-5.5" => (5.00, 30.00),
         "gpt-5.4" => (2.50, 15.00),
         "gpt-5.4-mini" => (0.75, 4.50),
@@ -169,13 +189,22 @@ fn estimate_asr_cost(duration_ms: u64, model: &str) -> f64 {
     (duration_ms as f64 / 60_000.0) * asr_price_per_minute(model)
 }
 
-fn estimate_polish_cost(raw_text: &str, final_text: &str, mode: &Mode, model: &str) -> f64 {
+fn estimate_polish_cost(
+    raw_text: &str,
+    final_text: &str,
+    mode: &Mode,
+    model: &str,
+    usage: Option<crate::polish::ChatCompletionUsage>,
+) -> f64 {
     if !matches!(mode, Mode::Polish) {
         return 0.0;
     }
     let (input_per_million, output_per_million) = text_model_price_per_million(model);
-    let input_cost = estimate_tokens(raw_text) * input_per_million / 1_000_000.0;
-    let output_cost = estimate_tokens(final_text) * output_per_million / 1_000_000.0;
+    let (input_tokens, output_tokens) = usage
+        .map(|usage| (usage.prompt_tokens as f64, usage.completion_tokens as f64))
+        .unwrap_or_else(|| (estimate_tokens(raw_text), estimate_tokens(final_text)));
+    let input_cost = input_tokens * input_per_million / 1_000_000.0;
+    let output_cost = output_tokens * output_per_million / 1_000_000.0;
     input_cost + output_cost
 }
 
@@ -565,6 +594,9 @@ pub fn record_usage(
     app: &AppHandle,
     metrics: SessionMetrics,
 ) -> anyhow::Result<Vec<UsageDaySummary>> {
+    let _guard = USAGE_WRITE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("usage write lock poisoned"))?;
     let mut days = load_usage(app)?;
     let day = day_key_from_unix(now_secs());
     let index = days.iter().position(|item| item.day == day);
@@ -595,6 +627,7 @@ pub fn record_usage(
         &metrics.final_text,
         &metrics.mode,
         &metrics.polish_model,
+        metrics.polish_usage,
     );
     if !summary.models.contains(&metrics.api_model) {
         summary.models.push(metrics.api_model);
@@ -606,6 +639,42 @@ pub fn record_usage(
     days.sort_by(|a, b| b.day.cmp(&a.day));
     save_usage(app, &days)?;
     Ok(days)
+}
+
+pub fn record_polish_usage_only(
+    app: &AppHandle,
+    model: &str,
+    usage: crate::polish::ChatCompletionUsage,
+) -> anyhow::Result<Vec<UsageDaySummary>> {
+    let _guard = USAGE_WRITE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("usage write lock poisoned"))?;
+    let mut days = load_usage(app)?;
+    let day = day_key_from_unix(now_secs());
+    let summary = if let Some(index) = days.iter().position(|item| item.day == day) {
+        &mut days[index]
+    } else {
+        days.push(UsageDaySummary {
+            day,
+            ..Default::default()
+        });
+        days.last_mut().expect("usage day just inserted")
+    };
+    apply_polish_usage(summary, model, usage);
+    days.sort_by(|a, b| b.day.cmp(&a.day));
+    save_usage(app, &days)?;
+    Ok(days)
+}
+
+fn apply_polish_usage(
+    summary: &mut UsageDaySummary,
+    model: &str,
+    usage: crate::polish::ChatCompletionUsage,
+) {
+    summary.polish_cost_usd += estimate_polish_cost("", "", &Mode::Polish, model, Some(usage));
+    if !summary.models.iter().any(|item| item == model) {
+        summary.models.push(model.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -644,10 +713,81 @@ mod tests {
     fn cost_estimates_use_model_specific_rates() {
         let asr = estimate_asr_cost(60_000, "gpt-4o-mini-transcribe");
         assert!((asr - 0.003).abs() < f64::EPSILON);
+        let gpt_transcribe = estimate_asr_cost(60_000, "gpt-transcribe");
+        assert!((gpt_transcribe - 0.0045).abs() < f64::EPSILON);
 
-        let polish =
-            estimate_polish_cost("hello world", "Hello world.", &Mode::Polish, "gpt-5.4-mini");
+        let polish = estimate_polish_cost(
+            "hello world",
+            "Hello world.",
+            &Mode::Polish,
+            "gpt-5.4-mini",
+            None,
+        );
         assert!(polish > 0.0);
+
+        let actual_usage = estimate_polish_cost(
+            "x",
+            "y",
+            &Mode::Polish,
+            "gpt-5.6-terra",
+            Some(crate::polish::ChatCompletionUsage {
+                prompt_tokens: 1_000_000,
+                completion_tokens: 1_000_000,
+            }),
+        );
+        assert!((actual_usage - 14.0).abs() < f64::EPSILON);
+        let terra_completion = estimate_polish_cost(
+            "",
+            "",
+            &Mode::Polish,
+            "provider/openai/gpt-5.6-terra",
+            Some(crate::polish::ChatCompletionUsage {
+                prompt_tokens: 0,
+                completion_tokens: 25_000,
+            }),
+        );
+        assert!((terra_completion - 0.30).abs() < f64::EPSILON);
+        assert_eq!(text_model_price_per_million("gpt-5.6"), (5.0, 30.0));
+        assert_eq!(text_model_price_per_million("gpt-5.6-sol"), (5.0, 30.0));
+        assert_eq!(text_model_price_per_million("gpt-5.6-luna"), (0.20, 1.20));
+        assert_eq!(
+            text_model_price_per_million("gpt-5.6-terra-2026-07-31"),
+            (2.0, 12.0)
+        );
+    }
+
+    #[test]
+    fn polish_usage_only_preserves_non_polish_summary_metrics() {
+        let mut summary = UsageDaySummary {
+            sessions: 3,
+            words: 40,
+            characters: 90,
+            audio_seconds: 12,
+            asr_cost_usd: 0.5,
+            polish_cost_usd: 0.1,
+            models: vec!["gpt-5.6-terra".to_string()],
+            ..Default::default()
+        };
+        apply_polish_usage(
+            &mut summary,
+            "gpt-5.6-terra",
+            crate::polish::ChatCompletionUsage {
+                prompt_tokens: 0,
+                completion_tokens: 25_000,
+            },
+        );
+        assert_eq!(
+            (
+                summary.sessions,
+                summary.words,
+                summary.characters,
+                summary.audio_seconds,
+                summary.asr_cost_usd
+            ),
+            (3, 40, 90, 12, 0.5)
+        );
+        assert!((summary.polish_cost_usd - 0.4).abs() < f64::EPSILON);
+        assert_eq!(summary.models, vec!["gpt-5.6-terra"]);
     }
 
     #[test]

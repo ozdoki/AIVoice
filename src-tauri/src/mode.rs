@@ -1,7 +1,7 @@
 use crate::{
     context::FocusedAppContext,
     corrections::StyleExample,
-    polish::{self, PolishState},
+    polish::{self, ChatCompletionUsage, PolishState},
     settings::AppSettings,
     state::Mode,
 };
@@ -10,6 +10,8 @@ use crate::{
 pub struct ModeRouteOutcome {
     pub text: String,
     pub polish_state: PolishState,
+    pub polish_usage: Option<ChatCompletionUsage>,
+    pub polish_model_used: Option<String>,
 }
 
 fn applied_state(original: &str, polished: &str) -> PolishState {
@@ -44,22 +46,26 @@ pub async fn route_with_style_examples(
         Mode::Raw => ModeRouteOutcome {
             text: text.to_string(),
             polish_state: PolishState::NotRequested,
+            polish_usage: None,
+            polish_model_used: None,
         },
         Mode::Polish => {
-            match polish::polish_text_with_examples(
+            let attempt = polish::polish_attempt_with_examples(
                 settings,
                 dictionary_words,
                 focused_context,
                 style_examples,
                 text,
             )
-            .await
-            {
+            .await;
+            match attempt.result {
                 Ok(polished) => {
                     let polish_state = applied_state(text, &polished);
                     ModeRouteOutcome {
                         text: polished,
                         polish_state,
+                        polish_usage: attempt.usage,
+                        polish_model_used: Some(attempt.model_used),
                     }
                 }
                 Err(error) => {
@@ -71,6 +77,8 @@ pub async fn route_with_style_examples(
                     ModeRouteOutcome {
                         text: text.to_string(),
                         polish_state,
+                        polish_usage: attempt.usage,
+                        polish_model_used: Some(attempt.model_used),
                     }
                 }
             }
