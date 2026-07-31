@@ -170,7 +170,7 @@ impl Default for AppSettings {
             api_key: String::new(),
             api_model: "gpt-transcribe".to_string(),
             language_mode: LanguageMode::Auto,
-            polish_model: "gpt-4o-mini".to_string(),
+            polish_model: "gpt-5.6-terra".to_string(),
             mode: Mode::default(),
             device_id: None,
             polish_preset: "memo".to_string(),
@@ -338,6 +338,7 @@ mod tests {
         assert_eq!(d.language_mode, LanguageMode::Auto);
         assert!(d.device_id.is_none());
         assert_eq!(d.mode, Mode::Raw);
+        assert_eq!(d.polish_model, "gpt-5.6-terra");
         assert_eq!(d.polish_preset, "memo");
         assert!(d.custom_polish_instructions.is_empty());
         assert!(!d.deep_context_enabled);
@@ -359,6 +360,15 @@ mod tests {
         });
         let settings: AppSettings = serde_json::from_value(json).unwrap();
         assert_eq!(settings.api_model, "gpt-4o-transcribe");
+    }
+
+    #[test]
+    fn saved_polish_model_is_preserved_without_migration() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "polish_model": "gpt-4o-mini"
+        }))
+        .unwrap();
+        assert_eq!(settings.polish_model, "gpt-4o-mini");
     }
 
     #[test]

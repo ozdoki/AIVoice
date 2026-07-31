@@ -817,14 +817,27 @@ async fn stop_recording_locked(app: &tauri::AppHandle, state: &AppState) -> Resu
                     final_text: outcome.final_text.clone(),
                     duration_ms: outcome.duration_ms,
                     api_model: settings.api_model,
-                    polish_model: settings.polish_model,
+                    polish_model: outcome
+                        .polish_model_used
+                        .clone()
+                        .unwrap_or(settings.polish_model),
+                    polish_usage: outcome.polish_usage,
                 },
             ) {
                 tracing::warn!("failed to record usage: {error}");
             }
             saved_id
         }
-        Ok(_) => None,
+        Ok(outcome) => {
+            if let (Some(usage), Some(model)) =
+                (outcome.polish_usage, outcome.polish_model_used.as_deref())
+            {
+                if let Err(error) = local_data::record_polish_usage_only(app, model, usage) {
+                    tracing::warn!("failed to record incomplete session Polish usage: {error}");
+                }
+            }
+            None
+        }
         Err(error) => {
             let entry = local_data::make_history_entry(
                 String::new(),
@@ -1138,23 +1151,29 @@ async fn stop_selected_voice_edit_locked(
         // 原選択本文はrecoveryへ保存しない。raw_text相当は音声指示だけ。
         recovery::mark_text_ready(app, &active.recovery_id, instruction.clone(), String::new())
             .map_err(|error| error.to_string())?;
-        let proposal = match tokio::time::timeout(
+        let proposal_attempt = match tokio::time::timeout(
             std::time::Duration::from_secs(selected_voice_edit::EDIT_TIMEOUT_SECS),
-            crate::polish::edit_selected_text(&settings, &active.original_text, &instruction),
+            crate::polish::edit_selected_text_attempt(&settings, &active.original_text, &instruction),
         )
         .await
         {
-            Ok(result) => result.map_err(|error| {
-                let message = format!("選択音声編集APIに失敗しました。元の選択本文は変更していません: {error}");
-                let _ = recovery::mark_failed(app, &active.recovery_id, message.clone());
-                message
-            })?,
+            Ok(result) => result,
             Err(_) => {
                 let message = "選択音声編集APIが90秒でタイムアウトしました。元の選択本文は変更していません。".to_string();
                 let _ = recovery::mark_failed(app, &active.recovery_id, message.clone());
                 return Err(message);
             }
         };
+        if let Some(usage) = proposal_attempt.usage {
+            if let Err(error) = local_data::record_polish_usage_only(app, &proposal_attempt.model_used, usage) {
+                tracing::warn!("failed to record selected voice edit usage: {error}");
+            }
+        }
+        let proposal = proposal_attempt.result.map_err(|error| {
+            let message = format!("選択音声編集APIに失敗しました。元の選択本文は変更していません: {error}");
+            let _ = recovery::mark_failed(app, &active.recovery_id, message.clone());
+            message
+        })?;
         if proposal.trim().is_empty()
             || proposal.chars().count() > crate::selection::MAX_SELECTED_TEXT_CHARS
         {
@@ -1774,6 +1793,11 @@ pub async fn rerun_history_polish(
         &post_asr_text,
     )
     .await;
+    if let (Some(usage), Some(model)) = (routed.polish_usage, routed.polish_model_used.as_deref()) {
+        if let Err(error) = local_data::record_polish_usage_only(&app, model, usage) {
+            tracing::warn!("failed to record history Polish usage: {error}");
+        }
+    }
     let snippets = local_data::load_snippets(&app).map_err(|error| error.to_string())?;
     let final_text = local_data::expand_snippets(&routed.text, &snippets);
     let _guard = state.history_action.lock().await;
@@ -3084,6 +3108,11 @@ pub async fn retry_recovery_session(
         &post_asr_text,
     )
     .await;
+    if let (Some(usage), Some(model)) = (routed.polish_usage, routed.polish_model_used.as_deref()) {
+        if let Err(error) = local_data::record_polish_usage_only(&app, model, usage) {
+            tracing::warn!("failed to record recovery Polish usage: {error}");
+        }
+    }
     let snippets = local_data::load_snippets(&app).map_err(|error| error.to_string())?;
     let final_text = local_data::expand_snippets(&routed.text, &snippets);
     recovery::mark_text_ready(&app, &id, raw_text, final_text)
