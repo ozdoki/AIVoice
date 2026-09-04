@@ -2974,8 +2974,19 @@ pub async fn get_usage_summary(app: tauri::AppHandle) -> Result<Vec<UsageDaySumm
 #[tauri::command]
 pub async fn get_recovery_sessions(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
 ) -> Result<Vec<RecoverySessionSummary>, String> {
-    recovery::list_sessions(&app).map_err(|error| error.to_string())
+    let _guard = state
+        .session_action
+        .try_lock()
+        .map_err(|_| "録音処理中のためRecovery一覧を更新できません。".to_string())?;
+    let active_id = state
+        .session
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|session| session.recovery_id.clone());
+    recovery::list_sessions(&app, active_id.as_deref()).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2984,6 +2995,13 @@ pub async fn retry_recovery_session(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<RecoverySessionSummary, String> {
+    let _guard = state
+        .session_action
+        .try_lock()
+        .map_err(|_| "別の録音またはRecovery再実行が進行中です。".to_string())?;
+    if state.session.lock().await.is_some() {
+        return Err("録音中のためRecoveryを再実行できません。".to_string());
+    }
     let meta = recovery::load_meta(&app, &id).map_err(|error| error.to_string())?;
     if meta.operation_kind == OperationKind::SelectedVoiceEdit {
         return Err(
@@ -2995,15 +3013,7 @@ pub async fn retry_recovery_session(
         return Err("復元できる音声ファイルがありません。".to_string());
     }
     let wav_info = recovery::repair_wav_header(&wav_path).map_err(|error| error.to_string())?;
-    recovery::mark_captured(
-        &app,
-        &id,
-        wav_info.sample_rate,
-        wav_info.channels,
-        wav_info.frame_count,
-        wav_info.duration_ms,
-    )
-    .map_err(|error| error.to_string())?;
+    let meta = recovery::claim_retry(&app, &id, wav_info).map_err(|error| error.to_string())?;
 
     let mut current_settings = state.settings.lock().await.clone();
     if current_settings.api_key.is_empty() {
@@ -3038,8 +3048,6 @@ pub async fn retry_recovery_session(
     } else {
         None
     };
-    recovery::mark_transcribing(&app, &id).map_err(|error| error.to_string())?;
-
     let audio = audio::CapturedAudio {
         samples: Vec::new(),
         sample_rate: wav_info.sample_rate,
@@ -3056,7 +3064,10 @@ pub async fn retry_recovery_session(
         focused_context: focused_context.clone(),
         partial_tx: None,
     };
-    let raw_text = match provider.transcribe(&audio).await {
+    let raw_text = match provider
+        .transcribe_dictation(&audio, Some(&app), Some(&id))
+        .await
+    {
         Ok(text) => text,
         Err(error) => {
             let error = error.to_string();
@@ -3064,6 +3075,7 @@ pub async fn retry_recovery_session(
             return Err(error);
         }
     };
+    recovery::save_raw_text(&app, &id, raw_text.clone()).map_err(|error| error.to_string())?;
     let post_asr_text = if current_settings.correction_learning_mode == CorrectionLearningMode::Ask
     {
         corrections::apply_replacements(&raw_text, &correction_store, &app_process)
@@ -3188,7 +3200,7 @@ pub async fn delete_recovery_session(
     id: String,
 ) -> Result<Vec<RecoverySessionSummary>, String> {
     recovery::delete_session(&app, &id).map_err(|error| error.to_string())?;
-    recovery::list_sessions(&app).map_err(|error| error.to_string())
+    recovery::list_sessions(&app, None).map_err(|error| error.to_string())
 }
 
 async fn settings_target_context(state: &AppState) -> Option<FocusedAppContext> {

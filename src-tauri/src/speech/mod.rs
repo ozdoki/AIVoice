@@ -1,3 +1,4 @@
+pub mod long_audio;
 pub mod mock;
 pub mod openai_compatible;
 pub mod realtime;

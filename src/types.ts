@@ -322,6 +322,7 @@ export interface RecoverySessionSummary {
   can_retry: boolean;
   operation_kind: OperationKind;
   injection_warning: string | null;
+  transcription_progress: { current: number; total: number } | null;
 }
 
 export interface UsageDaySummary {

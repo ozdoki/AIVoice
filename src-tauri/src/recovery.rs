@@ -2,6 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,6 +14,14 @@ use crate::{local_data::OperationKind, state::Mode};
 const RECOVERY_DIR: &str = "recovery";
 const META_FILE: &str = "meta.json";
 const AUDIO_FILE: &str = "audio.wav";
+static META_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn meta_lock() -> std::sync::MutexGuard<'static, ()> {
+    META_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +58,18 @@ pub struct RecoverySessionMeta {
     pub history_id: Option<String>,
     #[serde(default)]
     pub operation_kind: OperationKind,
+    /// 長尺ASRの再開用チェックポイント。旧セッションには存在しない。
+    #[serde(default)]
+    pub long_audio: Option<LongAudioCheckpoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LongAudioCheckpoint {
+    pub source_fingerprint: String,
+    pub request_fingerprint: String,
+    pub total_parts: usize,
+    /// `Some("")` は無音区間の成功を表す。`None` は未完了。
+    pub completed_parts: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +87,13 @@ pub struct RecoverySessionSummary {
     pub can_retry: bool,
     pub operation_kind: OperationKind,
     pub injection_warning: Option<String>,
+    pub transcription_progress: Option<RecoveryProgress>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryProgress {
+    pub current: usize,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -147,8 +175,8 @@ fn meta_path(app: &AppHandle, id: &str) -> anyhow::Result<PathBuf> {
 }
 
 fn save_meta_path(path: &Path, meta: &RecoverySessionMeta) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    if !path.parent().is_some_and(Path::exists) {
+        anyhow::bail!("recovery session directory no longer exists");
     }
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(meta)?)?;
@@ -166,6 +194,7 @@ pub fn update_meta<F>(app: &AppHandle, id: &str, update: F) -> anyhow::Result<Re
 where
     F: FnOnce(&mut RecoverySessionMeta),
 {
+    let _guard = meta_lock();
     let mut meta = load_meta(app, id)?;
     update(&mut meta);
     meta.updated_at = now_secs();
@@ -221,12 +250,84 @@ pub fn create_session_with_operation(
         error: None,
         history_id: None,
         operation_kind,
+        long_audio: None,
     };
     save_meta_path(&dir.join(META_FILE), &meta)?;
     Ok(RecoverySessionRuntime {
         id,
         audio_path: dir.join(AUDIO_FILE),
     })
+}
+
+pub fn load_long_audio_checkpoint(
+    app: &AppHandle,
+    id: &str,
+    source_fingerprint: &str,
+    request_fingerprint: &str,
+    total_parts: usize,
+) -> anyhow::Result<Vec<Option<String>>> {
+    let meta = load_meta(app, id)?;
+    Ok(reusable_long_audio_parts(
+        meta.long_audio.as_ref(),
+        source_fingerprint,
+        request_fingerprint,
+        total_parts,
+    ))
+}
+
+fn reusable_long_audio_parts(
+    checkpoint: Option<&LongAudioCheckpoint>,
+    source_fingerprint: &str,
+    request_fingerprint: &str,
+    total_parts: usize,
+) -> Vec<Option<String>> {
+    let Some(checkpoint) = checkpoint else {
+        return vec![None; total_parts];
+    };
+    if checkpoint.source_fingerprint != source_fingerprint
+        || checkpoint.request_fingerprint != request_fingerprint
+        || checkpoint.total_parts != total_parts
+        || checkpoint.completed_parts.len() != total_parts
+    {
+        return vec![None; total_parts];
+    }
+    checkpoint.completed_parts.clone()
+}
+
+pub fn save_long_audio_part(
+    app: &AppHandle,
+    id: &str,
+    source_fingerprint: String,
+    request_fingerprint: String,
+    total_parts: usize,
+    index: usize,
+    text: String,
+) -> anyhow::Result<()> {
+    if index >= total_parts {
+        anyhow::bail!("long audio part index is out of range");
+    }
+    update_meta(app, id, |meta| {
+        let checkpoint = meta.long_audio.get_or_insert_with(|| LongAudioCheckpoint {
+            source_fingerprint: source_fingerprint.clone(),
+            request_fingerprint: request_fingerprint.clone(),
+            total_parts,
+            completed_parts: vec![None; total_parts],
+        });
+        if checkpoint.source_fingerprint != source_fingerprint
+            || checkpoint.request_fingerprint != request_fingerprint
+            || checkpoint.total_parts != total_parts
+            || checkpoint.completed_parts.len() != total_parts
+        {
+            *checkpoint = LongAudioCheckpoint {
+                source_fingerprint,
+                request_fingerprint,
+                total_parts,
+                completed_parts: vec![None; total_parts],
+            };
+        }
+        checkpoint.completed_parts[index] = Some(text);
+    })?;
+    Ok(())
 }
 
 pub fn mark_captured(
@@ -269,6 +370,43 @@ pub fn mark_text_ready(
     Ok(meta)
 }
 
+pub fn claim_retry(
+    app: &AppHandle,
+    id: &str,
+    info: WavInfo,
+) -> anyhow::Result<RecoverySessionMeta> {
+    let _guard = meta_lock();
+    let mut meta = load_meta(app, id)?;
+    if matches!(meta.status, RecoveryStatus::Transcribing) {
+        anyhow::bail!("recovery retry is already running");
+    }
+    meta.status = RecoveryStatus::Transcribing;
+    meta.sample_rate = Some(info.sample_rate);
+    meta.channels = Some(info.channels);
+    meta.frame_count = Some(info.frame_count);
+    meta.duration_ms = info.duration_ms;
+    meta.error = None;
+    meta.updated_at = now_secs();
+    save_meta_path(&meta_path(app, id)?, &meta)?;
+    Ok(meta)
+}
+
+/// ASR全文は後処理より先に保全する。未完了の最終テキストとは区別する。
+pub fn save_raw_text(
+    app: &AppHandle,
+    id: &str,
+    raw_text: String,
+) -> anyhow::Result<RecoverySessionMeta> {
+    update_meta(app, id, |meta| apply_raw_text(meta, raw_text))
+}
+
+fn apply_raw_text(meta: &mut RecoverySessionMeta, raw_text: String) {
+    meta.raw_text = raw_text;
+    // 後処理前に落ちても、旧世代の完成文と新しいraw本文を組み合わせない。
+    meta.final_text.clear();
+    meta.error = None;
+}
+
 pub fn mark_failed(
     app: &AppHandle,
     id: &str,
@@ -293,6 +431,7 @@ pub fn mark_completed(
 }
 
 pub fn delete_session(app: &AppHandle, id: &str) -> anyhow::Result<()> {
+    let _guard = meta_lock();
     let dir = session_dir(app, id)?;
     if dir.exists() {
         fs::remove_dir_all(dir)?;
@@ -319,7 +458,11 @@ pub fn summarize(app: &AppHandle, id: &str) -> anyhow::Result<RecoverySessionSum
     Ok(summary_from_meta(&meta, audio.exists()))
 }
 
-pub fn list_sessions(app: &AppHandle) -> anyhow::Result<Vec<RecoverySessionSummary>> {
+pub fn list_sessions(
+    app: &AppHandle,
+    active_id: Option<&str>,
+) -> anyhow::Result<Vec<RecoverySessionSummary>> {
+    let _guard = meta_lock();
     let root = recovery_root(app)?;
     if !root.exists() {
         return Ok(Vec::new());
@@ -344,6 +487,13 @@ pub fn list_sessions(app: &AppHandle) -> anyhow::Result<Vec<RecoverySessionSumma
 
         let mut meta: RecoverySessionMeta = serde_json::from_str(&fs::read_to_string(&meta_file)?)?;
         if meta.id != id {
+            continue;
+        }
+        if active_id == Some(id.as_str()) {
+            summaries.push(summary_from_meta(
+                &meta,
+                entry.path().join(AUDIO_FILE).exists(),
+            ));
             continue;
         }
         let wav = entry.path().join(AUDIO_FILE);
@@ -394,6 +544,14 @@ fn summary_from_meta(meta: &RecoverySessionMeta, has_audio: bool) -> RecoverySes
             && meta.channels.is_some(),
         operation_kind: meta.operation_kind,
         injection_warning: None,
+        transcription_progress: meta.long_audio.as_ref().map(|checkpoint| RecoveryProgress {
+            current: checkpoint
+                .completed_parts
+                .iter()
+                .filter(|text| text.is_some())
+                .count(),
+            total: checkpoint.total_parts,
+        }),
     }
 }
 
@@ -613,5 +771,48 @@ mod tests {
             serde_json::from_value(serde_json::to_value(current).unwrap()).unwrap();
         assert_eq!(roundtrip.polish_preset, "slack");
         assert_eq!(roundtrip.app_process, "slack.exe");
+    }
+
+    #[test]
+    fn long_audio_reuse_keeps_empty_success_but_rejects_changed_conditions() {
+        let checkpoint = LongAudioCheckpoint {
+            source_fingerprint: "source-a".into(),
+            request_fingerprint: "request-a".into(),
+            total_parts: 2,
+            completed_parts: vec![Some(String::new()), None],
+        };
+        assert_eq!(
+            reusable_long_audio_parts(Some(&checkpoint), "source-a", "request-a", 2),
+            vec![Some(String::new()), None]
+        );
+        assert_eq!(
+            reusable_long_audio_parts(Some(&checkpoint), "source-b", "request-a", 2),
+            vec![None, None]
+        );
+        assert_eq!(
+            reusable_long_audio_parts(Some(&checkpoint), "source-a", "request-b", 2),
+            vec![None, None]
+        );
+    }
+
+    #[test]
+    fn saving_new_raw_text_invalidates_the_previous_final_text() {
+        let mut meta: RecoverySessionMeta = serde_json::from_value(serde_json::json!({
+            "id": "rec-1-2", "created_at": 1, "updated_at": 1, "mode": "raw",
+            "trigger": "manual", "status": "text_ready", "sample_rate": 16000,
+            "channels": 1, "frame_count": 1, "duration_ms": 1,
+            "raw_text": "old raw", "final_text": "old final", "error": null,
+            "history_id": null
+        }))
+        .unwrap();
+        apply_raw_text(&mut meta, "new raw".into());
+        assert_eq!(meta.raw_text, "new raw");
+        assert!(meta.final_text.is_empty());
+        assert_eq!(meta.status, RecoveryStatus::TextReady);
+        meta.final_text = "new final".into();
+        assert_eq!(
+            (meta.raw_text, meta.final_text),
+            ("new raw".into(), "new final".into())
+        );
     }
 }

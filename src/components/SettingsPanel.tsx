@@ -1,5 +1,6 @@
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   ArrowClockwise20Regular,
   Checkmark20Regular,
@@ -236,6 +237,24 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    let off: (() => void) | undefined;
+    let disposed = false;
+    listen<{ recovery_id: string | null; current: number; total: number }>(
+      "session://long-audio-progress",
+      (event) => {
+        if (!event.payload.recovery_id) return;
+        setRecoverySessions((sessions) => sessions.map((session) =>
+          session.id === event.payload.recovery_id
+            ? { ...session, transcription_progress: { current: event.payload.current, total: event.payload.total } }
+            : session
+        ));
+      }
+    ).then((unlisten) => { if (disposed) unlisten(); else off = unlisten; });
+    return () => { disposed = true; off?.(); };
+  }, []);
 
   const loadDevices = async () => {
     setDevicesLoading(true);
@@ -2299,6 +2318,9 @@ export function SettingsPanel({ onClose, onOpenOnboarding, onSaved }: Props) {
                         {item.operation_kind === "selected_voice_edit" && <span>選択音声編集</span>}
                         <span>{recoveryStatusLabel(item.status)}</span>
                         <span>{Math.round(item.duration_ms / 1000)}秒</span>
+                        {item.transcription_progress && (
+                          <span>文字起こし: {item.transcription_progress.current}/{item.transcription_progress.total}</span>
+                        )}
                       </div>
                       <p>{text || item.error || "音声のみ保存されています。"}</p>
                       <div className="history-actions">

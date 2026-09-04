@@ -91,6 +91,7 @@ export function FloatingBar() {
   );
   const [liveTranscript, setLiveTranscript] = useState("");
   const [liveTranscriptError, setLiveTranscriptError] = useState("");
+  const [longAudioProgress, setLongAudioProgress] = useState<{ current: number; total: number } | null>(null);
   const levelRef = useRef(isTauri ? 0 : 0.32);
   const liveStripRef = useRef<HTMLDivElement>(null);
   const terminalHideTimerRef = useRef<number | null>(null);
@@ -177,6 +178,7 @@ export function FloatingBar() {
         setRecordingStartedAt(Date.now());
         setLiveTranscript("");
         setLiveTranscriptError("");
+        setLongAudioProgress(null);
         try {
           await resizeAndPositionFloatingWindow(
             getFloatingBarHeight(
@@ -195,6 +197,7 @@ export function FloatingBar() {
         setDisplayLevel(0);
         setLiveTranscript("");
         setLiveTranscriptError("");
+        setLongAudioProgress(null);
         setActivePolishPreset(settings.polish_preset);
         setRecordingStartedAt(null);
         if (
@@ -281,6 +284,16 @@ export function FloatingBar() {
       partialOff?.();
       statusOff?.();
     };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    let off: (() => void) | undefined;
+    let disposed = false;
+    listen<{ recovery_id: string | null; current: number; total: number }>("session://long-audio-progress", (event) => {
+      setLongAudioProgress(event.payload);
+    }).then((unlisten) => { if (disposed) unlisten(); else off = unlisten; });
+    return () => { disposed = true; off?.(); };
   }, []);
 
   useEffect(() => {
@@ -412,6 +425,7 @@ export function FloatingBar() {
 
         <span className="floating-status">
           {phaseLabel[phase]}
+          {phase === "transcribing" && longAudioProgress && `: ${longAudioProgress.current}/${longAudioProgress.total}`}
           {isRecording && ` ${elapsedSeconds}s`}
         </span>
 
