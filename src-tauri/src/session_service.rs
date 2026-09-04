@@ -8,7 +8,7 @@ use crate::{
     polish::PolishState,
     recovery,
     settings::LanguageMode,
-    speech::{openai_compatible::OpenAiCompatibleProvider, SpeechProvider},
+    speech::openai_compatible::OpenAiCompatibleProvider,
     state::{AppState, Mode, RecordingState, SessionController},
 };
 
@@ -290,7 +290,10 @@ pub async fn stop_session_inner(
             Some(text) => text,
             None => {
                 let batch_started = Instant::now();
-                match provider.transcribe(&audio).await {
+                match provider
+                    .transcribe_dictation(&audio, app.as_ref(), recovery_id.as_deref())
+                    .await
+                {
                     Ok(text) => {
                         batch_asr_ms = batch_started.elapsed().as_millis() as u64;
                         text
@@ -316,6 +319,10 @@ pub async fn stop_session_inner(
             }
         };
         drop(provider);
+
+        if let (Some(app), Some(id)) = (app.as_ref(), recovery_id.as_ref()) {
+            recovery::save_raw_text(app, id, raw_text.clone()).map_err(|e| e.to_string())?;
+        }
 
         let current_mode = session_mode.clone();
         let mut current_settings_for_mode = state.settings.lock().await.clone();

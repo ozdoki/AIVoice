@@ -1,15 +1,19 @@
 use std::fs;
+use std::future::Future;
 
 use anyhow::Context;
 use futures_util::StreamExt;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
-use super::SpeechProvider;
-use crate::{audio::CapturedAudio, context::FocusedAppContext, settings::LanguageMode};
+use super::{long_audio, SpeechProvider};
+use crate::{audio::CapturedAudio, context::FocusedAppContext, recovery, settings::LanguageMode};
 
 const TRANSCRIPTION_TEMPERATURE: &str = "0";
+const ASR_REQUEST_TIMEOUT_SECS: u64 = 90;
+const TRANSIENT_RETRIES: usize = 1;
 
 pub struct OpenAiCompatibleProvider {
     pub base_url: String,
@@ -24,6 +28,13 @@ pub struct OpenAiCompatibleProvider {
 #[derive(Deserialize)]
 struct TranscriptionResponse {
     text: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct LongAudioProgressEvent {
+    recovery_id: Option<String>,
+    current: usize,
+    total: usize,
 }
 
 /// CapturedAudio を RIFF WAV バイト列に変換する。
@@ -174,79 +185,252 @@ impl SpeechProvider for OpenAiCompatibleProvider {
             Some(path) => fs::read(path).context("ASR audio file read failed")?,
             None => encode_wav(audio),
         };
-        let client = reqwest::Client::new();
+        self.transcribe_wav(wav, true, false).await
+    }
+}
 
-        let part = Part::bytes(wav)
-            .file_name("audio.wav")
-            .mime_str("audio/wav")?;
+impl OpenAiCompatibleProvider {
+    pub async fn transcribe_dictation(
+        &self,
+        audio: &CapturedAudio,
+        app: Option<&AppHandle>,
+        recovery_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let Some(path) = audio.wav_path.as_deref() else {
+            return self.transcribe(audio).await;
+        };
+        if !is_openai_endpoint(&self.base_url)
+            || fs::metadata(path)?.len() as usize <= long_audio::OPENAI_SAFE_WAV_LIMIT
+        {
+            return self.transcribe(audio).await;
+        }
+        let info = long_audio::read_pcm_wav_info(path)?;
+        let parts = long_audio::split_wav_parts(path, &info, long_audio::OPENAI_SAFE_WAV_LIMIT)?;
+        let source_fingerprint = long_audio::fingerprint_file(path)?;
         let batch_model = batch_transcription_model(&self.model);
         let prompt = build_transcription_prompt(
             &self.dictionary_words,
             self.focused_context.as_ref(),
             self.language_mode,
         );
-        let streaming = supports_file_streaming(&batch_model) && self.partial_tx.is_some();
-        let mut form = Form::new().part("file", part);
-        for (name, value) in
-            transcription_text_fields(&batch_model, self.language_mode, prompt, streaming)
-        {
-            form = form.text(name, value);
-        }
+        let plan: Vec<(usize, usize)> = parts
+            .iter()
+            .map(|part| (part.start_frame, part.end_frame))
+            .collect();
+        let request_fingerprint =
+            long_audio::fingerprint_text(&serde_json::to_string(&serde_json::json!({
+                "version": 1,
+                "endpoint": self.base_url.trim_end_matches('/'),
+                "model": batch_model,
+                "language": self.language_mode,
+                "prompt": prompt,
+                "plan": plan,
+            }))?);
+        let mut completed = match (app, recovery_id) {
+            (Some(app), Some(id)) => recovery::load_long_audio_checkpoint(
+                app,
+                id,
+                &source_fingerprint,
+                &request_fingerprint,
+                parts.len(),
+            )?,
+            _ => vec![None; parts.len()],
+        };
+        run_long_parts(
+            &mut completed,
+            |index| {
+                let wav = long_audio::read_wav_part(path, &info, &parts[index]);
+                async move { self.transcribe_wav(wav?, false, true).await }
+            },
+            |index, text| {
+                if let (Some(app), Some(id)) = (app, recovery_id) {
+                    recovery::save_long_audio_part(
+                        app,
+                        id,
+                        source_fingerprint.clone(),
+                        request_fingerprint.clone(),
+                        parts.len(),
+                        index,
+                        text,
+                    )
+                } else {
+                    Ok(())
+                }
+            },
+            |current, total| emit_long_audio_progress(app, recovery_id, current, total),
+        )
+        .await
+    }
 
+    async fn transcribe_wav(
+        &self,
+        wav: Vec<u8>,
+        streaming: bool,
+        retry_transient: bool,
+    ) -> anyhow::Result<String> {
+        let client = if retry_transient {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(ASR_REQUEST_TIMEOUT_SECS))
+                .build()?
+        } else {
+            reqwest::Client::new()
+        };
+
+        let batch_model = batch_transcription_model(&self.model);
+        let prompt = build_transcription_prompt(
+            &self.dictionary_words,
+            self.focused_context.as_ref(),
+            self.language_mode,
+        );
+        let streaming =
+            streaming && supports_file_streaming(&batch_model) && self.partial_tx.is_some();
         let url = format!(
             "{}/audio/transcriptions",
             self.base_url.trim_end_matches('/')
         );
+        let retry_count = if retry_transient {
+            TRANSIENT_RETRIES
+        } else {
+            0
+        };
+        for attempt in 0..=retry_count {
+            let part = Part::bytes(wav.clone())
+                .file_name("audio.wav")
+                .mime_str("audio/wav")?;
+            let mut form = Form::new().part("file", part);
+            for (name, value) in transcription_text_fields(
+                &batch_model,
+                self.language_mode,
+                prompt.clone(),
+                streaming,
+            ) {
+                form = form.text(name, value);
+            }
+            let resp = match client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .multipart(form)
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(error)
+                    if attempt < retry_count && (error.is_timeout() || error.is_connect()) =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error).context("ASR request failed"),
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                if attempt < retry_count
+                    && (status.is_server_error()
+                        || (status.as_u16() == 429 && !body.contains("insufficient_quota")))
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                anyhow::bail!("ASR API error {}: {}", status, body);
+            }
 
-        let resp = client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .multipart(form)
-            .send()
-            .await
-            .context("ASR request failed")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("ASR API error {}: {}", status, body);
-        }
-
-        if supports_file_streaming(&batch_model) && self.partial_tx.is_some() {
-            let mut stream = resp.bytes_stream();
-            let mut buffer = String::new();
-            let mut final_text = String::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.context("ASR stream read failed")?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(index) = buffer.find('\n') {
-                    let line = buffer[..index].trim().to_string();
-                    buffer = buffer[index + 1..].to_string();
-                    let Some((event_type, text)) = parse_transcript_event(&line) else {
-                        continue;
-                    };
-                    if event_type == "transcript.text.delta" {
-                        if let Some(tx) = &self.partial_tx {
-                            let _ = tx.send(text.clone());
+            if streaming {
+                let mut stream = resp.bytes_stream();
+                let mut buffer = String::new();
+                let mut final_text = String::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.context("ASR stream read failed")?;
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(index) = buffer.find('\n') {
+                        let line = buffer[..index].trim().to_string();
+                        buffer = buffer[index + 1..].to_string();
+                        let Some((event_type, text)) = parse_transcript_event(&line) else {
+                            continue;
+                        };
+                        if event_type == "transcript.text.delta" {
+                            if let Some(tx) = &self.partial_tx {
+                                let _ = tx.send(text.clone());
+                            }
+                            final_text.push_str(&text);
+                        } else if event_type == "transcript.text.done" {
+                            final_text = text;
                         }
-                        final_text.push_str(&text);
-                    } else if event_type == "transcript.text.done" {
-                        final_text = text;
                     }
                 }
+                return Ok(final_text.trim().to_string());
             }
-            return Ok(final_text.trim().to_string());
-        }
 
-        let result: TranscriptionResponse =
-            resp.json().await.context("ASR response parse failed")?;
-        Ok(result.text)
+            let result: TranscriptionResponse =
+                resp.json().await.context("ASR response parse failed")?;
+            return Ok(result.text);
+        }
+        unreachable!("ASR retry loop always returns")
+    }
+}
+
+fn join_transcript_parts(parts: impl IntoIterator<Item = String>) -> String {
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn run_long_parts<Request, RequestFuture, Save, Progress>(
+    completed: &mut [Option<String>],
+    mut request: Request,
+    mut save: Save,
+    mut progress: Progress,
+) -> anyhow::Result<String>
+where
+    Request: FnMut(usize) -> RequestFuture,
+    RequestFuture: Future<Output = anyhow::Result<String>>,
+    Save: FnMut(usize, String) -> anyhow::Result<()>,
+    Progress: FnMut(usize, usize),
+{
+    for index in 0..completed.len() {
+        if completed[index].is_none() {
+            let text = request(index).await?;
+            save(index, text.clone())?;
+            completed[index] = Some(text);
+        }
+        progress(index + 1, completed.len());
+    }
+    Ok(join_transcript_parts(completed.iter().flatten().cloned()))
+}
+
+fn is_openai_endpoint(base_url: &str) -> bool {
+    base_url
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case("https://api.openai.com/v1")
+}
+
+fn emit_long_audio_progress(
+    app: Option<&AppHandle>,
+    recovery_id: Option<&str>,
+    current: usize,
+    total: usize,
+) {
+    if let Some(app) = app {
+        let _ = app.emit(
+            "session://long-audio-progress",
+            LongAudioProgressEvent {
+                recovery_id: recovery_id.map(str::to_string),
+                current,
+                total,
+            },
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        cell::{Cell, RefCell},
+        fs,
+        sync::Arc,
+    };
 
     #[test]
     fn transcription_prompt_uses_dictionary_and_context() {
@@ -347,5 +531,99 @@ mod tests {
             ))
         );
         assert_eq!(parse_transcript_event("data: [DONE]"), None);
+    }
+
+    #[test]
+    fn long_part_join_preserves_text_boundaries_and_empty_successes() {
+        assert_eq!(
+            join_transcript_parts(["hello".to_string(), "world".to_string()]),
+            "hello\nworld"
+        );
+        assert_eq!(
+            join_transcript_parts(["日本語".to_string(), String::new(), "続き".to_string()]),
+            "日本語\n続き"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_loop_persists_before_later_failure_and_resume_skips_saved_parts() {
+        let path = std::env::temp_dir().join(format!("long-loop-{}.json", uuid::Uuid::new_v4()));
+        let persisted = Arc::new(std::sync::Mutex::new(
+            crate::recovery::LongAudioCheckpoint {
+                source_fingerprint: "source".into(),
+                request_fingerprint: "request".into(),
+                total_parts: 3,
+                completed_parts: vec![None, None, None],
+            },
+        ));
+        let calls = RefCell::new(Vec::new());
+        let fail_second = Cell::new(true);
+        let first = run_long_parts(
+            &mut [None, None, None],
+            |index| {
+                calls.borrow_mut().push(index);
+                let fail = fail_second.get() && index == 1;
+                async move {
+                    if fail {
+                        anyhow::bail!("permanent part failure")
+                    } else {
+                        Ok(["one", "", "three"][index].to_string())
+                    }
+                }
+            },
+            |index, text| {
+                let mut checkpoint = persisted.lock().unwrap();
+                checkpoint.completed_parts[index] = Some(text);
+                let tmp = path.with_extension("tmp");
+                fs::write(&tmp, serde_json::to_vec(&*checkpoint)?)?;
+                fs::rename(tmp, &path)?;
+                Ok(())
+            },
+            |_, _| {},
+        )
+        .await;
+        assert!(first.is_err());
+        assert_eq!(calls.into_inner(), vec![0, 1]);
+        let restored: crate::recovery::LongAudioCheckpoint =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            restored.completed_parts,
+            vec![Some("one".into()), None, None]
+        );
+
+        let calls = RefCell::new(Vec::new());
+        fail_second.set(false);
+        let mut resumed = restored.completed_parts;
+        let final_text = run_long_parts(
+            &mut resumed,
+            |index| {
+                calls.borrow_mut().push(index);
+                async move { Ok(["one", "", "three"][index].to_string()) }
+            },
+            |index, text| {
+                persisted.lock().unwrap().completed_parts[index] = Some(text);
+                Ok(())
+            },
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.into_inner(), vec![1, 2]);
+        assert_eq!(final_text, "one\nthree");
+
+        let calls = RefCell::new(Vec::new());
+        run_long_parts(
+            &mut resumed,
+            |index| {
+                calls.borrow_mut().push(index);
+                async move { Ok(String::new()) }
+            },
+            |_, _| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert!(calls.into_inner().is_empty());
+        let _ = fs::remove_file(path);
     }
 }
